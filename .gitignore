@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+appmap-*/
+*.secrets.yaml
+.pytest_cache/
+.superpowers/
