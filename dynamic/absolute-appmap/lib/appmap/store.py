@@ -178,6 +178,16 @@ class Store:
             resp_body_path=resp_body_path, content_type=content_type, duration_ms=duration_ms,
             ts=ts))
 
+    def set_exchange_body_paths(self, exchange_id: int, req_body_path: str | None = None,
+                                resp_body_path: str | None = None) -> None:
+        """Record on-disk body files once the exchange id (their filename) is known."""
+        vals = {"req_body_path": req_body_path, "resp_body_path": resp_body_path}
+        vals = {k: v for k, v in vals.items() if v is not None}
+        if vals:
+            self.conn.execute(
+                f"UPDATE exchanges SET {','.join(f'{c}=?' for c in vals)} WHERE id=?",
+                [*vals.values(), exchange_id])
+
     def upsert_response(self, endpoint_id: int, role: str, statuses: list[int] | None = None,
                         content_types: list[str] | None = None, body_shape: Any = None,
                         min_size: int | None = None, max_size: int | None = None,
