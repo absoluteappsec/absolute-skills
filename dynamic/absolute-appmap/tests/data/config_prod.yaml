@@ -1,5 +1,6 @@
-base_urls:
-  - https://www.example.com
+target:
+  base_urls:
+    - https://www.example.com
 authorization:
   confirmed_by: Jane Doe (Security Lead)
   notes: Approved for production testing

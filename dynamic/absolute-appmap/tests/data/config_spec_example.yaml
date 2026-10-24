@@ -1,0 +1,34 @@
+target:
+  base_urls: ["https://staging.example.com"]
+  scope:
+    allow_hosts: ["staging.example.com", "api.staging.example.com"]
+    allow_path_prefixes: ["/"]
+    deny_patterns: ["/admin/billing/*", "*/logout"]
+authorization:
+  confirmed_by: "operator name"     # required; orchestrator asks
+  notes: "Engagement #1234, staging only"
+profile: staging                    # staging | production
+limits:
+  max_requests_per_second: 5        # production default: 1, with jitter
+  concurrency: 4                    # production forced to 1
+  max_states_per_route_pattern: 5   # SPA dedup / list sampling
+  max_runtime_minutes: 240
+  max_depth: 15
+roles:
+  - name: admin
+    login: { type: form, url: /login, username_env: APPMAP_ADMIN_USER, password_env: APPMAP_ADMIN_PASS }
+  - name: user
+    login: { type: form, url: /login, username_env: APPMAP_USER_USER, password_env: APPMAP_USER_PASS }
+  - name: anonymous
+    login: { type: none }
+  - name: sso-user
+    login: { type: manual }         # headed browser, operator logs in once, session saved
+discovery:
+  passive_sources: true             # robots, sitemap, .well-known, source maps
+  schemas: true                     # OpenAPI/Swagger, GraphQL introspection
+  bundle_mining: true
+  api_replay: true
+  forced_browsing: false            # wordlist; blocked in production profile
+form_data:
+  marker_prefix: "appmap-{run_id}"  # tags created data for later cleanup
+  fixtures: ./fixtures.yaml         # optional domain-specific values

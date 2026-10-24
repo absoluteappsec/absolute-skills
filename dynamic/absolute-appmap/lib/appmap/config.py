@@ -26,6 +26,10 @@ _COMMON_LIMITS = {
 }
 
 
+TOP_KEYS = ("target", "base_urls", "scope", "authorization", "profile", "limits",
+            "roles", "discovery", "form_data", "spa", "redact_patterns")
+
+
 class ConfigError(ValueError):
     """Raised for any invalid or unsafe run configuration."""
 
@@ -124,6 +128,24 @@ class RunConfig:
         return d
 
 
+def _check_keys(raw: dict, allowed, what: str) -> None:
+    unknown = set(raw) - set(allowed)
+    if unknown:
+        raise ConfigError(f"{what}: unknown keys {sorted(unknown)}")
+
+
+def _num(values: dict, key: str, *, integer: bool, lo: float,
+         lo_open: bool = False, hi: float | None = None) -> None:
+    v = values[key]
+    ok_type = isinstance(v, int) if integer else isinstance(v, (int, float))
+    if isinstance(v, bool) or not ok_type:
+        raise ConfigError(
+            f"limits.{key} must be {'an integer' if integer else 'a number'}")
+    if (v <= lo if lo_open else v < lo) or (hi is not None and v > hi):
+        rng = f"{'>' if lo_open else '>='} {lo}" + (f" and <= {hi}" if hi is not None else "")
+        raise ConfigError(f"limits.{key} must be {rng}")
+
+
 def _mapping(raw, what: str) -> dict:
     if raw is None:
         return {}
@@ -171,6 +193,16 @@ def _parse_limits(raw, profile: str) -> Limits:
     if unknown:
         raise ConfigError(f"limits: unknown keys {sorted(unknown)}")
     values.update(raw)
+    _num(values, "max_requests_per_second", integer=False, lo=0, lo_open=True)
+    _num(values, "jitter_seconds", integer=False, lo=0)
+    _num(values, "concurrency", integer=True, lo=1)
+    _num(values, "max_states_per_route_pattern", integer=True, lo=1)
+    _num(values, "max_runtime_minutes", integer=True, lo=1)
+    _num(values, "max_depth", integer=True, lo=1)
+    _num(values, "quiet_window_ms", integer=True, lo=0)
+    _num(values, "max_form_retries", integer=True, lo=0)
+    _num(values, "breaker_window", integer=True, lo=1)
+    _num(values, "breaker_threshold", integer=False, lo=0, lo_open=True, hi=1)
     if profile == "production":
         # Safety floor: a file may be gentler than production defaults, never harsher.
         values["concurrency"] = 1
@@ -190,13 +222,21 @@ def load_config(path: Path) -> RunConfig:
     except (OSError, yaml.YAMLError) as e:
         raise ConfigError(f"cannot read config {path}: {e}") from e
     raw = _mapping(raw, "config")
+    _check_keys(raw, TOP_KEYS, "config")
 
-    base_urls = _strs(raw.get("base_urls"), "base_urls")
+    target = _mapping(raw.get("target"), "target")
+    _check_keys(target, ("base_urls", "scope"), "target")
+    for key in ("base_urls", "scope"):
+        if key in target and key in raw:
+            raise ConfigError(
+                f"{key} given both at top level and under target; use target.{key}")
+    base_urls = _strs(target.get("base_urls", raw.get("base_urls")),
+                      "target.base_urls")
     if not base_urls:
         raise ConfigError("base_urls must list at least one URL")
     hosts = []
     for u in base_urls:
-        host = urlparse(u).hostname
+        host = (urlparse(u).hostname or "").lower()
         if not host or urlparse(u).scheme not in ("http", "https"):
             raise ConfigError(f"base_urls entry is not an http(s) URL: {u}")
         if host not in hosts:
@@ -209,15 +249,18 @@ def load_config(path: Path) -> RunConfig:
     auth_raw = raw.get("authorization")
     if not isinstance(auth_raw, dict):
         raise ConfigError("authorization is required (authorization.confirmed_by)")
+    _check_keys(auth_raw, ("confirmed_by", "notes"), "authorization")
     confirmed_by = auth_raw.get("confirmed_by")
     if not isinstance(confirmed_by, str) or not confirmed_by.strip():
         raise ConfigError("authorization.confirmed_by is required")
     authorization = Authorization(confirmed_by=confirmed_by,
                                   notes=str(auth_raw.get("notes") or ""))
 
-    scope_raw = _mapping(raw.get("scope"), "scope")
+    scope_raw = _mapping(target.get("scope", raw.get("scope")), "target.scope")
+    _check_keys(scope_raw, Scope.__dataclass_fields__, "target.scope")
     scope = Scope(
-        allow_hosts=_strs(scope_raw.get("allow_hosts"), "scope.allow_hosts") or hosts,
+        allow_hosts=[h.lower() for h in _strs(scope_raw.get("allow_hosts"),
+                                              "scope.allow_hosts")] or hosts,
         allow_path_prefixes=_strs(scope_raw.get("allow_path_prefixes"),
                                   "scope.allow_path_prefixes"),
         deny_patterns=_strs(scope_raw.get("deny_patterns"), "scope.deny_patterns"),
@@ -250,6 +293,7 @@ def load_config(path: Path) -> RunConfig:
         roles.append(Role(name=name, login=_parse_login(r.get("login"), name)))
 
     fd_raw = _mapping(raw.get("form_data"), "form_data")
+    _check_keys(fd_raw, FormData.__dataclass_fields__, "form_data")
     form_data = FormData(
         marker_prefix=str(fd_raw.get("marker_prefix") or FormData.marker_prefix),
         fixtures=fd_raw.get("fixtures"),

@@ -88,3 +88,52 @@ def test_redacted_dict_has_no_env_values(monkeypatch):
     assert "APPMAP_ADMIN_USER" in text and "APPMAP_ADMIN_PASS" in text
     assert "secret-user-value" not in text and "secret-pass-value" not in text
     assert isinstance(d["source_path"], str)
+
+
+def test_spec_example_loads_verbatim():
+    cfg = load_config(DATA / "config_spec_example.yaml")
+    assert cfg.base_urls == ["https://staging.example.com"]
+    assert cfg.scope.allow_hosts == ["staging.example.com", "api.staging.example.com"]
+    assert cfg.scope.deny_patterns == ["/admin/billing/*", "*/logout"]
+    assert [r.login.type for r in cfg.roles] == ["form", "form", "none", "manual"]
+    assert cfg.form_data.fixtures == "./fixtures.yaml"
+
+
+def test_flat_alias_accepted_and_both_rejected(tmp_path):
+    p = tmp_path / "c.yaml"
+    p.write_text("base_urls: ['https://a.example.com']\nauthorization: {confirmed_by: me}\n")
+    assert load_config(p).scope.allow_hosts == ["a.example.com"]
+    p.write_text("base_urls: ['https://a.example.com']\n"
+                 "target: {base_urls: ['https://b.example.com']}\n"
+                 "authorization: {confirmed_by: me}\n")
+    with pytest.raises(ConfigError, match="both"):
+        load_config(p)
+
+
+def test_allow_hosts_lowercased(tmp_path):
+    p = _write(tmp_path, target={"base_urls": ["https://A.Example.com"],
+                                 "scope": {"allow_hosts": ["A.Example.COM"]}})
+    assert load_config(p).scope.allow_hosts == ["a.example.com"]
+
+
+@pytest.mark.parametrize("override", [
+    {"limit": {"concurrency": 2}},
+    {"target": {"base_urls": ["https://a.example.com"], "scop": {}}},
+    {"target": {"base_urls": ["https://a.example.com"], "scope": {"allow_host": []}}},
+    {"authorization": {"confirmed_by": "me", "note": "x"}},
+    {"form_data": {"marker": "x"}},
+])
+def test_unknown_keys_rejected(tmp_path, override):
+    with pytest.raises(ConfigError, match="unknown keys"):
+        load_config(_write(tmp_path, **override))
+
+
+@pytest.mark.parametrize("limits", [
+    {"max_requests_per_second": "fast"}, {"max_requests_per_second": 0},
+    {"max_requests_per_second": -1}, {"concurrency": 0}, {"concurrency": 1.5},
+    {"concurrency": True}, {"breaker_threshold": 0}, {"breaker_threshold": 1.5},
+    {"jitter_seconds": -0.1}, {"max_depth": None}, {"max_runtime_minutes": 0},
+])
+def test_invalid_limits_rejected(tmp_path, limits):
+    with pytest.raises(ConfigError, match="limits"):
+        load_config(_write(tmp_path, limits=limits))
