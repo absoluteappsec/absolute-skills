@@ -1,0 +1,16 @@
+base_urls:
+  - https://www.example.com
+authorization:
+  confirmed_by: Jane Doe (Security Lead)
+  notes: Approved for production testing
+profile: production
+limits:
+  concurrency: 8
+  max_requests_per_second: 20
+roles:
+  - name: user
+    login:
+      type: form
+      url: https://www.example.com/login
+      username_env: APPMAP_USER_USER
+      password_env: APPMAP_USER_PASS

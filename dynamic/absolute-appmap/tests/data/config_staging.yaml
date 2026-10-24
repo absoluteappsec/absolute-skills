@@ -1,0 +1,16 @@
+base_urls:
+  - https://staging.example.com
+authorization:
+  confirmed_by: Jane Doe (Security Lead)
+  notes: Approved for staging testing
+profile: staging
+roles:
+  - name: admin
+    login:
+      type: form
+      url: https://staging.example.com/login
+      username_env: APPMAP_ADMIN_USER
+      password_env: APPMAP_ADMIN_PASS
+  - name: anon
+    login:
+      type: none
