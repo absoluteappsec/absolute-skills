@@ -35,3 +35,10 @@ def test_circuit_open_is_runtime_error():
     assert issubclass(CircuitOpen, RuntimeError)
     with pytest.raises(CircuitOpen):
         raise CircuitOpen("x")
+
+
+def test_invalid_args():
+    with pytest.raises(ValueError):
+        RateLimiter(rps=0)
+    with pytest.raises(ValueError):
+        CircuitBreaker(window=0, threshold=0.5)

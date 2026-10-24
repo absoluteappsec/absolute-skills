@@ -16,3 +16,10 @@ from appmap.normalize import normalize_path
 ])
 def test_normalize(path, known, marker, expected):
     assert normalize_path(path, known, marker=marker) == expected
+
+
+def test_double_slash_trailing_slash_and_unicode_digits():
+    assert normalize_path("//users/42") == "/users/{id}"
+    assert normalize_path("/users/42/") == "/users/{id}"
+    assert normalize_path("/users/42#frag") == "/users/{id}"
+    assert normalize_path("/u/\u0663") == "/u/\u0663"

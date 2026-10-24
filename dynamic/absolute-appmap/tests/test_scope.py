@@ -29,3 +29,25 @@ def test_scheme_and_prefix():
     assert not g.allows("javascript:alert(1)")
     assert g.allows("http://app.example.com/app/x")
     assert not g.allows("http://app.example.com/other")
+
+
+import pytest
+
+
+@pytest.mark.parametrize("path", [
+    "/app/logout/", "/app/%6Cogout", "/app/%256Cogout", "/app/logout;x=1",
+    "/app/LOGOUT", "/app/x/../logout", "/app/logout/.", "/app\\logout",
+])
+def test_deny_bypass_forms_blocked(path):
+    assert not guard(allow_path_prefixes=["/app"]).allows("https://app.example.com" + path)
+
+
+@pytest.mark.parametrize("path", ["/app/x/../../admin", "/application", "/app/%2e%2e/admin"])
+def test_prefix_bypass_forms_blocked(path):
+    assert not guard(allow_path_prefixes=["/app"]).allows("https://app.example.com" + path)
+
+
+def test_prefix_root_and_exact():
+    g = guard(allow_path_prefixes=["/app/"])
+    assert g.allows("https://app.example.com/app")
+    assert g.allows("https://app.example.com/app/")

@@ -13,6 +13,8 @@ class CircuitOpen(RuntimeError):
 
 class RateLimiter:
     def __init__(self, rps: float, jitter: float = 0.0):
+        if rps <= 0:
+            raise ValueError("rps must be > 0")
         self._interval = 1.0 / rps
         self._jitter = jitter
         self._next = 0.0
@@ -31,6 +33,8 @@ class RateLimiter:
 
 class CircuitBreaker:
     def __init__(self, window: int, threshold: float):
+        if window <= 0:
+            raise ValueError("window must be > 0")
         self._events: deque[bool] = deque(maxlen=window)
         self._window = window
         self._threshold = threshold

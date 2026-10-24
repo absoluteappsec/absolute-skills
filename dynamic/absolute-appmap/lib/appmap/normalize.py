@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import re
-from urllib.parse import urlsplit
 
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _HEX = re.compile(r"^[0-9a-fA-F]{16,}$")
@@ -32,7 +31,7 @@ def _match_known(segs: list[str], pattern: str) -> str | None:
 
 def normalize_path(path: str, known_patterns: list[str] | None = None,
                    *, marker: str | None = None) -> str:
-    path = urlsplit(path).path or "/"
+    path = path.split("#", 1)[0].split("?", 1)[0] or "/"
     segs = [s for s in path.strip("/").split("/") if s]
     for pattern in known_patterns or []:
         hit = _match_known(segs, pattern)
@@ -40,7 +39,7 @@ def normalize_path(path: str, known_patterns: list[str] | None = None,
             return hit
     out = []
     for s in segs:
-        if s.isdigit():
+        if s.isascii() and s.isdigit():
             out.append("{id}")
         elif _UUID.match(s):
             out.append("{uuid}")

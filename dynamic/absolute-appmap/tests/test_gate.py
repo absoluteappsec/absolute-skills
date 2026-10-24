@@ -35,3 +35,15 @@ async def test_admit_raises_when_tripped():
     g.observe(500)
     with pytest.raises(CircuitOpen):
         await g.admit("GET", "http://a.test/x", role="r", found_on=None)
+
+
+async def test_out_of_scope_never_touches_limiter_even_when_tripped():
+    g, st = make()
+    g.observe(503)
+    g.observe(500)
+
+    async def boom():
+        raise AssertionError("limiter called")
+    g.limiter.acquire = boom
+    assert await g.admit("GET", "http://b.test/x", role="r", found_on="p") is False
+    assert st.links == [("http://b.test/x", "p", "r")]
