@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Wrapper: ensure the cached venv exists, then run the appmap CLI.
+set -euo pipefail
+
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VERSION="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$PLUGIN_DIR/lib/appmap/__init__.py")"
+VENV="${XDG_CACHE_HOME:-$HOME/.cache}/absolute-appmap/$VERSION/venv"
+
+if [ ! -x "$VENV/bin/appmap" ]; then
+  bash "$PLUGIN_DIR/scripts/setup.sh" >&2
+fi
+exec "$VENV/bin/appmap" "$@"

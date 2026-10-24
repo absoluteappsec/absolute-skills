@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "absolute-appmap"
+version = "0.1.0"
+description = "Playwright-based web application crawler producing an application map"
+license = { text = "MIT" }
+authors = [{ name = "Absolute AppSec", email = "info@absoluteappsec.com" }]
+requires-python = ">=3.11"
+dependencies = ["playwright>=1.47,<2", "pyyaml>=6", "jinja2>=3.1"]
+
+[project.urls]
+Homepage = "https://absoluteappsec.com"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "flask>=3"]
+
+[project.scripts]
+appmap = "appmap.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["lib"]
+
+[tool.setuptools.package-data]
+appmap = ["schema.sql", "templates/*", "resources/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["lib"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
