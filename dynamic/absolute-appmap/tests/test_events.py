@@ -39,3 +39,11 @@ def test_unknown_event_type_rejected(tmp_path):
     import pytest
     with pytest.raises(ValueError):
         EventLog(tmp_path / "e.jsonl", Redactor([], [])).emit("bogus")
+
+
+def test_bytes_and_exception_data_not_leaked(tmp_path):
+    p = tmp_path / "e.jsonl"
+    log = EventLog(p, Redactor(["hunter2"], []))
+    log.emit("error", body=b"pw=hunter2", error=Exception("Bearer abc"))
+    text = p.read_text()
+    assert "hunter2" not in text and "Bearer abc" not in text

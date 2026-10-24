@@ -70,3 +70,49 @@ def test_extra_patterns_and_empty_secrets_ignored():
     assert r.text("id ACME-123 here") == "id <redacted:secret> here"
     assert r.text("abc") == "<redacted:secret>c"  # short secrets still scrubbed; empty ignored
     assert Redactor([""], []).text("hello") == "hello"
+
+
+def test_encoded_variants_of_secret():
+    import json as j
+    from urllib.parse import quote, quote_plus
+    pw = 'p@ss "word"!'
+    r = Redactor([pw], [])
+    for v in (pw, quote(pw, safe=""), quote_plus(pw), j.dumps(pw)[1:-1]):
+        assert "word" not in r.text(f"x={v}&y=1") or v == "", v
+        assert "<redacted:secret>" in r.text(f"x={v}")
+
+
+def test_short_secret_does_not_corrupt_placeholders():
+    r = Redactor(["ed", "hunter2"], [])
+    out = r.text("Bearer abc hunter2 edge")
+    assert out == "<redacted:authorization> <redacted:secret> <redacted:secret>ge"
+    assert r.text("hunter2 ed") == "<redacted:secret> <redacted:secret>"
+
+
+def test_har_shaped_name_value_lists():
+    r = Redactor([], [])
+    har = {"request": {
+        "cookies": [{"name": "sid", "value": "abc", "path": "/"}],
+        "headers": [{"name": "Authorization", "value": "Bearer x"},
+                    {"name": "Cookie", "value": "sid=abc; t=d"},
+                    {"name": "X-CSRF-Token", "value": "c"},
+                    {"name": "Accept", "value": "text/html"}],
+        "postData": {"params": [{"name": "password", "value": "p"}, {"name": "q", "value": "ok"}]}},
+        "response": {"headers": [{"name": "Set-Cookie", "value": "sid=abc; Path=/"}]}}
+    out = r.json(har)
+    assert out["request"]["cookies"] == [{"name": "sid", "value": "<redacted:cookie>", "path": "/"}]
+    h = {x["name"]: x["value"] for x in out["request"]["headers"]}
+    assert h == {"Authorization": "<redacted:authorization>",
+                 "Cookie": "sid=<redacted:cookie>; t=<redacted:cookie>",
+                 "X-CSRF-Token": "<redacted:csrf>", "Accept": "text/html"}
+    assert out["request"]["postData"]["params"] == [
+        {"name": "password", "value": "<redacted:password>"}, {"name": "q", "value": "ok"}]
+    assert out["response"]["headers"][0]["value"] == "sid=<redacted:cookie>; Path=/"
+
+
+def test_json_non_str_values_scrubbed():
+    r = Redactor(["hunter2"], [])
+    from pathlib import Path
+    out = r.json({"b": b"pw=hunter2", "e": Exception("Bearer abc"), "p": Path("/x/hunter2"), "n": 1})
+    assert out == {"b": "pw=<redacted:secret>", "e": "<redacted:authorization>",
+                   "p": "/x/<redacted:secret>", "n": 1}
