@@ -30,7 +30,7 @@ def test_run_json_flags_production(tmp_path, prod_cfg):
 
 
 def test_run_json_contents_and_no_secrets(tmp_path, cfg, monkeypatch):
-    monkeypatch.setenv("APPMAP_USER_PASS", "hunter2")
+    monkeypatch.setenv("APPMAP_ADMIN_PASS", "hunter2")
     rd = create_run_dir(cfg, tmp_path, NOW)
     write_run_meta(rd, cfg, status="complete", extra={"note": "x"})
     text = (rd.root / "run.json").read_text()
@@ -41,7 +41,7 @@ def test_run_json_contents_and_no_secrets(tmp_path, cfg, monkeypatch):
     assert meta["run_id"] == rd.run_id
     assert meta["schema_version"] == "1.0.0" and meta["tool_version"]
     assert meta["config"]["base_urls"] == cfg.base_urls
-    assert meta["config"]["roles"][0]["login"]["password_env"] == "APPMAP_USER_PASS"
+    assert meta["config"]["roles"][0]["login"]["password_env"] == "APPMAP_ADMIN_PASS"
     assert "authorization" in meta and "roles" in meta
     assert "started_at" in meta and "updated_at" in meta
     write_run_meta(rd, cfg, status="complete")
