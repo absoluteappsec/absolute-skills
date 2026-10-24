@@ -8,10 +8,13 @@ from urllib.parse import urlencode, urljoin, urlsplit
 
 from playwright.async_api import APIRequestContext, APIResponse
 
+from .events import EventLog
 from .gate import RequestGate
 
 MAX_HOPS = 10
 _REDIRECTS = {301, 302, 303, 307, 308}
+_CREDENTIAL_HEADERS = {"authorization", "cookie", "proxy-authorization"}
+NETWORK_ERROR_STATUS = 599  # what the circuit breaker sees for a failed fetch
 
 
 def _with_params(url: str, params: dict | None) -> str:
@@ -40,8 +43,9 @@ class DirectClient:
     with ``functools.partial``).
     """
 
-    def __init__(self, gate: RequestGate, rec: Callable[..., int]):
-        self.gate, self.rec = gate, rec
+    def __init__(self, gate: RequestGate, rec: Callable[..., int],
+                 events: EventLog | None = None):
+        self.gate, self.rec, self.events = gate, rec, events
 
     async def request(self, api: APIRequestContext, method: str, url: str, *, role: str,
                       origin: str, caused_by: str | None = None,
@@ -61,13 +65,25 @@ class DirectClient:
             if not await self.gate.admit(method, url, role=role, found_on=found_on):
                 return result
             hdrs = dict(headers or {})
-            if extra_auth and urlsplit(url).netloc == origin_netloc:
+            same_origin = urlsplit(url).netloc == origin_netloc
+            if not same_origin:
+                hdrs = {k: v for k, v in hdrs.items() if k.lower() not in _CREDENTIAL_HEADERS}
+            if body is None:
+                hdrs = {k: v for k, v in hdrs.items() if k.lower() != "content-type"}
+            if extra_auth and same_origin:
                 hdrs.update(extra_auth)
             if json is not None and body is not None:
                 hdrs.setdefault("Content-Type", "application/json")
             started = time.monotonic()
-            resp = await api.fetch(url, method=method, headers=hdrs or None, data=body,
-                                   max_redirects=0)
+            try:
+                resp = await api.fetch(url, method=method, headers=hdrs or None, data=body,
+                                       max_redirects=0)
+            except Exception as exc:  # timeout, refused, DNS, ...
+                self.gate.observe(NETWORK_ERROR_STATUS)
+                if self.events is not None:
+                    self.events.emit("error", role=role, caused_by=caused_by, method=method,
+                                     url=url, error=f"{type(exc).__name__}: {exc}")
+                return None
             duration_ms = (time.monotonic() - started) * 1000
             resp_body = await resp.body()
             self.gate.observe(resp.status)

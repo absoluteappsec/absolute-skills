@@ -23,9 +23,11 @@ _MAX_SAMPLES = 5
 _GQL_OP = re.compile(r"^\s*(query|mutation|subscription)\s+(\w+)")
 _GQL_TYPE = re.compile(r"^\s*(query|mutation|subscription)\b")
 
-_SOURCE_BY_ORIGIN = {"ui": "ui", "approved": "ui", "login": "ui", "passive": "ui",
-                     "replay": "replay", "cross_role": "replay", "schema": "openapi",
-                     "bundle": "bundle"}
+# "passive" has no default source: callers must say which probe found the exchange.
+_SOURCE_BY_ORIGIN = {"ui": "ui", "approved": "ui", "login": "ui", "replay": "replay",
+                     "cross_role": "replay", "schema": "openapi", "bundle": "bundle"}
+# Higher wins; an endpoint's kind is never downgraded by a later exchange.
+_KIND_RANK = {"page": 0, "rest": 1, "static": 2, "websocket": 3, "sse": 4, "graphql_op": 5}
 
 _STACK = re.compile("|".join([
     r"Traceback \(most recent call last\)",                 # Python
@@ -207,6 +209,11 @@ def _index_params(store: Store, redactor: Redactor, endpoint_id: int, raw_segs: 
                 _upsert_param(store, redactor, endpoint_id, "body", k, v)
 
 
+def _redact_bytes(redactor: Redactor, raw: bytes) -> bytes:
+    """Redact binary / non-UTF-8 content via a lossless latin-1 round trip."""
+    return redactor.text(raw.decode("latin-1")).encode("latin-1", errors="replace")
+
+
 def _redact_text(redactor: Redactor, text: str) -> str:
     obj = _json_or_none(text)
     if isinstance(obj, (dict, list)):
@@ -218,7 +225,11 @@ def record_exchange(store: Store, events: EventLog, redactor: Redactor, rd: RunD
                     role: str, origin: str, method: str, url: str, req_headers: dict,
                     req_body: bytes | None, status: int, resp_headers: dict,
                     resp_body: bytes | None, duration_ms: float, caused_by: str | None,
-                    known_patterns: list[str]) -> int:
+                    known_patterns: list[str], source: str | None = None) -> int:
+    if source is None:
+        if origin not in _SOURCE_BY_ORIGIN:
+            raise ValueError(f"origin {origin!r} has no default source; pass source=")
+        source = _SOURCE_BY_ORIGIN[origin]
     parts = urlsplit(url)
     safe_url = redactor.url(url)
     safe_req_h = redactor.headers(req_headers or {})
@@ -242,14 +253,18 @@ def record_exchange(store: Store, events: EventLog, redactor: Redactor, rd: RunD
     kind = _kind(path, resp_ct, gql is not None)
     host = parts.netloc.lower()
     gql_op, gql_type = gql if gql else ("", None)
-    old = _row_json(store, "SELECT content_types FROM endpoints WHERE method=? AND host=? "
+    old = _row_json(store, "SELECT content_types, kind FROM endpoints WHERE method=? AND host=? "
                     "AND path_pattern=? AND graphql_op=?", method, host, pattern, gql_op)
     cts = json.loads(old["content_types"]) if old and old["content_types"] else []
     if _base_ct(resp_ct):
         cts = _merge(cts, [_base_ct(resp_ct)])
+    if old and _KIND_RANK.get(old["kind"], 0) > _KIND_RANK[kind]:
+        kind = old["kind"]
     endpoint_id = store.upsert_endpoint(method, host, pattern, kind, graphql_op=gql_op,
                                         graphql_type=gql_type, content_types=cts or None)
-    store.upsert_source("endpoint", endpoint_id, _SOURCE_BY_ORIGIN.get(origin, "ui"))
+    if origin == "schema" and gql is not None and source == "openapi":
+        source = "graphql"
+    store.upsert_source("endpoint", endpoint_id, source)
     _index_params(store, redactor, endpoint_id, [s for s in path.split("/") if s], pattern,
                   parts.query, req_ct, req_text)
 
@@ -261,7 +276,7 @@ def record_exchange(store: Store, events: EventLog, redactor: Redactor, rd: RunD
         if not raw:
             continue
         if text is None:
-            files[side] = (raw, _ext(ct, False))
+            files[side] = (_redact_bytes(redactor, raw), _ext(ct, False))
             continue
         safe = _redact_text(redactor, text)
         if len(safe.encode("utf-8")) <= INLINE_LIMIT:
@@ -290,6 +305,9 @@ def record_exchange(store: Store, events: EventLog, redactor: Redactor, rd: RunD
     j = lambda col: json.loads(prev[col]) if prev and prev[col] else []
     size = len(resp_body or b"")
     shape = body_shape(obj) if isinstance(obj := _json_or_none(resp_text), (dict, list)) else None
+    seen_2xx = any(200 <= st < 300 for st in j("statuses"))
+    if prev and prev["body_shape"] and (seen_2xx or not 200 <= status < 300):
+        shape = None  # keep the first 2xx shape; errors never replace anything useful
     store.upsert_response(
         endpoint_id, role,
         statuses=sorted(set(j("statuses")) | {status}),

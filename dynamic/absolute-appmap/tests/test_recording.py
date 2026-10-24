@@ -140,3 +140,52 @@ def test_secrets_redacted_everywhere(env):
     assert "s3cret" not in blob and "sid=abc" not in blob
     types = [json.loads(l)["type"] for l in rd.events_path.read_text().splitlines()]
     assert types == ["request", "response"]
+
+
+def test_binary_and_oversized_bodies_redacted_in_files(env):
+    rec, store, rd, _ = env
+    e1 = rec(resp_headers={"content-type": "application/octet-stream"},
+             resp_body=b"\x00\xffhead s3cret tail\x80")
+    e2 = rec(resp_headers={"content-type": "text/plain"},
+             resp_body=b"s3cret " + b"a" * 262144)
+    for eid in (e1, e2):
+        path = rows(store, "SELECT resp_body_path p FROM exchanges WHERE id=?", eid)[0]["p"]
+        assert b"s3cret" not in (rd.root / path).read_bytes()
+    assert (rd.root / rows(store, "SELECT resp_body_path p FROM exchanges WHERE id=?", e1)[0]["p"]
+            ).read_bytes().startswith(b"\x00\xffhead ")
+
+
+def test_endpoint_kind_never_downgraded(env):
+    rec, store, _, _ = env
+    rec(url="http://t.test/api/x", resp_headers={"content-type": "application/json"}, resp_body=b"{}")
+    rec(url="http://t.test/api/x", status=500, resp_headers={"content-type": "text/html"},
+        resp_body=b"<html>err</html>")
+    assert rows(store, "SELECT kind FROM endpoints")[0]["kind"] == "rest"
+
+
+def test_body_shape_keeps_first_2xx(env):
+    rec, store, _, _ = env
+    js = {"content-type": "application/json"}
+    shape = lambda: json.loads(rows(store, "SELECT body_shape FROM responses")[0]["body_shape"])
+    rec(url="http://t.test/api/y", status=500, resp_headers=js, resp_body=b'{"error":"x"}')
+    assert shape() == {"error": "str"}
+    rec(url="http://t.test/api/y", resp_headers=js, resp_body=b'{"id":1}')
+    assert shape() == {"id": "int"}
+    rec(url="http://t.test/api/y", status=404, resp_headers=js, resp_body=b'{"error":"x"}')
+    rec(url="http://t.test/api/y", resp_headers=js, resp_body=b'{"other":1}')
+    assert shape() == {"id": "int"}
+
+
+def test_source_explicit_default_and_unknown(env):
+    rec, store, _, _ = env
+    rec(url="http://t.test/robots.txt", origin="passive", source="robots")
+    with pytest.raises(ValueError):
+        rec(url="http://t.test/z", origin="passive")
+    with pytest.raises(ValueError):
+        rec(url="http://t.test/z", origin="bogus")
+    rec(url="http://t.test/graphql", origin="schema", method="POST",
+        req_headers={"content-type": "application/json"},
+        req_body=b'{"query":"query Q { a }"}')
+    rec(url="http://t.test/openapi.json", origin="schema")
+    assert sorted(r["source"] for r in rows(store, "SELECT source FROM sources")) == [
+        "graphql", "openapi", "robots"]
