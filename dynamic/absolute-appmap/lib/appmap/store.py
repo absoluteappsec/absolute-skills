@@ -4,6 +4,10 @@ Naming: ``upsert_<singular>`` is idempotent on the table's UNIQUE key and return
 row id (a string for states/approvals); ``add_<singular>`` always appends and returns the
 new integer id. JSON columns take Python objects and are serialized with json.dumps.
 On upsert, only arguments that are not None overwrite existing column values.
+
+Upserts are last-write-wins for JSON list/dict columns (types, examples, statuses, ...):
+callers must merge with existing values before calling. ``upsert_state`` increments
+``visits`` on every call and never updates ``first_seen_event``.
 """
 from __future__ import annotations
 
@@ -30,7 +34,8 @@ class Store:
     def __init__(self, db_path: Path, *, _readonly: bool = False):
         self.db_path = Path(db_path)
         if _readonly:
-            self.conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, isolation_level=None)
+            uri = self.db_path.resolve().as_uri() + "?mode=ro"  # as_uri percent-quotes #, ?, %, spaces
+            self.conn = sqlite3.connect(uri, uri=True, isolation_level=None)
         else:
             self.conn = sqlite3.connect(self.db_path, isolation_level=None)
             self.conn.execute("PRAGMA journal_mode=WAL")
@@ -47,7 +52,13 @@ class Store:
     def init_schema(self) -> None:
         sql = resources.files("appmap").joinpath("schema.sql").read_text(encoding="utf-8")
         self.conn.executescript(sql)
-        self.set_meta("schema_version", SCHEMA_VERSION)
+        existing = self.get_meta("schema_version")
+        if existing is None:
+            self.set_meta("schema_version", SCHEMA_VERSION)
+        elif existing.split(".")[0] != SCHEMA_VERSION.split(".")[0]:
+            raise RuntimeError(
+                f"{self.db_path}: database schema version {existing} is incompatible "
+                f"with supported version {SCHEMA_VERSION} (major version differs)")
 
     # -- helpers -----------------------------------------------------------
     def _insert(self, table: str, data: dict[str, Any]) -> int:
@@ -59,7 +70,10 @@ class Store:
         return int(cur.lastrowid)
 
     def _upsert(self, table: str, keys: dict[str, Any], values: dict[str, Any]) -> int:
-        """Insert or update on the UNIQUE key; returns the row id."""
+        """Insert or update on the UNIQUE key; returns the row id.
+
+        Last-write-wins per provided column (JSON columns are replaced, not merged).
+        """
         values = {k: v for k, v in values.items() if v is not None}
         cols = list(keys) + list(values)
         sql = (f"INSERT INTO {table}({','.join(cols)}) VALUES({','.join('?' * len(cols))}) "
@@ -97,7 +111,11 @@ class Store:
                      dom_fingerprint: str | None = None, title: str | None = None,
                      first_seen_event: str | None = None, screenshot: str | None = None,
                      dom_snapshot: str | None = None) -> str:
-        """Insert a state, or bump ``visits`` and refresh provided fields if it exists."""
+        """Insert a state, or bump ``visits`` and refresh provided fields if it exists.
+
+        ``visits`` is incremented on every call; ``first_seen_event`` is set only on insert
+        and never updated afterwards.
+        """
         vals = {"role": role, "url": url, "route_pattern": route_pattern,
                 "dom_fingerprint": dom_fingerprint, "title": title,
                 "first_seen_event": first_seen_event, "screenshot": screenshot,

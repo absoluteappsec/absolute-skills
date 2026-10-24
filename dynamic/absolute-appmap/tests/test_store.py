@@ -101,3 +101,30 @@ def test_frontier_defaults_dedup(store):
     store.conn.execute(q)
     with pytest.raises(sqlite3.IntegrityError):
         store.conn.execute(q)
+
+
+def test_readonly_path_with_special_chars(tmp_path):
+    d = tmp_path / "a#b %20c?x"
+    d.mkdir()
+    p = d / "appmap.db"
+    w = Store(p)
+    w.init_schema()
+    w.set_meta("marker", "here")
+    w.close()
+    ro = Store.open_readonly(p)
+    assert ro.get_meta("marker") == "here"
+    ro.close()
+
+
+def test_init_schema_version_compat(tmp_path):
+    p = tmp_path / "appmap.db"
+    s = Store(p)
+    s.init_schema()
+    s.set_meta("schema_version", "1.0.5")
+    s.init_schema()  # same major: left alone
+    assert s.get_meta("schema_version") == "1.0.5"
+    s.set_meta("schema_version", "2.0.0")
+    with pytest.raises(RuntimeError, match="incompatible"):
+        s.init_schema()
+    assert s.get_meta("schema_version") == "2.0.0"
+    s.close()
