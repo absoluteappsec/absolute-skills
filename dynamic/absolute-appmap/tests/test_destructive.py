@@ -44,3 +44,34 @@ def test_production_submit_is_data_create():
     f = classify(_a("Go", None, "ui", kind="submit"), "production")
     assert f.category == "data_create"
     assert classify(_a("Go", None, "approved", kind="submit"), "production").held is False
+
+
+@pytest.mark.parametrize("label,url,method,cat", [
+    ("deleteUser", None, "POST", "delete"),
+    ("Deleted", None, "POST", "delete"),
+    ("Removes", None, "POST", "delete"),
+    ("Go", "http://x/api/deleteAccount", "POST", "delete"),
+    ("Go", "http://x/api/sendEmail", "POST", "outbound_message"),
+    ("Go", "http://x/users/sign_out", "GET", "logout"),
+    ("Go", "http://x/log_out", "GET", "logout"),
+    ("signOut", None, "GET", "logout"),
+    ("Cancel order", None, "POST", "deactivate"),
+    ("Cancel my booking", None, "POST", "deactivate"),
+    ("Erase data", None, "POST", "delete"),
+    ("Trash", None, "POST", "delete"),
+    ("Archive", None, "POST", "delete"),
+    ("Terminate session", None, "POST", "deactivate"),
+    ("Close account", None, "POST", "deactivate"),
+    ("Go", "http://x/api/resetPassword", "POST", "credential_change"),
+])
+def test_inflected_and_camel_case(label, url, method, cat):
+    f = classify(_a(label, method, "ui", url=url), "staging")
+    assert f.category == cat
+
+
+@pytest.mark.parametrize("label,url", [
+    ("Save", "http://x/api/payload"), ("Cancel", None), ("Resend", None), ("Settings", None),
+    ("Go", "http://x/api/sentry"), ("Closet", None),
+])
+def test_no_false_positives(label, url):
+    assert classify(_a(label, "POST", "ui", url=url), "staging").held is False

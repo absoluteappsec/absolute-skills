@@ -8,22 +8,35 @@ from typing import Literal
 CATEGORIES = ("delete", "credential_change", "payment", "outbound_message",
               "deactivate", "logout", "data_create")
 
-LOGOUT_WORDS = [r"log\s*out", r"sign\s*out", r"log\s*off", r"sign\s*off"]
-LOGOUT_URL = re.compile(r"/(log-?out|sign-?out)(\b|/|$|\?)", re.I)
-
-# Keyword lists, checked in this order after logout/DELETE.
+# Text is tokenized (camelCase split, non-alphanumerics -> spaces, lowercased) and the
+# patterns below are matched against the space-joined tokens, so inflected/camelCase
+# forms match ("deleteUser", "Deleted", "/api/sendEmail") but "payload" does not match "pay".
+_NOUN = r"(?:subscription|account|order|booking|reservation|plan|membership|appointment|invoice|ticket)s?"
+_DET = r"(?:(?:my|your|the|this)\s+)?"
 KEYWORDS: list[tuple[str, list[str]]] = [
-    ("delete", [r"delete", r"remove", r"destroy", r"purge"]),
-    ("credential_change", [r"change\s+(my\s+)?(password|email)", r"reset\s+(my\s+)?(password|email)",
-                           r"(password|email)\s+(change|reset)", r"change[-_]?(password|email)",
-                           r"reset[-_]?(password|email)"]),
-    ("payment", [r"pay", r"payment", r"purchase", r"checkout", r"check\s*out", r"refund", r"transfer"]),
-    ("outbound_message", [r"send", r"invite", r"notify", r"email", r"sms"]),
-    ("deactivate", [r"deactivate", r"disable", r"revoke", r"cancel\s+(my\s+)?(subscription|account)"]),
+    ("delete", [r"delet(?:e|es|ed|ing|ion)", r"remov(?:e|es|ed|ing|al)", r"destroy(?:s|ed|ing)?",
+                r"purg(?:e|es|ed|ing)", r"eras(?:e|es|ed|ing|ure)", r"trash(?:es|ed|ing)?",
+                r"archiv(?:e|es|ed|ing)"]),
+    ("credential_change", [r"(?:change|changes|changed|changing|reset|resets|resetting)\s+" + _DET + r"(?:password|email)",
+                           r"(?:password|email)\s+(?:change|reset)"]),
+    ("payment", [r"pay(?:s|ed|ing|ment|ments)?", r"purchas(?:e|es|ed|ing)", r"check\s*out",
+                 r"refund(?:s|ed|ing)?", r"transfer(?:s|red|ring)?"]),
+    ("outbound_message", [r"send(?:s|ing)?", r"sent", r"invit(?:e|es|ed|ing|ation|ations)",
+                          r"notif(?:y|ies|ied|ication|ications)", r"e\s*mail(?:s|ed|ing)?", r"sms"]),
+    ("deactivate", [r"deactivat(?:e|es|ed|ing|ion)", r"disabl(?:e|es|ed|ing)", r"revok(?:e|es|ed|ing)",
+                    r"cancel(?:s|led|ling|ed)?\s+" + _DET + _NOUN, r"terminat(?:e|es|ed|ing|ion)",
+                    r"clos(?:e|es|ed|ing)\s+" + _DET + r"account"]),
 ]
-_COMPILED = [(cat, re.compile(r"(?<![a-z0-9])(?:" + "|".join(ws) + r")(?![a-z0-9])", re.I))
-             for cat, ws in KEYWORDS]
-_LOGOUT = re.compile(r"(?<![a-z0-9])(?:" + "|".join(LOGOUT_WORDS) + r")(?![a-z0-9])", re.I)
+_COMPILED = [(cat, re.compile(r"\b(?:" + "|".join(ws) + r")\b")) for cat, ws in KEYWORDS]
+_LOGOUT = re.compile(r"\b(?:log\s*out|sign\s*out|log\s*off|sign\s*off)\b")
+_CAMEL = re.compile(r"([a-z0-9])([A-Z])")
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+
+def _tok(text: str) -> str:
+    return _NON_ALNUM.sub(" ", _CAMEL.sub(r"\1 \2", text).lower()).strip()
+
+
 _WRITE = {"POST", "PUT", "PATCH"}
 
 
@@ -54,12 +67,13 @@ def classify(a: ActionDescriptor, profile: str) -> Flag:
     method = (a.method or "").upper()
     label, url, ctx = a.label or "", a.url or "", a.context_text or ""
 
-    if _LOGOUT.search(label) or _LOGOUT.search(url) or LOGOUT_URL.search(url):
+    tl, tu, tc = _tok(label), _tok(url), _tok(ctx)
+    if _LOGOUT.search(tl) or _LOGOUT.search(tu):
         return _held("logout", "logout/sign-out action")
     if method == "DELETE":
         return _held("delete", "HTTP DELETE request")
     for cat, rx in _COMPILED:
-        for source, text in (("label", label), ("url", url), ("context", ctx)):
+        for source, text in (("label", tl), ("url", tu), ("context", tc)):
             m = rx.search(text)
             if m:
                 return _held(cat, f"{source} matches {cat} keyword '{m.group(0).lower()}'")

@@ -72,3 +72,66 @@ def test_item_decision_beats_rule(tmp_path):
 
 def test_load_without_file(tmp_path):
     assert _q(tmp_path).load_decisions() == 0
+
+
+def _write(q, mutate):
+    q.write_yaml()
+    data = yaml.safe_load(q.yaml_path.read_text())
+    mutate(data)
+    q.yaml_path.write_text(yaml.safe_dump(data))
+
+
+def test_invalid_rules_not_applied_and_reported(tmp_path):
+    q = _q(tmp_path)
+    a = q.enqueue(_pa())
+    bad = [{"match": {}, "decision": "approve"},
+           {"match": {"categroy": "delete"}, "decision": "approve"},
+           {"match": {"category": "delete", "typo": "x"}, "decision": "approve"},
+           {"match": {"label_contains": ""}, "decision": "approve"},
+           {"match": {"category": "delete"}, "decision": "aprove"},
+           {"decision": "approve"}, "junk"]
+    _write(q, lambda d: d.update(rules=bad))
+    assert q.load_decisions() == 0
+    assert _decision(q, a) == "pending"
+    assert len(q.warnings) == len(bad)
+
+
+def test_role_and_label_rules(tmp_path):
+    q = _q(tmp_path)
+    a = q.enqueue(_pa(role="admin", label="Delete Foo", path=[{"o": 1}]))
+    b = q.enqueue(_pa(role="user", label="Delete Bar", path=[{"o": 2}]))
+    c = q.enqueue(_pa(role="user", label="Other", path=[{"o": 3}]))
+    _write(q, lambda d: d.update(rules=[
+        {"match": {"role": "admin"}, "decision": "skip"},
+        {"match": {"role": "user", "label_contains": "delete b"}, "decision": "approve"}]))
+    assert q.load_decisions() == 2
+    assert (_decision(q, a), _decision(q, b), _decision(q, c)) == ("skip", "approve", "pending")
+    assert q.warnings == []
+
+
+def test_url_contains_case_insensitive(tmp_path):
+    q = _q(tmp_path)
+    a = q.enqueue(_pa(url="http://t/api/APPMAP-9"))
+    _write(q, lambda d: d.update(rules=[{"match": {"url_contains": "appmap-"}, "decision": "approve"}]))
+    assert q.load_decisions() == 1 and _decision(q, a) == "approve"
+
+
+def test_dedup_distinguishes_requests_with_empty_paths(tmp_path):
+    q = _q(tmp_path)
+    a = q.enqueue(_pa(url="http://t/a/1", path=[]))
+    b = q.enqueue(_pa(url="http://t/a/2", path=[]))
+    assert a != b
+    assert q.enqueue(_pa(url="http://t/a/1", path=[])) == a
+
+
+def test_pending_revokes_and_typos_warn(tmp_path):
+    q = _q(tmp_path)
+    a = q.enqueue(_pa())
+    b = q.enqueue(_pa(label="Delete y", path=[{"o": 1}]))
+    _write(q, lambda d: (d["items"][0].update(decision="approve"), d["items"][1].update(decision="aprove")))
+    assert q.load_decisions() == 1 and _decision(q, a) == "approve"
+    assert _decision(q, b) == "pending" and len(q.warnings) == 1
+    _write(q, lambda d: d["items"][0].update(decision="pending"))
+    assert q.load_decisions() == 1
+    row = q.store.conn.execute("SELECT decision, decided_by FROM approvals WHERE id=?", (a,)).fetchone()
+    assert tuple(row) == ("pending", None)
