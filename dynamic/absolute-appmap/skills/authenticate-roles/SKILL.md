@@ -9,10 +9,10 @@ Every role must hold a working session before probing and crawling. `appmap auth
 role in, records the outcome in the `roles` table (`auth_ok`), and saves the session (cookies,
 localStorage, sessionStorage) to `~/.cache/absolute-appmap/sessions/<run_id>/<role>.json` —
 never into the run directory. Later commands reuse it. When a session is lost mid-crawl or
-mid-probe, `form` roles are re-logged in automatically; a `manual` role would need the operator
-again, and that re-login prompts on the terminal — which is why `crawl` and `probe` are run with
-stdin closed when a manual role exists (see `crawl-application`), so a lost manual session fails
-fast instead of waiting.
+mid-probe, `form` roles are re-logged in automatically (at most twice in a row; a failed re-login
+is never repeated, to avoid account lockouts). `crawl` and `probe` never prompt for a manual
+login: a lost `manual` session (or a failed re-login) stops that role with `auth_failed` and its
+pending work kept, and `next` names the `appmap auth` command to run with the operator.
 
 Conventions (`appmap` = the plugin's `scripts/appmap` wrapper, run by absolute path; the
 `APPMAP_STATUS` contract) are in `../map-running-application/SKILL.md`.
@@ -94,7 +94,8 @@ operator.
 | "Succeeds" but the app is still anonymous | Login stays on the same URL | Add `success_selector` (an element only visible when logged in) |
 | MFA prompt, CAPTCHA, SSO redirect | Not scriptable | Step 3 (manual), or `type: manual` in the config |
 | `storage_state` fails | File missing or expired | Ask the operator for a fresh state file |
-| `crawl`/`probe` hangs after printing `[appmap] Log in as role …` | A manual role's session expired and the command is waiting for Enter | Stop the command; re-authenticate that role with the operator (Step 3); rerun with stdin closed (`</dev/null`) |
+| `crawl` reports `auth_failed` for a role | Its session was lost and the re-login failed (changed password, expired manual session) | Re-authenticate that role (Step 3 for manual roles, with the operator); then rerun the crawl — its pending items were kept |
+| SSO login page blocked / login never completes | The IdP host is out of scope | Add the IdP host(s) to `scope.login_allow_hosts` (login pages only) |
 
 Edit the config file in place (it is re-read on every command), then rerun
 `appmap auth --run <run> --role <role>`.

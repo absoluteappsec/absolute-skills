@@ -8,7 +8,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Awaitable
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
 
 from playwright.async_api import BrowserContext, Page, Request, Route, WebSocket
@@ -22,9 +22,11 @@ from ..rundir import RunDir
 from ..store import Store
 from ..throttle import CircuitOpen
 
-# Static subresources of in-scope hosts skip the rate limiter (scope still applies).
+# Static subresources of in-scope hosts (and of scope.static_allow_hosts) skip the rate
+# limiter, in every profile (scope and deny patterns still apply).
 STATIC_TYPES = frozenset({"image", "stylesheet", "script", "font", "media"})
 _CDP_STATIC_TYPES = frozenset({"Image", "Stylesheet", "Script", "Font", "Media"})
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _CSRF = re.compile(r"csrf|xsrf", re.I)
 _FRAME_LIMIT = 4096
 
@@ -55,6 +57,11 @@ class TrafficRecorder:
         self._roles: dict[BrowserContext, str] = {}
         self._safe: set[Page] = set()        # armed before any request could start
         self._quarantine: set[Page] = set()  # unarmed pages whose requests are refused
+        # Decides a redirect hop that re-sends a write (307/308 keep method and body):
+        # ``await redirect_guard(method, url, role, page)`` -> allowed. The crawler installs
+        # its destructive classifier here; without one only login pages may do this.
+        self.redirect_guard: Callable[[str, str, str, Page | None], Awaitable[bool]] | None \
+            = None
 
     # -- wiring ------------------------------------------------------------
     async def attach(self, context: BrowserContext, role: str) -> None:
@@ -69,7 +76,7 @@ class TrafficRecorder:
         for page in context.pages:
             self._watch_page(page, role)
 
-    async def _cdp_allows(self, ev: dict, role: str) -> bool:
+    async def _cdp_allows(self, ev: dict, role: str, page: Page | None = None) -> bool:
         """Every paused request gets scope + deny checks. Chromium restarts cross-origin
         redirected fetch/XHR as a fresh request (no redirectedRequestId, no route call), so
         the limiter/breaker apply to anything the route handler did not already admit."""
@@ -78,15 +85,32 @@ class TrafficRecorder:
         if urlsplit(url).scheme not in ("http", "https"):
             return True  # data:, blob:, about: never reach the network
         found_on = req.get("headers", {}).get("Referer", "")
-        if not self.gate.scope.allows(url):
+        static = ev.get("resourceType") in _CDP_STATIC_TYPES
+        login = page is not None and page in self.login_pages
+        if not self.gate.scope.allows(url, login=login, static=static):
             await self.gate.admit(method, url, role=role, found_on=found_on)  # records link
             return False
         redirected = bool(ev.get("redirectedRequestId"))
-        if ev.get("resourceType") in _CDP_STATIC_TYPES:
+        if redirected and method.upper() not in _SAFE_METHODS \
+                and not await self._redirect_write_allowed(method, url, role, page):
+            return False
+        if static:
             return True
         if not redirected and not self._claim(method, url):
             return True
-        return await self.gate.admit(method, url, role=role, found_on=found_on)
+        return await self.gate.admit(method, url, role=role, found_on=found_on, login=login)
+
+    async def _redirect_write_allowed(self, method: str, url: str, role: str,
+                                      page: Page | None) -> bool:
+        """A 307/308 hop re-sends a write to a URL nobody classified (route handlers never
+        see redirect hops)."""
+        if self.redirect_guard is not None:
+            return await self.redirect_guard(method, url, role, page)
+        if page is not None and page in self.login_pages:
+            return True  # a login flow's own redirected submit
+        self.events.emit("error", role=role, url=self.redactor.url(url),
+                         message=f"{method} redirect hop refused (no destructive classifier)")
+        return False
 
     def _claim(self, method: str, url: str) -> bool:
         """True if the caller must admit this request; False if the other gate (route
@@ -112,7 +136,7 @@ class TrafficRecorder:
             req = ev["request"]
             url = req["url"]
             try:
-                ok = await self._cdp_allows(ev, role)
+                ok = await self._cdp_allows(ev, role, page)
             except CircuitOpen as exc:
                 self.events.emit("error", role=role, message=str(exc), url=url)
                 ok = False
@@ -189,12 +213,13 @@ class TrafficRecorder:
                     and request.frame == page.main_frame:
                 self._spawn(self._replay_navigation(page, task, url, role))
             return
-        if request.resource_type in STATIC_TYPES and self.gate.scope.allows(url):
+        if request.resource_type in STATIC_TYPES and self.gate.scope.allows(url, static=True):
             await route.continue_()
             return
         try:
             admitted = (not self._claim(request.method, url)) or await self.gate.admit(
-                request.method, url, role=role, found_on=self._found_on(request))
+                request.method, url, role=role, found_on=self._found_on(request),
+                login=page in self.login_pages)
         except CircuitOpen as exc:
             self.events.emit("error", role=role, message=str(exc), url=url)
             admitted = False
@@ -257,6 +282,8 @@ class TrafficRecorder:
                 learned[_canonical_header(name)] = value
 
     async def _record(self, request: Request, role: str) -> None:
+        if not self.gate.scope.allows(request.url):
+            return  # login-only (IdP) and static-only (CDN) hosts: HAR only, no endpoints
         try:
             response = await request.response()
             if response is None:

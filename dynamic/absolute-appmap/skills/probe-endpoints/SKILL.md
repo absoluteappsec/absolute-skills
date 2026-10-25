@@ -21,11 +21,8 @@ of the loop:
 Conventions (`appmap` = the plugin's `scripts/appmap` wrapper, run by absolute path; the
 `APPMAP_STATUS` contract) are in `../map-running-application/SKILL.md`.
 
-**When the config has a `manual` role, run probes with stdin closed** (append `</dev/null`, e.g.
-`appmap probe --run <run> --phase active </dev/null`), as for `crawl`: a lost manual session must
-fail fast with a warning, never wait for keyboard input. If a command hangs after printing
-`[appmap] Log in as role …`, stop it and re-authenticate that role with the operator
-(`authenticate-roles`).
+Probes never prompt for a manual login: a `manual` role without a working saved session is
+skipped with a warning in `errors`; re-authenticate it with the operator (`authenticate-roles`).
 
 ---
 

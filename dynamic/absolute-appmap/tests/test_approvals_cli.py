@@ -512,3 +512,45 @@ async def test_yaml_edits_during_crawl_are_kept(browser, stub_server, make_cfg, 
     assert item["decision"] == "deny" and item["note"] == "not this one"
     assert q(rd.root, "SELECT decision FROM approvals")[0]["decision"] == "deny"
     assert not list(rd.root.glob(".approvals.yaml.*.tmp"))
+
+
+def test_run_lock_refuses_concurrent_writer(ssr_url, make_cfg, tmp_path, capsys):
+    """I4: auth/crawl/probe/approvals/build hold <run>/.lock; a second one stops."""
+    from appmap.rundir import run_lock
+    root = _init(make_cfg, ssr_url, tmp_path, capsys)
+    with run_lock(root):
+        assert main(["approvals", "--run", str(root), "write"]) == 1
+        st = _status(capsys)
+        assert st["status"] == "locked" and not st["ok"] and st["errors"]
+        assert "appmap approvals --run" in st["next"]
+        assert main(["build", "--run", str(root)]) == 1
+        assert _status(capsys)["status"] == "locked"
+        assert main(["status", "--run", str(root)]) == 0  # read-only: not locked
+        _status(capsys)
+    assert main(["approvals", "--run", str(root), "write"]) == 0
+    assert _status(capsys)["status"] == "written"
+
+
+async def test_approval_executed_elsewhere_is_not_resent(browser, stub_server, make_cfg,
+                                                          run_dir, tmp_path, monkeypatch):
+    """I4: the row is re-read right before the action is let through."""
+    srv = stub_server({"/": H("<p>home</p>"), "/api/items/9": lambda r: "gone"})
+    cfg = _anon(make_cfg, srv.url)
+    rd = run_dir(tmp_path, cfg)
+    url = srv.url + "/api/items/9"
+    step = {"type": "request", "method": "DELETE", "url": url, "origin": "replay"}
+    [aid] = _enqueue(rd.root, _pa(f"DELETE {url}", path=[step],
+                                  pred={"method": "DELETE", "url": url, "origin": "replay"}))
+    _decide(rd, {aid: "approve"})
+    real = ApprovalQueue.approved_unexecuted
+
+    def listed_then_run_elsewhere(self):
+        items = real(self)
+        self.store.conn.execute("UPDATE approvals SET executed_event='ev-elsewhere' WHERE id=?",
+                                (aid,))
+        return items
+    monkeypatch.setattr(ApprovalQueue, "approved_unexecuted", listed_then_run_elsewhere)
+    stats = await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=2, approved_only=True,
+                            browser=browser)
+    assert stats.approvals == {"executed": 0, "failed": 0, "skipped": 1}
+    assert ("DELETE", "/api/items/9") not in srv.requests

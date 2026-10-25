@@ -10,9 +10,6 @@ from pathlib import Path
 
 from appmap import __version__
 
-COMMANDS = ["init", "auth", "crawl", "probe", "approvals", "build", "status", "query"]
-IMPLEMENTED = {"init", "auth", "crawl", "probe", "approvals", "build", "status", "query"}
-
 log = logging.getLogger("appmap.cli")
 
 
@@ -91,9 +88,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--new-pass", action="store_true",
                    help="start the next pass: snapshot current counts as its baseline")
     _add_query_parser(sub)
-    for name in COMMANDS:
-        if name not in IMPLEMENTED:
-            sub.add_parser(name, help=f"{name} (not yet implemented)")
     return parser
 
 
@@ -652,6 +646,9 @@ def cmd_status(args) -> int:
     return 0
 
 
+# Commands that write the run directory hold its lock (status/query/init do not).
+LOCKED = {"auth", "crawl", "probe", "approvals", "build"}
+
 HANDLERS = {"init": cmd_init, "auth": cmd_auth, "crawl": cmd_crawl, "probe": cmd_probe,
             "approvals": cmd_approvals, "build": cmd_build, "status": cmd_status,
             "query": cmd_query}
@@ -666,12 +663,21 @@ def main(argv: list[str] | None = None) -> int:
     if not args.command:
         parser.print_help()
         return 2
-    handler = HANDLERS.get(args.command)
-    if handler is None:
-        emit_status(args.command, ok=False, status="not_implemented",
-                    errors=[f"'{args.command}' is not implemented yet"])
+    handler = HANDLERS[args.command]
+    run = getattr(args, "run", None)
+    if args.command not in LOCKED or not run or not Path(run).is_dir():
+        return handler(args)
+    from appmap.rundir import RunLocked, run_lock
+    try:
+        with run_lock(Path(run)):
+            return handler(args)
+    except RunLocked as e:
+        again = shlex.join(["appmap", *(argv if argv is not None else sys.argv[1:])])
+        emit_status(args.command, ok=False, status="locked",
+                    errors=[f"{e}; only one auth/crawl/probe/approvals/build command may run "
+                            "on a run directory at a time"],
+                    next=f"wait for the other command to finish, then rerun: {again}")
         return 1
-    return handler(args)
 
 
 if __name__ == "__main__":

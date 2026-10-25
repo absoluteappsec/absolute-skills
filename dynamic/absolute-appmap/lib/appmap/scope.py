@@ -39,20 +39,29 @@ class ScopeGuard:
     def __init__(self, scope: Scope):
         self.scope = scope
         self._hosts = {h.lower() for h in scope.allow_hosts}
+        self._login = {h.lower() for h in scope.login_allow_hosts}
+        self._static = {h.lower() for h in scope.static_allow_hosts}
         self._deny = [d.lower() for d in scope.deny_patterns]
 
-    def allows(self, url: str) -> bool:
+    def allows(self, url: str, *, login: bool = False, static: bool = False) -> bool:
+        """In scope for crawling/probing. ``login=True`` (a login flow's page) also admits
+        ``login_allow_hosts``; ``static=True`` (a static subresource) also admits
+        ``static_allow_hosts``. Path prefixes apply to scope hosts only; deny patterns to
+        every host."""
         try:
             parts = urlsplit(url)
             host = (parts.hostname or "").lower()
         except ValueError:
             return False
-        if parts.scheme not in ("http", "https") or host not in self._hosts:
+        if parts.scheme not in ("http", "https"):
             return False
         raw = parts.path or "/"
-        canon = _canonical(raw)
-        prefixes = self.scope.allow_path_prefixes
-        if prefixes and not any(self._under(canon, p) for p in prefixes):
+        if host in self._hosts:
+            canon = _canonical(raw)
+            prefixes = self.scope.allow_path_prefixes
+            if prefixes and not any(self._under(canon, p) for p in prefixes):
+                return False
+        elif not ((login and host in self._login) or (static and host in self._static)):
             return False
         return not any(fnmatchcase(v, pat) for v in _variants(raw) for pat in self._deny)
 

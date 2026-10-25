@@ -226,7 +226,7 @@ async def probe_bundles(client: DirectClient, api, cfg, store: Store, frontier: 
             counts["timed_out"] = 1
             return None
         got = await with_source(client, source, attribute="ok").request(
-            api, "GET", url, role=role, origin=origin)
+            api, "GET", url, role=role, origin=origin, static=True)
         counts["requests"] += 1
         if got is None or got[0] != 200:
             return None
@@ -297,7 +297,7 @@ async def probe_bundles(client: DirectClient, api, cfg, store: Store, frontier: 
         if expired(deadline):
             counts["timed_out"] = 1
             break
-        if not scope.allows(url):
+        if not scope.allows(url, static=True):  # app bundles may live on a CDN host
             continue
         js = await body_of(url, "bundle", "bundle")
         if js is None:
@@ -308,7 +308,7 @@ async def probe_bundles(client: DirectClient, api, cfg, store: Store, frontier: 
         maps = {urldefrag(urljoin(url, m))[0] for m in found.source_maps
                 if not m.startswith("data:")} or {url.split("?", 1)[0] + ".map"}
         for map_url in sorted(maps):
-            if not scope.allows(map_url):
+            if not scope.allows(map_url, static=True):
                 continue
             text = await body_of(map_url, "source_map", "passive")
             if not text:

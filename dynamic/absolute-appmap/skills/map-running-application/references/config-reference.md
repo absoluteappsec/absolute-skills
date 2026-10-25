@@ -17,6 +17,8 @@ target:
     allow_hosts: ["staging.example.com", "api.staging.example.com"]  # default: hosts of base_urls
     allow_path_prefixes: ["/"]                         # default [] = whole host
     deny_patterns: ["/admin/billing/*", "*/logout"]    # globs on the URL path, case-insensitive
+    login_allow_hosts: []                              # external IdP/SSO hosts: login pages only
+    static_allow_hosts: []                             # CDN hosts: static subresources only
 authorization:                                         # required
   confirmed_by: "Jane Doe (Security Lead)"             # required, non-empty: who confirmed
   notes: "Engagement #1234, staging only, 2026-10-24"  # optional
@@ -66,7 +68,9 @@ redact_patterns: []          # extra regexes whose matches are redacted everywhe
 | `target.base_urls` | — | Crawl entry points. The first URL's host names the run directory |
 | `scope.allow_hosts` | hosts of `base_urls` | Only these hosts are ever requested (browser and direct). Add API hosts here |
 | `scope.allow_path_prefixes` | `[]` (whole host) | If set, only paths under one of these prefixes |
-| `scope.deny_patterns` | `[]` | `fnmatch` globs on the path (not the host), lowercased, e.g. `*/logout`, `/admin/billing/*`. Denied URLs are never requested |
+| `scope.deny_patterns` | `[]` | `fnmatch` globs on the path (not the host), lowercased, e.g. `*/logout`, `/admin/billing/*`. Denied URLs are never requested (on any host) |
+| `scope.login_allow_hosts` | `[]` | External identity-provider hosts (SSO: `login.microsoftonline.com`, `example.okta.com`, `accounts.example-idp.com`). Admitted **only** for pages of a login flow (`appmap auth`, scripted login, re-login); never crawled, probed, replayed or recorded as endpoints (their traffic stays in the redacted HAR only) |
+| `scope.static_allow_hosts` | `[]` | CDN hosts serving the app's scripts, styles, fonts and images (`cdn.example.com`, `d123.cloudfront.net`). Admitted **only** for static subresources the browser loads (and for `probe` bundle mining to read scripts and source maps); never navigated to, crawled or replayed. Add `deny_patterns` if parts of the CDN must stay untouched. A host that serves the app's API belongs in `allow_hosts` instead |
 | `authorization.confirmed_by` | — | Required. Write the operator's own name/role as they stated it — never invent it |
 | `authorization.notes` | `""` | Engagement id, environment, date, limits the operator mentioned |
 | `profile` | `staging` | See profiles below |
@@ -106,13 +110,15 @@ Production values in the file can only make the run gentler, never harsher.
 
 | `type` | Keys | Behaviour |
 |---|---|---|
-| `form` | `url` (absolute URL of the login page; default: the first base URL), `username_env`, `password_env`; optional `username_selector`, `password_selector`, `submit_selector`, `success_selector` | Scripted login with credentials read from the named environment variables at run time. Default selectors: username `input[type=email], input[name*=user i], input[name*=email i]`; password `input[type=password]`; submit `button[type=submit], input[type=submit]`. Success = left the login URL and no password field visible, or `success_selector` visible |
-| `manual` | `url` (absolute; default: the first base URL) | `appmap auth` opens a headed browser at `url`; the operator logs in (SSO, MFA) and presses Enter in the terminal |
+| `form` | `url` (login page: absolute, or a path such as `/login` resolved against the first base URL; default: the first base URL), `username_env`, `password_env` (both required); optional `username_selector`, `password_selector`, `submit_selector`, `success_selector` | Scripted login with credentials read from the named environment variables at run time. Default selectors: username `input[type=email], input[name*=user i], input[name*=email i]`; password `input[type=password]`; submit `button[type=submit], input[type=submit]`. Success = left the login URL and no password field visible, or `success_selector` visible |
+| `manual` | `url` (absolute or a path; default: the first base URL) | `appmap auth` opens a headed browser at `url`; the operator logs in (SSO, MFA) and presses Enter in the terminal. Only `appmap auth` ever asks for a manual login: when the saved session expires during `crawl`/`probe`, the role stops (`auth_failed`) instead of prompting |
 | `none` | — | Anonymous |
 | `storage_state` | `storage_state_path` | A Playwright storage-state JSON the operator captured |
 
-Always write `url` as an absolute URL (`https://host/login`): a bare path such as `/login`
-is not resolved against the base URL and the login fails.
+A relative `url` (`/login`) is resolved against the first `base_urls` entry when the config is
+loaded. When the login page sends the browser to an external identity provider, list that
+provider's host(s) in `scope.login_allow_hosts` (and the CDN hosts its pages load assets from, if
+any, too); otherwise the IdP page is blocked and the login fails.
 
 `username`/`password` keys in the config are rejected: credentials come only from the
 environment. Session state (cookies, localStorage, sessionStorage) is saved to

@@ -346,3 +346,64 @@ async def test_opener_driven_popup_fetch_blocked(browser, stub_server, make_cfg,
     await h.recorder.drain()
     assert ext.requests == []
     await sess.context.close()
+
+
+async def test_unsafe_redirect_hop_refused_without_classifier(browser, stub_server, make_cfg,
+                                                              run_dir, tmp_path, monkeypatch):
+    """I1: outside the crawler (no redirect_guard), a 307 re-sending a POST is refused."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    srv = stub_server({
+        "/": lambda r: Response("<form method='post' action='/save'><button>Go</button></form>",
+                                mimetype="text/html"),
+        "/save": lambda r: Response(status=307, headers={"Location": "/items/7/delete"}),
+        "/items/7/delete": lambda r: Response("deleted", mimetype="text/html"),
+    })
+    cfg = make_cfg(srv.url, roles=[{"name": "anonymous", "login": {"type": "none"}}])
+    h = Harness(cfg, run_dir(tmp_path, cfg))
+    sess = await h.open(browser, "anonymous")
+    page = await h.recorder.new_page(sess.context)
+    await page.goto(srv.url + "/")
+    try:
+        await page.click("button")
+        await page.wait_for_timeout(500)
+    except Exception:
+        pass
+    await h.recorder.drain()
+    assert ("POST", "/save") in srv.requests
+    assert ("POST", "/items/7/delete") not in srv.requests
+    await sess.context.close()
+
+
+async def test_login_and_static_allow_hosts_in_browser(browser, stub_server, make_cfg, run_dir,
+                                                       tmp_path, monkeypatch):
+    """I2: a CDN script loads (static_allow_hosts) and an IdP page opens from a login page
+    (login_allow_hosts); neither host is reachable otherwise or recorded as an endpoint."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    ext = stub_server({
+        "/lib.js": lambda r: Response("document.title = 'cdn-loaded'",
+                                      mimetype="application/javascript"),
+        "/sso": lambda r: Response("<title>IdP</title>", mimetype="text/html")})
+    ext_base = f"http://localhost:{ext.port}"
+    app = stub_server({"/": lambda r: Response(
+        f"<title>app</title><script src='{ext_base}/lib.js'></script>", mimetype="text/html")})
+    cfg = make_cfg(app.url, roles=[{"name": "anonymous", "login": {"type": "none"}}],
+                   scope={"static_allow_hosts": ["localhost"],
+                          "login_allow_hosts": ["localhost"]})
+    h = Harness(cfg, run_dir(tmp_path, cfg))
+    sess = await h.open(browser, "anonymous")
+    page = await h.recorder.new_page(sess.context)
+    await page.goto(app.url + "/")
+    await page.wait_for_function("document.title === 'cdn-loaded'", timeout=5000)
+    try:  # a crawl page may not navigate to the IdP / CDN host
+        await page.goto(ext_base + "/sso")
+    except Exception:
+        pass
+    assert ("GET", "/sso") not in ext.requests
+    login_page = await h.recorder.new_page(sess.context)
+    h.recorder.login_pages.add(login_page)
+    await login_page.goto(ext_base + "/sso")
+    assert await login_page.title() == "IdP"
+    await h.recorder.drain()
+    assert ("GET", "/lib.js") in ext.requests and ("GET", "/sso") in ext.requests
+    assert not [r for r in rows(h, "SELECT url FROM exchanges") if "localhost" in r["url"]]
+    await sess.context.close()

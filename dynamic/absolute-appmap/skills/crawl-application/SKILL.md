@@ -34,11 +34,9 @@ app yourself to "help" the crawler.
   fixed time, pick a budget a few minutes below that limit.
 - Roles without a saved session are logged in first; `manual` roles must have been
   authenticated by the operator beforehand (`authenticate-roles`).
-- **When the config has a `manual` role, run the crawl with stdin closed:**
-  `appmap crawl --run <run> </dev/null`. If that role's session is lost mid-crawl, the re-login
-  then fails fast (a `login failed` warning in `errors`) instead of waiting for an Enter that never
-  comes. If a crawl ever hangs after printing `[appmap] Log in as role …`, stop it and
-  re-authenticate that role with the operator.
+- The crawl never prompts for a manual login. If a `manual` role's session is lost mid-crawl (or
+  any role's re-login fails), that role stops with `auth_failed` and its pending items kept;
+  re-authenticate it with the operator (`authenticate-roles`), then rerun the crawl.
 
 ---
 

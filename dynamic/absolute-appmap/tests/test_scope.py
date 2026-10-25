@@ -51,3 +51,17 @@ def test_prefix_root_and_exact():
     g = guard(allow_path_prefixes=["/app/"])
     assert g.allows("https://app.example.com/app")
     assert g.allows("https://app.example.com/app/")
+
+
+def test_login_and_static_hosts_only_in_their_context():
+    """I2: an external IdP is reachable only from a login flow, a CDN only for static
+    subresources; neither is ever in scope for crawling or probing."""
+    g = guard(login_allow_hosts=["idp.example.net"], static_allow_hosts=["cdn.example.net"])
+    assert not g.allows("https://idp.example.net/authorize")
+    assert g.allows("https://idp.example.net/authorize", login=True)
+    assert not g.allows("https://idp.example.net/authorize", static=True)
+    assert not g.allows("https://cdn.example.net/app.js")
+    assert g.allows("https://cdn.example.net/app.js", static=True)
+    assert not g.allows("https://cdn.example.net/app.js", login=True)
+    assert not g.allows("https://idp.example.net/logout", login=True)  # deny still applies
+    assert not g.allows("ftp://idp.example.net/x", login=True)

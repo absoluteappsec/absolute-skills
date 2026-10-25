@@ -1,11 +1,12 @@
 """Run configuration: YAML loading, profile defaults and validation."""
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import yaml
 
@@ -39,6 +40,11 @@ class Scope:
     allow_hosts: list[str]
     allow_path_prefixes: list[str] = field(default_factory=list)
     deny_patterns: list[str] = field(default_factory=list)
+    # Hosts admitted only for a login flow's pages (external IdP / SSO) ...
+    login_allow_hosts: list[str] = field(default_factory=list)
+    # ... and only for static subresources (CDN scripts, styles, fonts, images).
+    # Neither is ever crawled, probed or replayed.
+    static_allow_hosts: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -138,9 +144,9 @@ def _num(values: dict, key: str, *, integer: bool, lo: float,
          lo_open: bool = False, hi: float | None = None) -> None:
     v = values[key]
     ok_type = isinstance(v, int) if integer else isinstance(v, (int, float))
-    if isinstance(v, bool) or not ok_type:
+    if isinstance(v, bool) or not ok_type or not math.isfinite(v):
         raise ConfigError(
-            f"limits.{key} must be {'an integer' if integer else 'a number'}")
+            f"limits.{key} must be {'an integer' if integer else 'a finite number'}")
     if (v <= lo if lo_open else v < lo) or (hi is not None and v > hi):
         rng = f"{'>' if lo_open else '>='} {lo}" + (f" and <= {hi}" if hi is not None else "")
         raise ConfigError(f"limits.{key} must be {rng}")
@@ -169,7 +175,7 @@ def _bool(raw: dict, key: str, default: bool, what: str) -> bool:
     return v
 
 
-def _parse_login(raw, role: str) -> LoginSpec:
+def _parse_login(raw, role: str, base_url: str) -> LoginSpec:
     raw = _mapping(raw, f"roles[{role}].login")
     if "password" in raw or "username" in raw:
         raise ConfigError(
@@ -183,7 +189,20 @@ def _parse_login(raw, role: str) -> LoginSpec:
     unknown = set(raw) - known
     if unknown:
         raise ConfigError(f"roles[{role}].login: unknown keys {sorted(unknown)}")
-    return LoginSpec(**{**raw, "type": ltype})
+    spec = LoginSpec(**{**raw, "type": ltype})
+    if ltype == "form":
+        missing = [k for k in ("username_env", "password_env") if not getattr(spec, k)]
+        if missing:
+            raise ConfigError(f"roles[{role}].login: type form needs {' and '.join(missing)} "
+                              "(names of environment variables holding the credentials)")
+    if spec.url is not None:
+        if not isinstance(spec.url, str) or not spec.url.strip():
+            raise ConfigError(f"roles[{role}].login.url must be a URL or a path")
+        # ``url: /login`` (as in the spec example) is relative to the first base URL.
+        spec.url = urljoin(base_url, spec.url)
+        if urlparse(spec.url).scheme not in ("http", "https"):
+            raise ConfigError(f"roles[{role}].login.url is not an http(s) URL: {spec.url}")
+    return spec
 
 
 def _parse_limits(raw, profile: str) -> Limits:
@@ -264,6 +283,10 @@ def load_config(path: Path) -> RunConfig:
         allow_path_prefixes=_strs(scope_raw.get("allow_path_prefixes"),
                                   "scope.allow_path_prefixes"),
         deny_patterns=_strs(scope_raw.get("deny_patterns"), "scope.deny_patterns"),
+        login_allow_hosts=[h.lower() for h in _strs(scope_raw.get("login_allow_hosts"),
+                                                    "scope.login_allow_hosts")],
+        static_allow_hosts=[h.lower() for h in _strs(scope_raw.get("static_allow_hosts"),
+                                                     "scope.static_allow_hosts")],
     )
 
     disc_raw = _mapping(raw.get("discovery"), "discovery")
@@ -290,7 +313,7 @@ def load_config(path: Path) -> RunConfig:
         name = r.get("name")
         if not isinstance(name, str) or not name:
             raise ConfigError("each role needs a name")
-        roles.append(Role(name=name, login=_parse_login(r.get("login"), name)))
+        roles.append(Role(name=name, login=_parse_login(r.get("login"), name, base_urls[0])))
 
     fd_raw = _mapping(raw.get("form_data"), "form_data")
     _check_keys(fd_raw, FormData.__dataclass_fields__, "form_data")

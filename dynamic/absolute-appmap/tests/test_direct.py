@@ -115,3 +115,19 @@ async def test_network_error_observed_and_returns_none(api, tmp_path):
     assert await client.request(api, "GET", "http://127.0.0.1:1/", role="r", origin="ui") is None
     assert seen == [599]
     assert [e.type for e in ev.iter()] == ["error"]
+
+
+@pytest.mark.parametrize("code", [307, 308])
+async def test_unsafe_method_307_308_redirect_not_followed(api, tmp_path, stub_server, code):
+    """I1: a 307/308 re-sends the same method and body to the target, which was never
+    classified: record the 3xx and stop (GET still follows)."""
+    srv = stub_server({
+        "/save": lambda r: Response(status=code, headers={"Location": "/items/7/delete"}),
+        "/items/7/delete": lambda r: "deleted"})
+    _, _, client, calls = make(tmp_path)
+    status, _ = await client.request(api, "POST", srv.url + "/save", role="r", origin="replay",
+                                     data=b"a=1")
+    assert status == code
+    assert srv.requests == [("POST", "/save")]
+    status, _ = await client.request(api, "GET", srv.url + "/save", role="r", origin="replay")
+    assert status == 200 and ("GET", "/items/7/delete") in srv.requests

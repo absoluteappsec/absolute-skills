@@ -115,6 +115,10 @@ class _Fail(Exception):
     """A step of an item could not be performed (unresolvable locator, navigation error)."""
 
 
+class _NotRunnable(Exception):
+    """An approved item was executed, started or revoked elsewhere since it was listed."""
+
+
 class _AuthFailed(Exception):
     """The role could not be re-authenticated: stop it, leave the item pending."""
 
@@ -297,6 +301,7 @@ class Crawler:
             # the role context: all pages, popups and workers, during and between actions.
             await sess.context.route(
                 "**/*", lambda route, request: self._guard_route(route, request, role))
+            self.recorder.redirect_guard = self._guard_redirect
             if self.cfg.spa != "off":
                 await sess.context.add_init_script(HISTORY_PATCH_JS)
             page = await self.recorder.new_page(sess.context)
@@ -316,45 +321,70 @@ class Crawler:
         """Network-level destructive guard (ruling R17). Every non-GET request of the role
         context is classified as a ``request`` attributed to the current (or most recent)
         action or page load; held ones are aborted and queued for approval."""
-        if request.method in _SAFE_METHODS or self._approval_allows(request, role):
+        page = self._page_of(request)
+        if request.method in _SAFE_METHODS \
+                or self._approval_allows(request.method, request.url, page, role):
             await route.fallback()
             return
+        try:
+            origin = request.frame.url
+        except Exception:  # worker / not-yet-attached popup
+            origin = request.headers.get("referer") or request.url
+        if self._hold_write(request.method, request.url, role, page, origin):
+            await route.abort("blockedbyclient")
+        else:
+            await route.fallback()
+
+    async def _guard_redirect(self, method: str, url: str, role: str, page) -> bool:
+        """Recorder hook for a 307/308 hop re-sending a write (I1): the target is classified
+        like any other request. An approved action's window does not cover a redirect
+        target unless it is the predicted request itself."""
+        ap = self._approval
+        if ap is not None and ap["role"] == role and ap["match"] is not None \
+                and self._approval_allows(method, url, page, role):
+            return True
+        try:
+            origin = page.url if page is not None else url
+        except Exception:
+            origin = url
+        return not self._hold_write(method, url, role, page, origin)
+
+    def _hold_write(self, method: str, url: str, role: str, page, origin: str) -> bool:
+        """Classify a non-GET request charged to the current (or most recent) action or
+        page load. Held: recorded as a guard hit, queued for approval, returns True (the
+        caller aborts it)."""
         g = self._guard or self._last_guard.get(role)
         if g is None:  # nothing processed yet: charge it to the page that sent it
-            try:
-                origin = request.frame.url
-            except Exception:  # worker / not-yet-attached popup
-                origin = request.headers.get("referer") or request.url
             g = {"kind": "load", "label": "", "context": "", "state": None, "item": None,
                  "path": [{"type": "goto", "url": self._safe_url(origin)}], "hits": []}
         try:
-            flag = classify(ActionDescriptor("request", request.method, request.url, g["label"],
+            flag = classify(ActionDescriptor("request", method, url, g["label"],
                                              g["context"], False, role, "ui"), self.cfg.profile)
         except Exception:  # fail closed
             flag = Flag(True, "delete", ["request could not be classified"])
-        if not flag.held or (flag.category == "data_create" and self._from_login_page(request)):
+        if not flag.held or (flag.category == "data_create"
+                             and page is not None and page in self.recorder.login_pages):
             # A login flow's own submit (data_create only in production) must go through;
             # destructive requests from the login page, and anything from other pages or
             # workers while it runs, stay guarded.
-            await route.fallback()
-            return
-        await route.abort("blockedbyclient")
-        url = self.redactor.url(request.url)
-        g["hits"].append((flag, request.method, url))
-        self.events.emit("error", role=role, url=url,
-                         message=f"held {request.method} request aborted ({flag.category}); "
+            return False
+        safe = self.redactor.url(url)
+        g["hits"].append((flag, method, safe))
+        self.events.emit("error", role=role, url=safe,
+                         message=f"held {method} request aborted ({flag.category}); "
                                  "queued for approval")
-        label = g["label"] if g["kind"] == "action" else f"{request.method} {url} (page load)"
-        self._enqueue(role, g["state"], label, flag, g["path"],
-                      {"method": request.method, "url": url})
+        label = g["label"] if g["kind"] == "action" else f"{method} {safe} (page load)"
+        self._enqueue(role, g["state"], label, flag, g["path"], {"method": method, "url": safe})
         if g is not self._guard and g["item"] is not None:
             self.frontier.mark(g["item"], "queued_approval")  # fired after its item finished
+        return True
 
-    def _from_login_page(self, request) -> bool:
+    @staticmethod
+    def _page_of(request):
         try:
-            return request.frame.page in self.recorder.login_pages
+            return request.frame.page
         except Exception:  # worker requests have no frame
-            return False
+            return None
 
     def _arm_guard(self, role: str, kind: str, path: list[dict], *, label: str = "",
                    context: str = "", state: str | None = None,
@@ -425,6 +455,10 @@ class Crawler:
                     break
                 except _AuthFailed:  # nothing was let through; the item stays approved
                     continue
+                except _NotRunnable as exc:
+                    res["skipped"] += 1
+                    warnings.append(f"approval {a.id} ({a.label}): {exc}")
+                    continue
                 res[outcome] += 1
                 if reason:
                     warnings.append(f"approval {a.id} ({a.label}): {reason}")
@@ -467,7 +501,15 @@ class Crawler:
 
     def _start_approval(self, a: PendingAction, mode: str, label: str):
         """Persist that the approved action is about to be let through (before it is):
-        an interrupted run then never executes it a second time."""
+        an interrupted run then never executes it a second time. The row is re-read
+        first: another process (or an edit of approvals.yaml) may have run, started or
+        revoked it since the list was read."""
+        row = self.store.conn.execute("SELECT decision, executed_event FROM approvals "
+                                      "WHERE id=?", (a.id,)).fetchone()
+        if row is None or row["decision"] != "approve":
+            raise _NotRunnable("no longer approved; not executed")
+        if row["executed_event"] is not None or a.id in self.queue.in_flight():
+            raise _NotRunnable("already executed or in flight; not executed again")
         ev = self.events.emit("approval_started", role=a.role, approval_id=a.id,
                               category=a.category, label=label, mode=mode)
         self.queue.mark_started(a.id, ev.id)
@@ -741,7 +783,7 @@ class Crawler:
         except _Fail as exc:
             self.events.emit("error", role=role, message=f"after approved action: {exc}")
 
-    def _approval_allows(self, request, role: str) -> bool:
+    def _approval_allows(self, req_method: str, req_url: str, page, role: str) -> bool:
         """During an approved action only: its predicted request (method + URL), or, when
         no write was predicted, held requests of the acted-on page in the action window."""
         ap = self._approval
@@ -749,20 +791,15 @@ class Crawler:
             return False
         if ap["match"] is not None:
             method, url = ap["match"]
-            rm = request.method.upper()
+            rm = req_method.upper()
             # a form's hidden _method override is sent as POST
             if not (rm == method or (rm == "POST" and method not in ("GET", "POST"))):
                 return False
-            if self._norm_url(request.url) != url:
+            if self._norm_url(req_url) != url:
                 return False
-        else:
-            try:
-                same_page = request.frame.page is ap["page"]
-            except Exception:  # workers have no frame
-                same_page = False
-            if not same_page:
-                return False
-        ap["allowed"].append((request.method, self.redactor.url(request.url)))
+        elif page is None or page is not ap["page"]:  # workers have no frame
+            return False
+        ap["allowed"].append((req_method, self.redactor.url(req_url)))
         return True
 
     def _norm_url(self, url: str) -> str:

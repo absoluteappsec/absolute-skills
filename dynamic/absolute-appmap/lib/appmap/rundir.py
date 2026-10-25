@@ -1,7 +1,10 @@
 """Run directory layout and run.json metadata."""
 from __future__ import annotations
 
+import fcntl
 import json
+import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -60,6 +63,26 @@ def open_run_dir(path: Path) -> RunDir:
     if not run_id:  # fall back to the dir-name suffix YYYYMMDD-HHMMSS
         run_id = "-".join(root.name.rsplit("-", 2)[-2:])
     return _layout(root, run_id)
+
+
+class RunLocked(RuntimeError):
+    """Another appmap command holds the run directory's lock."""
+
+
+@contextmanager
+def run_lock(root: Path):
+    """Exclusive, non-blocking lock on ``<run>/.lock`` for commands that write the run
+    (auth, crawl, probe, approvals, build). Released when the process exits, even on a
+    crash, so a stale lock file is harmless."""
+    fd = os.open(Path(root) / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RunLocked(f"another appmap command is using {root}") from None
+        yield
+    finally:
+        os.close(fd)
 
 
 def write_run_meta(rd: RunDir, cfg: RunConfig, *, status: str,

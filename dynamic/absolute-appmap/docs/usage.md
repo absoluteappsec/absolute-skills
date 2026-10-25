@@ -74,7 +74,10 @@ form_data:
 
 Notes:
 
-- Write login `url`s as absolute URLs; a bare `/login` is not resolved against the base URL.
+- Login `url`s may be absolute or a path (`/login`, resolved against the first base URL).
+- SSO through an external identity provider: put its hosts in `scope.login_allow_hosts` (used
+  only by login pages). Scripts and styles served from a CDN: `scope.static_allow_hosts` (static
+  subresources only). Neither is ever crawled or probed.
 - Unknown keys are errors. The full key list, defaults, profiles, login types and
   `fixtures.yaml` are in `skills/map-running-application/references/config-reference.md`.
 - Put logout URLs in `deny_patterns` when you can; otherwise logout links and buttons are held

@@ -14,6 +14,7 @@ from .gate import RequestGate
 MAX_HOPS = 10
 _REDIRECTS = {301, 302, 303, 307, 308}
 _CREDENTIAL_HEADERS = {"authorization", "cookie", "proxy-authorization"}
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 NETWORK_ERROR_STATUS = 599  # what the circuit breaker sees for a failed fetch
 
 
@@ -52,11 +53,14 @@ class DirectClient:
                       headers: dict | None = None, data: Any = None, json: Any = None,
                       params: dict | None = None,
                       extra_auth: dict | None = None,
-                      follow_redirects: bool = True) -> tuple[int, APIResponse] | None:
+                      follow_redirects: bool = True,
+                      static: bool = False) -> tuple[int, APIResponse] | None:
         """Return ``(status, response)`` of the last response received, or None when the
         gate refuses the initial URL. A redirect to an out-of-scope URL is not followed:
         the 3xx response is returned and the target lands in ``external_links``.
         ``follow_redirects=False`` records and returns the first response, 3xx included.
+        A 307/308 answer to a non-GET/HEAD/OPTIONS request is never followed either.
+        ``static=True`` (a script/source-map fetch) also admits ``scope.static_allow_hosts``.
         """
         url = _with_params(url, params)
         origin_netloc = urlsplit(url).netloc
@@ -64,7 +68,8 @@ class DirectClient:
         found_on = None
         result: tuple[int, APIResponse] | None = None
         for _ in range(MAX_HOPS + 1):
-            if not await self.gate.admit(method, url, role=role, found_on=found_on):
+            if not await self.gate.admit(method, url, role=role, found_on=found_on,
+                                         static=static):
                 return result
             hdrs = dict(headers or {})
             same_origin = urlsplit(url).netloc == origin_netloc
@@ -95,6 +100,10 @@ class DirectClient:
             result = (resp.status, resp)
             location = resp.headers.get("location")
             if resp.status not in _REDIRECTS or not location or not follow_redirects:
+                return result
+            if resp.status in (307, 308) and method.upper() not in _SAFE_METHODS:
+                # A 307/308 re-sends the same write to a target nobody classified (it
+                # could be destructive): record the 3xx, never follow it.
                 return result
             found_on = url
             url = urljoin(url, location)

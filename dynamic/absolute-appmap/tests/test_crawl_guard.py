@@ -184,3 +184,28 @@ async def test_login_page_destructive_request_still_held(browser, stub_server, m
     rt.store.close()
     assert ("POST", "/login") in srv.requests
     assert ("DELETE", "/api/items/7") not in srv.requests
+
+
+REDIRECT_CASES = {
+    "form": "<form method='post' action='/save'><input name='n' value='x'>"
+            "<button type='submit'>Save</button></form>",
+    "fetch": "<button onclick=\"fetch('/save',{method:'POST',body:'a=1'})\">Save</button>",
+}
+
+
+@pytest.mark.parametrize("case", list(REDIRECT_CASES))
+@pytest.mark.parametrize("code", [307, 308])
+async def test_unsafe_307_redirect_hop_classified(case, code, browser, stub_server, make_cfg,
+                                                  run_dir, tmp_path):
+    """I1: Chromium re-sends a POST on 307/308; the hop's target is classified and a
+    destructive one is aborted and queued, never sent."""
+    routes = {"/": H(REDIRECT_CASES[case]),
+              "/save": lambda r: werkzeug.Response(
+                  status=code, headers={"Location": "/items/7/delete"}),
+              "/items/7/delete": lambda r: "deleted"}
+    srv, rd, _stats = await _crawl(routes, browser, stub_server, make_cfg, run_dir, tmp_path)
+    assert ("POST", "/save") in srv.requests
+    assert ("POST", "/items/7/delete") not in srv.requests
+    held = [a for a in _approvals(rd)
+            if "/items/7/delete" in (a["predicted_request"] or "")]
+    assert held and held[0]["category"] == "delete"

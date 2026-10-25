@@ -54,10 +54,10 @@ Otherwise, ask only what you cannot infer; propose defaults and let the operator
 | Topic | What to settle |
 |---|---|
 | Entry points | `base_urls` (the app's start page(s), absolute URLs) |
-| Scope | `allow_hosts`, `allow_path_prefixes`, `deny_patterns` (globs on the path, e.g. `*/logout`) |
+| Scope | `allow_hosts`, `allow_path_prefixes`, `deny_patterns` (globs on the path, e.g. `*/logout`); `static_allow_hosts` for a CDN serving the app's scripts and styles (static subresources only, never crawled) |
 | Profile | `staging` (default) or `production` (Step 1 rules) |
 | Roles | One role per distinct privilege level, plus `anonymous` (`type: none`) — cross-role replay needs at least two roles to say anything about access control |
-| Login per role | `form` (scripted, env-var credentials), `manual` (SSO/MFA — operator logs in by hand), `storage_state` (operator supplies a saved Playwright state file), `none`. Login `url` must be an absolute URL |
+| Login per role | `form` (scripted, env-var credentials), `manual` (SSO/MFA — operator logs in by hand), `storage_state` (operator supplies a saved Playwright state file), `none`. Login `url` is absolute or a path (`/login`, resolved against the first base URL). SSO via an external identity provider: add its host(s) to `scope.login_allow_hosts` |
 | Credentials | For `form` roles, environment-variable **names** only, e.g. `APPMAP_ADMIN_USER` / `APPMAP_ADMIN_PASS` |
 | Limits | `max_runtime_minutes` (default 240); lower `max_requests_per_second` if the target is fragile |
 | Discovery | Defaults are on except `forced_browsing` (staging only, off unless asked) |

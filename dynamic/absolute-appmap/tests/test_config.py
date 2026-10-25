@@ -137,3 +137,36 @@ def test_unknown_keys_rejected(tmp_path, override):
 def test_invalid_limits_rejected(tmp_path, limits):
     with pytest.raises(ConfigError, match="limits"):
         load_config(_write(tmp_path, limits=limits))
+
+
+def test_relative_login_url_resolved_against_first_base_url():
+    """I3: the spec example's ``url: /login`` works."""
+    cfg = load_config(DATA / "config_spec_example.yaml")
+    assert cfg.roles[0].login.url == "https://staging.example.com/login"
+    assert cfg.roles[3].login.url is None  # manual without url: first base URL at login
+
+
+def test_form_role_requires_env_names(tmp_path):
+    p = _write(tmp_path, roles=[{"name": "a", "login": {"type": "form", "url": "/login",
+                                                        "username_env": "U"}}])
+    with pytest.raises(ConfigError, match="password_env"):
+        load_config(p)
+
+
+def test_login_and_static_allow_hosts_parsed(tmp_path):
+    p = _write(tmp_path, target={"base_urls": ["https://a.example.com"],
+                                 "scope": {"login_allow_hosts": ["IdP.example.net"],
+                                           "static_allow_hosts": ["CDN.example.net"]}})
+    scope = load_config(p).scope
+    assert scope.login_allow_hosts == ["idp.example.net"]
+    assert scope.static_allow_hosts == ["cdn.example.net"]
+    assert scope.allow_hosts == ["a.example.com"]
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("key", ["max_requests_per_second", "jitter_seconds",
+                                 "breaker_threshold"])
+def test_non_finite_limits_rejected(tmp_path, key, value):
+    """T2: .nan/.inf pass every comparison-based range check."""
+    with pytest.raises(ConfigError, match="limits"):
+        load_config(_write(tmp_path, limits={key: value}))
