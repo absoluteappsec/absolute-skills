@@ -249,13 +249,15 @@ async def test_production_js_post_click_held(browser, stub_server, make_cfg, run
     assert q(rd, "select category from approvals where label='Add'")[0]["category"] == "data_create"
 
 
-async def test_approved_only_is_not_reported_as_done(browser, ssr_url, make_cfg, run_dir,
-                                                     tmp_path):
+async def test_approved_only_without_approvals_crawls_nothing(browser, ssr_url, make_cfg,
+                                                              run_dir, tmp_path):
     cfg = make_cfg(ssr_url, limits=FAST)
     rd = run_dir(tmp_path, cfg)
     stats = await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=1, approved_only=True,
                             browser=browser)
-    assert stats.status == "not_implemented" and stats.warnings
+    assert stats.status == "done"
+    assert stats.approvals == {"executed": 0, "failed": 0, "skipped": 0}
+    assert q1(rd, "select count(*) from exchanges") == 0
 
 
 def test_manual_login_roles_only_converts_interactive(make_cfg, ssr_url):
@@ -323,10 +325,11 @@ def test_cli_init_auth_crawl(ssr_url, make_cfg, tmp_path, capsys):
     assert any(m == "GET" and u.endswith("/account/password") for m, u in reqs)
     assert not list((run / "traffic").glob("*.part.har"))
     assert "alice-pw-Fx2" not in (run / "traffic" / "alice.har").read_text()
-    # --approved-only must not claim approvals ran
-    assert main(["crawl", "--run", str(run), "--approved-only"]) == 1
+    # --approved-only with nothing approved executes nothing
+    assert main(["crawl", "--run", str(run), "--approved-only"]) == 0
     st = _status(capsys)
-    assert not st["ok"] and st["status"] == "not_implemented" and st["errors"]
+    assert st["ok"] and st["status"] == "done"
+    assert st["counts"]["executed"] == 0 and st["counts"]["failed"] == 0
 
 
 def test_cli_parser_flags():

@@ -49,8 +49,7 @@ from .throttle import CircuitBreaker, CircuitOpen, RateLimiter
 
 log = logging.getLogger("appmap.crawl")
 
-CrawlStatus = Literal["done", "in_progress", "paused_circuit", "limit_reached",
-                      "not_implemented"]
+CrawlStatus = Literal["done", "in_progress", "paused_circuit", "limit_reached"]
 # url items first (cheap, map pages), then clicks, then form submissions
 PRIORITY = {"url": 2, "click": 1, "submit": 0}
 NAV_TIMEOUT_MS = 15000
@@ -93,6 +92,8 @@ class CrawlStats:
     queued_approvals: int
     status: CrawlStatus
     warnings: list[str] = field(default_factory=list)
+    # --approved-only: approved items executed / failed / skipped in this invocation
+    approvals: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -148,7 +149,10 @@ class Crawler:
         self._spa_filled: set[tuple[str, str]] = set()
         self._spa_skipped: dict[tuple[str, str], str] = {}  # (role, pattern) -> warning
         self._confirm_seen = False
-        self._approved_mode = False  # set while executing approved actions (Task 17)
+        # While an approved action's final step runs (and only then): which held requests
+        # the guard lets through, and how confirm() dialogs are answered.
+        self._approval: dict | None = None
+        self._confirm_mode = "dismiss"  # "accept" | "defer" (fill_and_submit accepts)
         # Network guard attribution: the action (or page load) requests are charged to.
         # ``_guard`` is set while an item runs; ``_last_guard[role]`` keeps the most recent
         # one so requests fired later (timers, popups, workers) are still attributed.
@@ -159,12 +163,7 @@ class Crawler:
     async def run(self, roles: list[str], *, budget_minutes: float,
                   approved_only: bool = False) -> CrawlStats:
         if approved_only:
-            # Executing approved actions is implemented by the approvals task (Task 17).
-            msg = "--approved-only is not implemented yet; no approved actions were executed"
-            log.warning(msg)
-            stats = self.stats("not_implemented")
-            stats.warnings.append(msg)
-            return stats
+            return await self._run_approved(roles, budget_minutes)
         start = time.monotonic()
         prior = float(self.store.get_meta("crawl_elapsed_s") or 0)
         budget_s = budget_minutes * 60
@@ -269,7 +268,7 @@ class Crawler:
         """Network-level destructive guard (ruling R17). Every non-GET request of the role
         context is classified as a ``request`` attributed to the current (or most recent)
         action or page load; held ones are aborted and queued for approval."""
-        if self._approved_mode or request.method in _SAFE_METHODS:
+        if request.method in _SAFE_METHODS or self._approval_allows(request, role):
             await route.fallback()
             return
         g = self._guard or self._last_guard.get(role)
@@ -323,13 +322,346 @@ class Crawler:
         self.events.emit("dialog", role=role, dialog_type=dialog.type,
                          message=(dialog.message or "")[:500], url=self.redactor.url(page.url))
         try:
-            if dialog.type == "confirm" and not self._approved_mode:
+            if dialog.type == "confirm" and self._confirm_mode == "defer":
+                pass  # an approved confirm-protected form: fill_and_submit accepts it
+            elif dialog.type == "confirm" and self._confirm_mode != "accept":
                 self._confirm_seen = True
                 await dialog.dismiss()
             else:  # alert, prompt, beforeunload: record and accept
                 await dialog.accept()
         except Exception:
             pass  # already handled / page closed
+
+    # -- approved actions (--approved-only) ----------------------------------------
+    async def _run_approved(self, roles: list[str], budget_minutes: float) -> CrawlStats:
+        """Execute each approved, not yet executed item once. Only the approved action's
+        own request(s) pass the destructive guard; everything else stays guarded."""
+        start = time.monotonic()
+        budget_s = budget_minutes * 60
+        res = {"executed": 0, "failed": 0, "skipped": 0}
+        warnings: list[str] = []
+        status: CrawlStatus = "done"
+        items = self.queue.approved_unexecuted()
+        idle = sorted({a.role for a in items if a.role not in roles and a.role in self.sessions})
+        if idle:
+            warnings.append(f"approved items of role(s) {', '.join(idle)} not executed: "
+                            "role not logged in")
+        log.info("approved-only: %d approved item(s) to execute",
+                 sum(1 for a in items if a.role in roles))
+        try:
+            for a in items:
+                if a.role not in roles:
+                    continue
+                if time.monotonic() - start >= budget_s:
+                    status = "in_progress"
+                    break
+                if self.gate.breaker.tripped:
+                    status = "paused_circuit"
+                    break
+                if a.category == "logout":
+                    # Executing it would end the role's session: never run, even if approved.
+                    self.store.upsert_approval(a.id, decision="skip", decided_by="appmap")
+                    msg = (f"approval {a.id} ({a.label}): logout actions are never executed "
+                           "(they end the session); marked skip")
+                    warnings.append(msg)
+                    log.warning(msg)
+                    res["skipped"] += 1
+                    continue
+                try:
+                    outcome, reason = await self._execute_approval(a)
+                except CircuitOpen:
+                    status = "paused_circuit"
+                    break
+                res[outcome] += 1
+                if reason:
+                    warnings.append(f"approval {a.id} ({a.label}): {reason}")
+                    log.warning("[%s] approval %s %s: %s", a.role, a.id, outcome, reason)
+                else:
+                    log.info("[%s] approval %s executed: %s", a.role, a.id, a.label)
+        finally:
+            await self.recorder.drain()
+        stats = self.stats(status)
+        stats.approvals = res
+        stats.warnings += warnings
+        log.info("approved-only stopped: status=%s %s", status, res)
+        return stats
+
+    def _approval_failed(self, a: PendingAction, reason: str) -> tuple[str, str]:
+        """An approved item that could not be executed (nothing destructive was sent)."""
+        self.queue.mark_failed(a.id, reason)
+        self.events.emit("error", role=a.role, approval_id=a.id,
+                         message=f"approved action not executed: {reason}")
+        return "failed", reason
+
+    async def _execute_approval(self, a: PendingAction) -> tuple[str, str | None]:
+        sess = self.sessions.get(a.role)
+        if sess is None:
+            return self._approval_failed(a, f"role {a.role!r} has no session")
+        path = a.action_path or []
+        last = path[-1] if path else {}
+        pred = a.predicted_request or {}
+        if last.get("type") in ("click", "submit"):
+            mode = "ui"
+        elif last.get("type") == "request" or (pred.get("url") and (
+                not path or (pred.get("method") or "GET").upper() not in _SAFE_METHODS)):
+            mode = "direct"  # replay/schema/cross-role, or a request a page load fired
+        elif last.get("type") == "goto":
+            mode = "goto"
+        else:
+            return self._approval_failed(a, "approval has no action or request to perform")
+        if mode == "direct":
+            return await self._execute_direct(sess, a)
+        page = await self._open_page(sess)
+        try:
+            return await self._execute_ui(sess, page, a, mode)
+        finally:
+            self._guard = None
+            if not page.is_closed():
+                await page.close()
+            await self.recorder.drain()
+
+    async def _execute_direct(self, sess: RoleSession, a: PendingAction) -> tuple[str, str | None]:
+        import functools
+
+        from .direct import DirectClient
+        from .recording import record_exchange
+
+        role = sess.role.name
+        last = a.action_path[-1] if a.action_path else {}
+        step = last if last.get("type") == "request" else {}
+        pred = a.predicted_request or {}
+        method = str(step.get("method") or pred.get("method") or "").upper()
+        url = step.get("url") or pred.get("url")
+        if not method or not url:
+            return self._approval_failed(a, "approval has no request to send")
+        body = step.get("body")
+        if "<redacted:" in url or "<redacted:" in (body or ""):
+            return self._approval_failed(a, "the recorded request holds redacted credentials; "
+                                            "not sent")
+        rec = functools.partial(record_exchange, self.store, self.events, self.redactor,
+                                self.rd, known_patterns=self.recorder.known_patterns)
+        client = DirectClient(self.gate, rec, self.events)
+        mark = self._exchange_mark()
+        ctype = step.get("content_type")
+        error = None
+        got = None
+        try:
+            got = await client.request(
+                sess.context.request, method, url, role=role, origin="approved",
+                headers={"Content-Type": ctype} if body is not None and ctype else None,
+                data=body.encode("utf-8") if body is not None else None,
+                extra_auth=dict(sess.auth_headers) or None)
+            if got is None:
+                error = "request refused by the scope gate or failed on the network"
+        finally:
+            ids = self._ids_since(mark, role)
+            ev = self.events.emit("approval_executed", role=role, approval_id=a.id,
+                                  category=a.category, label=a.label, mode="direct",
+                                  method=method, url=self.redactor.url(url),
+                                  status=got[0] if got else None, exchange_ids=ids,
+                                  outcome="error" if error or got is None else "done",
+                                  error=error)
+            self.queue.mark_executed(a.id, ev.id)  # at most once, whatever happened
+            self._settle_frontier(role, a.action_path)
+        if error:
+            self.queue.mark_failed(a.id, error)
+            return "failed", error
+        status, resp = got
+        location = resp.headers.get("location")
+        if 300 <= status < 400 and location:  # new surface the action pointed to
+            target = urljoin(url, location)
+            if urlsplit(target).scheme in ("http", "https") and self.gate.scope.allows(target):
+                self.frontier.push(role, "url", url=self._safe_url(target), depth=1,
+                                   priority=PRIORITY["url"], source="ui")
+        return "executed", None
+
+    @staticmethod
+    def _restore_blocker(prefix: list[dict]) -> dict | None:
+        """The first restore step that would issue writes (or cannot be replayed)."""
+        for s in prefix:
+            if s.get("type") == "goto":
+                continue
+            if s.get("type") == "click" and not s.get("mutating"):
+                continue
+            return s
+        return None
+
+    async def _execute_ui(self, sess: RoleSession, page: Page, a: PendingAction,
+                          mode: str) -> tuple[str, str | None]:
+        role, path = sess.role.name, a.action_path
+        step = path[-1]
+        prefix = path[:-1] if mode == "ui" else []
+        if mode == "ui":
+            bad = self._restore_blocker(prefix)
+            if bad is not None:
+                return self._approval_failed(
+                    a, f"restoring its action path needs a mutating step "
+                       f"({self._describe([bad]).strip()}); not executed")
+            if not prefix or prefix[0].get("type") != "goto":
+                return self._approval_failed(a, "action path does not start at an entry URL")
+            # Restore with the guard fully armed: no held request passes, confirm()
+            # dialogs are dismissed.
+            for attempt in (1, 2):
+                hits = self._arm_guard(role, "load", prefix)
+                try:
+                    await self._replay(page, prefix)
+                    await self.recorder.drain()
+                    if hits:
+                        return self._approval_failed(
+                            a, "restoring its action path issued a request that needs "
+                               "approval (aborted); not executed")
+                    await self._check_lost(sess, page)
+                    break
+                except _Lost:
+                    if attempt == 2 or not await self._relogin(sess, page):
+                        return self._approval_failed(a, "session lost while restoring")
+                    if page.is_closed():
+                        page = await self._open_page(sess)
+                except _Fail as exc:
+                    return self._approval_failed(a, f"restore failed: {exc}")
+            src = await self._record_state(page, role, visit=False)
+            await self._drain_nav(page)
+        else:
+            src = None
+        before = canon_url(page.url) if page.url.startswith("http") else ""
+        form = loc = None
+        try:  # locate the control before anything is let through
+            if step["type"] == "click":
+                loc = await self._resolve(page, step["locators"])
+            elif step["type"] == "submit":
+                form = await self._find_form(page, step)
+                if form is None:
+                    raise _Fail(f"form {step.get('form_label')!r} not found after restore")
+        except _Fail as exc:
+            return self._approval_failed(a, str(exc))
+        pred = a.predicted_request or {}
+        pm = str(pred.get("method") or "").upper()
+        match = ((pm, self._norm_url(pred["url"]))
+                 if pm and pm not in _SAFE_METHODS and pred.get("url") else None)
+        label = self._step_label(step) or a.label
+        mark = self._exchange_mark()
+        hits = self._arm_guard(role, "action", path, label=label,
+                               context=step.get("context", ""), state=src.id if src else None)
+        if mode == "ui":
+            # Without a predicted write, held requests fired in this action window pass.
+            self._approval = {"role": role, "match": match, "allowed": []}
+        self._confirm_mode = "defer" if form is not None and form.has_confirm else "accept"
+        self.recorder.origin_by_role[role] = "approved"
+        result = None
+        error = None
+        ev = self.events.emit(step["type"] if mode == "ui" else "navigate", role=role,
+                              approval_id=a.id, label=label,
+                              url=self.redactor.url(step.get("url") or page.url))
+        try:
+            if mode == "goto":
+                await self._goto(page, step["url"])
+            elif step["type"] == "click":
+                await loc.click(timeout=ACTION_TIMEOUT_MS)
+                await asyncio.sleep(0.05)
+                await wait_settled(page, self.limits.quiet_window_ms)
+            else:
+                result = await fill_and_submit(
+                    page, form, self.gen, max_retries=0,
+                    settle_ms=self.limits.quiet_window_ms,
+                    exchange_ids_since=lambda: self._ids_since(mark, role))
+        except CircuitOpen:
+            error = "circuit breaker tripped during the action"
+        except Exception as exc:
+            error = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        finally:
+            try:
+                await self.recorder.drain()
+            finally:
+                allowed = (self._approval or {}).get("allowed", [])
+                self._approval = None
+                self._confirm_mode = "dismiss"
+                self.recorder.origin_by_role.pop(role, None)
+        ids = self._ids_since(mark, role)
+        done = self.events.emit(
+            "approval_executed", role=role, caused_by=ev.id, approval_id=a.id,
+            category=a.category, label=label, mode=mode, exchange_ids=ids,
+            allowed_requests=[f"{m} {u}" for m, u in allowed],
+            blocked_requests=[f"{m} {u}" for _f, m, u in hits],
+            outcome="error" if error else "done", error=error)
+        self.queue.mark_executed(a.id, done.id)  # at most once, whatever happened
+        self._settle_frontier(role, path)
+        if error:
+            reason = f"approved action raised: {error}"
+            self.queue.mark_failed(a.id, reason)
+            return "failed", reason
+        await self._after_approved(sess, page, step, src, ev.id, label, ids, before, form,
+                                   result)
+        return "executed", None
+
+    async def _after_approved(self, sess: RoleSession, page: Page, step: dict,
+                              src: _State | None, ev_id: str, label: str, ids: list[int],
+                              before: str, form: FormInfo | None, result) -> None:
+        """Record the transition and queue the surface the approved action revealed."""
+        role = sess.role.name
+        try:
+            if page.is_closed():
+                return
+            await self._close_popups(page)
+            await self._check_lost(sess, page)
+            navs = await self._drain_nav(page)
+            dst = await self._record_state(page, role)
+            if src is not None:
+                locs = (step.get("locators") or []) if form is None else (
+                    form.submit_locators or next(
+                        (f.locators for f in reversed(form.fields) if f.locators), []))
+                self.store.add_transition(src.id, dst.id, role, step["type"], label,
+                                          self._locset(locs), ev_id, ids)
+            if result is not None:
+                self._update_form(step.get("form_id"), result.success,
+                                  result.validation_messages, ids)
+            self._push_nav_urls(role, navs, page.url, 0)
+            # Children are restored from the URL the action left the page on: re-doing the
+            # approved action as a restore step is never allowed.
+            here = self._safe_url(page.url)
+            if canon_url(page.url) != before and self.frontier.push(
+                    role, "url", url=here, depth=1, priority=PRIORITY["url"], source="ui"):
+                self.frontier.mark(self.frontier.id_of(role, "url", url=here), "done")
+            await self._expand(page, role, dst, [{"type": "goto", "url": here}], 1)
+        except _Lost:  # the approved action ended the session
+            if not await self._relogin(sess, page):
+                log.warning("[%s] re-login after an approved action failed", role)
+        except _Fail as exc:
+            self.events.emit("error", role=role, message=f"after approved action: {exc}")
+
+    def _approval_allows(self, request, role: str) -> bool:
+        """During an approved action only: its predicted request (method + URL), or any
+        held request of the action window when no write was predicted."""
+        ap = self._approval
+        if ap is None or ap["role"] != role:
+            return False
+        if ap["match"] is not None:
+            method, url = ap["match"]
+            rm = request.method.upper()
+            # a form's hidden _method override is sent as POST
+            if not (rm == method or (rm == "POST" and method not in ("GET", "POST"))):
+                return False
+            if self._norm_url(request.url) != url:
+                return False
+        ap["allowed"].append((request.method, self.redactor.url(request.url)))
+        return True
+
+    def _norm_url(self, url: str) -> str:
+        p = urlsplit(canon_url(self.redactor.url(url)))
+        return urlunsplit((p.scheme.lower(), p.netloc.lower(), p.path, p.query, ""))
+
+    def _settle_frontier(self, role: str, path: list[dict]) -> None:
+        """The frontier item that was held for this approval is now done."""
+        if not path:
+            return
+        if len(path) == 1 and path[0].get("type") == "goto":
+            self.store.conn.execute(
+                "UPDATE frontier SET status='done' WHERE role=? AND kind='url' AND url=? "
+                "AND status='queued_approval'", (role, path[0].get("url") or ""))
+        else:
+            self.store.conn.execute(
+                "UPDATE frontier SET status='done' WHERE role=? AND kind='action' "
+                "AND action_path=? AND status='queued_approval'",
+                (role, json.dumps(path, sort_keys=True)))
 
     # -- item processing -----------------------------------------------------
     async def _process(self, sess: RoleSession, page: Page, item: FrontierItem) -> str:

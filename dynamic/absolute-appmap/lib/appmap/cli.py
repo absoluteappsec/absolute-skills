@@ -11,7 +11,7 @@ from pathlib import Path
 from appmap import __version__
 
 COMMANDS = ["init", "auth", "crawl", "probe", "approvals", "build", "status", "query"]
-IMPLEMENTED = {"init", "auth", "crawl", "probe"}
+IMPLEMENTED = {"init", "auth", "crawl", "probe", "approvals"}
 
 log = logging.getLogger("appmap.cli")
 
@@ -73,6 +73,12 @@ def build_parser() -> argparse.ArgumentParser:
                                   "active: API replay for every role)")
     p.add_argument("--budget-minutes", type=float, default=8.0,
                    help="stop cleanly after this long (default 8); rerun to resume")
+    p = sub.add_parser("approvals", help="review the destructive-action approval queue")
+    p.add_argument("--run", required=True, help="run directory")
+    p.add_argument("action", choices=["list", "write", "apply"],
+                   help="list: print pending items as JSON lines; write: refresh "
+                        "approvals.yaml (keeps decisions, rules and notes); apply: load the "
+                        "decisions and rules from approvals.yaml")
     for name in COMMANDS:
         if name not in IMPLEMENTED:
             sub.add_parser(name, help=f"{name} (not yet implemented)")
@@ -246,13 +252,24 @@ def cmd_crawl(args) -> int:
     errors = list(stats.warnings)
     run = _q(rd.root)
     again = f"appmap crawl --run {run}" + (f" --role {_q(args.role)}" if args.role else "")
+    if args.approved_only:
+        ok = stats.status in ("done", "in_progress")
+        if stats.status == "paused_circuit":
+            errors.append("circuit breaker tripped (too many 429/5xx responses); "
+                          "check the target before resuming")
+        # Surface found after approved actions is in the frontier for a normal crawl.
+        nxt = {"done": again, "in_progress": again + " --approved-only"}.get(stats.status)
+        emit_status("crawl", ok=ok, status=stats.status,
+                    counts={**stats.approvals, "exchanges": stats.exchanges,
+                            "queued_approvals": stats.queued_approvals},
+                    pending_approvals=stats.queued_approvals, errors=errors, next=nxt)
+        return 0 if ok else 1
     nxt = {
         "in_progress": again,
         "done": (f"appmap approvals --run {run} write" if stats.queued_approvals
                  else f"appmap probe --run {run} --phase active"),
         "limit_reached": f"appmap build --run {run}",
         "paused_circuit": None,
-        "not_implemented": None,
     }[stats.status]
     ok = stats.status in ("done", "in_progress", "limit_reached")
     if stats.status == "paused_circuit":
@@ -374,7 +391,58 @@ def cmd_probe(args) -> int:
     return 0
 
 
-HANDLERS = {"init": cmd_init, "auth": cmd_auth, "crawl": cmd_crawl, "probe": cmd_probe}
+def cmd_approvals(args) -> int:
+    from appmap.approvals import ApprovalQueue
+    from appmap.store import Store
+
+    try:
+        rd, _cfg, _meta = _open_run(args.run)
+        store = Store(rd.db_path)
+    except Exception as e:
+        emit_status("approvals", ok=False, status="error", errors=[str(e)])
+        return 1
+    run = _q(rd.root)
+    try:
+        store.init_schema()
+        queue = ApprovalQueue(store, rd.approvals_path)
+        changed = 0
+        if args.action == "list":
+            for r in store.conn.execute("SELECT * FROM approvals WHERE decision='pending' "
+                                        "ORDER BY id"):
+                print(json.dumps({
+                    "id": r["id"], "role": r["role"], "category": r["category"],
+                    "label": r["label"], "reasons": json.loads(r["reasons"] or "[]"),
+                    "predicted_request": json.loads(r["predicted_request"] or "null"),
+                    "state_id": r["state_id"]}), flush=True)
+        else:
+            # Decisions edited in approvals.yaml are folded in before it is rewritten, so
+            # neither ``write`` nor ``apply`` loses (or later revokes) a decision.
+            changed = queue.load_decisions()
+            queue.write_yaml()
+        counts = queue.summary()
+    except Exception as e:
+        emit_status("approvals", ok=False, status="error", errors=[str(e)])
+        return 1
+    finally:
+        store.close()
+    if counts["approved_unexecuted"]:
+        nxt = f"appmap crawl --run {run} --approved-only"
+    elif counts["pending"] and args.action != "apply":
+        nxt = (f"appmap approvals --run {run} apply" if args.action == "write"
+               else f"appmap approvals --run {run} write")
+    else:
+        nxt = f"appmap build --run {run}"
+    if args.action != "list":
+        counts["changed"] = changed
+    emit_status("approvals", ok=True,
+                status={"list": "listed", "write": "written", "apply": "applied"}[args.action],
+                counts=counts, pending_approvals=counts["pending"],
+                errors=[f"approvals.yaml: {w}" for w in queue.warnings], next=nxt)
+    return 0
+
+
+HANDLERS = {"init": cmd_init, "auth": cmd_auth, "crawl": cmd_crawl, "probe": cmd_probe,
+            "approvals": cmd_approvals}
 
 
 def main(argv: list[str] | None = None) -> int:

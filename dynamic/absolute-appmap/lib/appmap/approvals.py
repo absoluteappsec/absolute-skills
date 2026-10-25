@@ -11,6 +11,7 @@ from .store import Store
 
 _DECISIONS = {"approve", "deny", "skip"}
 _MATCH_KEYS = {"category", "role", "url_contains", "label_contains"}
+_FAILED_KEY = "approval_failed:"  # meta key prefix: why an approved item could not run
 
 
 @dataclass
@@ -87,11 +88,17 @@ class ApprovalQueue:
     def write_yaml(self) -> None:
         old = self._read_yaml()
         notes = {i.get("id"): i.get("note") for i in old.get("items") or [] if isinstance(i, dict)}
-        items = [{"id": r["id"], "role": r["role"], "category": r["category"], "label": r["label"],
-                  "reasons": _loads(r["reasons"]) or [],
-                  "predicted_request": _loads(r["predicted_request"]),
-                  "decision": r["decision"], "note": notes.get(r["id"]) or ""}
-                 for r in self._rows()]
+        failed = self.failures()
+        items = []
+        for r in self._rows():
+            item = {"id": r["id"], "role": r["role"], "category": r["category"],
+                    "label": r["label"], "reasons": _loads(r["reasons"]) or [],
+                    "predicted_request": _loads(r["predicted_request"]),
+                    "decision": r["decision"], "note": notes.get(r["id"]) or ""}
+            execution = self._execution(r["executed_event"], failed.get(r["id"]))
+            if execution:
+                item["execution"] = execution  # informational; ignored when loading
+            items.append(item)
         out = {"items": items, "rules": old.get("rules") or []}
         self.yaml_path.parent.mkdir(parents=True, exist_ok=True)
         self.yaml_path.write_text(yaml.safe_dump(out, sort_keys=False, default_flow_style=False))
@@ -173,6 +180,31 @@ class ApprovalQueue:
 
     def mark_executed(self, id: str, event_id: str) -> None:
         self.store.upsert_approval(id, executed_event=event_id)
+        self.store.conn.execute("DELETE FROM meta WHERE key=?", (_FAILED_KEY + id,))
+
+    def mark_failed(self, id: str, reason: str) -> None:
+        """Record why an approved item could not be (fully) executed."""
+        self.store.set_meta(_FAILED_KEY + id, reason)
+
+    def failures(self) -> dict[str, str]:
+        return {r["key"][len(_FAILED_KEY):]: r["value"] for r in self.store.conn.execute(
+            "SELECT key, value FROM meta WHERE key LIKE ?", (_FAILED_KEY + "%",))}
+
+    @staticmethod
+    def _execution(event_id: str | None, failure: str | None) -> str:
+        if event_id and failure:
+            return f"executed ({event_id}) with error: {failure}"
+        if event_id:
+            return f"executed ({event_id})"
+        return f"failed: {failure}" if failure else ""
+
+    def summary(self) -> dict[str, int]:
+        """Status counts for CLI output (decision names spelled out, plus failures)."""
+        c = self.counts()
+        return {"pending": c["pending"], "approved": c["approve"], "denied": c["deny"],
+                "skipped": c["skip"], "executed": c["executed"],
+                "approved_unexecuted": len(self.approved_unexecuted()),
+                "failed": len(self.failures())}
 
     def counts(self) -> dict[str, int]:
         c = {"pending": 0, "approve": 0, "deny": 0, "skip": 0, "executed": 0}
