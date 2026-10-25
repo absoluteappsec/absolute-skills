@@ -11,7 +11,7 @@ from pathlib import Path
 from appmap import __version__
 
 COMMANDS = ["init", "auth", "crawl", "probe", "approvals", "build", "status", "query"]
-IMPLEMENTED = {"init", "auth", "crawl", "probe", "approvals", "build", "status"}
+IMPLEMENTED = {"init", "auth", "crawl", "probe", "approvals", "build", "status", "query"}
 
 log = logging.getLogger("appmap.cli")
 
@@ -90,10 +90,44 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also report coverage gaps (JSON line before APPMAP_STATUS)")
     p.add_argument("--new-pass", action="store_true",
                    help="start the next pass: snapshot current counts as its baseline")
+    _add_query_parser(sub)
     for name in COMMANDS:
         if name not in IMPLEMENTED:
             sub.add_parser(name, help=f"{name} (not yet implemented)")
     return parser
+
+
+def _add_query_parser(sub) -> None:
+    p = sub.add_parser("query", help="run a query recipe or read-only SQL on a run's database")
+    p.add_argument("--run", help="run directory")
+    p.add_argument("--format", choices=["json", "table"], default="json",
+                   help="json: one JSON object per line (default); table: aligned text")
+    rs = p.add_subparsers(dest="recipe", metavar="RECIPE")
+
+    def recipe(name, help_, *opts):
+        rp = rs.add_parser(name, help=help_)
+        rp.add_argument("--run", default=argparse.SUPPRESS, help="run directory")
+        rp.add_argument("--format", choices=["json", "table"], default=argparse.SUPPRESS)
+        for opt, h in opts:
+            rp.add_argument(f"--{opt}", help=h)
+        return rp
+
+    recipe("flows", "every flow step with its UI action, locators and request",
+           ("role", "only this role (default: all)"))
+    recipe("forms-posting-to", "forms whose submission hit an endpoint",
+           ("endpoint", "exact path pattern or LIKE pattern, e.g. '/api/%%'"))
+    recipe("hidden-but-reachable", "allowed for the role but never reached through its UI",
+           ("role", "role name"))
+    recipe("endpoint-shape", "params and per-role response shapes of an endpoint",
+           ("method", "HTTP method"), ("path", "path pattern, e.g. /api/items/{id}"))
+    recipe("path-to-state", "URL plus click/submit steps (with locators) reaching a state",
+           ("state", "state id (st-...)"))
+    recipe("role-matrix", "the whole role access matrix")
+    recipe("gaps", "coverage gaps (same lists as 'status --gaps')")
+    recipe("flow-form-fields", "fields of the forms a flow submits, with locators",
+           ("flow", "flows.id"))
+    sp = recipe("sql", "run one read-only SELECT/WITH statement")
+    sp.add_argument("sql", help="the SELECT statement")
 
 
 # -- run-directory plumbing ------------------------------------------------------
@@ -492,6 +526,45 @@ def cmd_build(args) -> int:
     return 0
 
 
+def cmd_query(args) -> int:
+    from appmap.query import QueryError, format_table, run_recipe, run_sql
+    from appmap.rundir import open_run_dir
+    from appmap.store import Store
+
+    name = args.recipe or "query"
+    try:
+        if not args.run:
+            raise QueryError("--run is required")
+        if not args.recipe:
+            raise QueryError("a recipe or 'sql' is required (see: appmap query --help)")
+        rd = open_run_dir(Path(args.run))
+        if not rd.db_path.is_file():
+            raise QueryError(f"{rd.db_path} not found; run a crawl first")
+        store = Store.open_readonly(rd.db_path)
+    except (QueryError, OSError) as e:
+        emit_status("query", ok=False, status="error", errors=[str(e)])
+        return 1
+    try:
+        if args.recipe == "sql":
+            rows = run_sql(store, args.sql)
+        else:
+            params = {k: getattr(args, k, None)
+                      for k in ("role", "endpoint", "method", "path", "state", "flow")}
+            rows = run_recipe(store, args.recipe, **params)
+    except QueryError as e:
+        emit_status("query", ok=False, status="error", errors=[str(e)])
+        return 1
+    finally:
+        store.close()
+    if args.format == "table":
+        print(format_table(rows), flush=True)
+    else:
+        for r in rows:
+            print(json.dumps(r, default=str), flush=True)
+    emit_status("query", ok=True, status="complete", counts={"rows": len(rows), "recipe": name})
+    return 0
+
+
 def _record_activity(rd) -> None:
     """Stamp meta.last_activity_ts so ``status --new-pass`` can tell a pass actually ran."""
     from appmap.gaps import record_activity
@@ -562,7 +635,8 @@ def cmd_status(args) -> int:
 
 
 HANDLERS = {"init": cmd_init, "auth": cmd_auth, "crawl": cmd_crawl, "probe": cmd_probe,
-            "approvals": cmd_approvals, "build": cmd_build, "status": cmd_status}
+            "approvals": cmd_approvals, "build": cmd_build, "status": cmd_status,
+            "query": cmd_query}
 
 
 def main(argv: list[str] | None = None) -> int:

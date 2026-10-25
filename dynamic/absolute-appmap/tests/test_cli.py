@@ -1,5 +1,6 @@
 import json
 
+from appmap import cli
 from appmap.cli import build_parser, emit_status, main
 from appmap.paths import cache_dir, session_dir, venv_dir
 
@@ -24,7 +25,8 @@ def test_cache_dir_honors_xdg(monkeypatch, tmp_path):
     assert session_dir("r1") == tmp_path / "absolute-appmap" / "sessions" / "r1"
 
 
-def test_subcommands_registered_and_stubs_emit_status(capsys):
+def test_subcommands_registered_and_stubs_emit_status(capsys, monkeypatch):
+    monkeypatch.delitem(cli.HANDLERS, "query")  # every command is implemented now
     names = {"init", "auth", "crawl", "probe", "approvals", "build", "status", "query"}
     sub = next(a for a in build_parser()._actions if a.dest == "command")
     assert set(sub.choices) == names
