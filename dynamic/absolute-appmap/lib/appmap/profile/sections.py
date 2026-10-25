@@ -4,10 +4,14 @@ Read-only over a run's SQLite store and ``run.json``; nothing here contacts the 
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
+from appmap.build import created_records
+from appmap.gaps import compute_gaps
 from appmap.probe.schemas import load_spec
 from appmap.profile.evidence import MAX_EVIDENCE_TEXT, _is_schema, _read_body
 from appmap.redact import Redactor
@@ -458,4 +462,265 @@ def environment(run_dir: Path) -> dict:
         "started_at": meta.get("started_at"),
         "tool_version": meta.get("tool_version"),
         "contains_production_data": bool(meta.get("contains_production_data")),
+    }
+
+
+# ------------------------------------------------------- sections II: features etc.
+_OBSERVED_CAP = 50
+_OBSERVED_KEYS = {"username", "email", "user", "login"}
+_EMAIL = re.compile(r"^[^@\s<>\"']{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,}$")
+_NAME = re.compile(r"^[A-Za-z0-9][\w.@+-]{0,63}$")
+_MAILTO = re.compile(r"mailto:([^\"'<>\s?#&]{3,200})", re.I)
+_SIGNUP_PATH = re.compile(r"regist|sign[-_]?up|users?(/new)?$|accounts?(/new)?$", re.I)
+_LIST_CAP = 5000
+_NOISE_OUTCOMES = {"not_tested"}
+
+
+def _exref(run_id: str, xid: int) -> dict:
+    return {"run_id": run_id, "kind": "exchange", "id": xid}
+
+
+def _flow_resource(pre: dict) -> str | None:
+    steps = pre.get("steps") or []
+    ordered = [s for s in steps if s.get("mutating")] + steps
+    for s in ordered:
+        res = _resource(s.get("path_pattern") or "")
+        if res:
+            return res
+    return None
+
+
+def features(store: Store, run_id: str) -> list[dict]:
+    """Feature candidates: flows, forms, routes and endpoints clustered by resource."""
+    conn = store.conn
+    feats: dict[str, dict] = {}
+
+    def feat(res: str) -> dict:
+        return feats.setdefault(res, {"flow_keys": set(), "routes": [], "endpoints": [],
+                                      "forms": [], "roles": set()})
+
+    access: dict[tuple[str, int], set[str]] = {}
+    for r in conn.execute("SELECT item_kind, item_id, role FROM role_access "
+                          "WHERE outcome='allowed'"):
+        access.setdefault((r["item_kind"], r["item_id"]), set()).add(r["role"])
+    for r in conn.execute("SELECT id, pattern FROM routes ORDER BY pattern"):
+        res = _resource(r["pattern"])
+        if res:
+            f = feat(res)
+            f["routes"].append(r["pattern"])
+            f["roles"] |= access.get(("route", r["id"]), set())
+    ep_res: dict[int, str] = {}
+    for e in conn.execute("SELECT id, method, path_pattern, kind FROM endpoints "
+                          "ORDER BY path_pattern, method"):
+        res = _resource(e["path_pattern"])
+        if not res or e["kind"] in _NON_ENDPOINT_KINDS or e["method"] in ("HEAD", "OPTIONS"):
+            continue
+        ep_res[e["id"]] = res
+        f = feat(res)
+        f["endpoints"].append(f"{e['method']} {e['path_pattern']}")
+        f["roles"] |= access.get(("endpoint", e["id"]), set())
+    for fm in conn.execute(
+            "SELECT f.id, f.method, f.purpose, f.action_endpoint_id, e.path_pattern "
+            "FROM forms f LEFT JOIN endpoints e ON e.id=f.action_endpoint_id ORDER BY f.id"):
+        res = _resource(fm["path_pattern"] or "")
+        if res:
+            feat(res)["forms"].append({"id": fm["id"], "method": fm["method"],
+                                       "purpose": fm["purpose"] or "",
+                                       "action": fm["path_pattern"]})
+    for fl in conn.execute("SELECT role, preconditions FROM flows ORDER BY id"):
+        pre = _loads(fl["preconditions"], {})
+        res = _flow_resource(pre)
+        if res and pre.get("flow_key"):
+            f = feat(res)
+            f["flow_keys"].add(pre["flow_key"])
+            if fl["role"]:
+                f["roles"].add(fl["role"])
+    out = []
+    for res, f in sorted(feats.items()):
+        keys = sorted(f["flow_keys"])
+        out.append({
+            "key": "ft-" + hashlib.sha1((res + "|" + "|".join(keys)).encode()).hexdigest()[:12],
+            "resource": res, "flow_keys": keys, "routes": f["routes"],
+            "endpoints": f["endpoints"], "forms": f["forms"], "roles": sorted(f["roles"]),
+            "name_suggestion": re.sub(r"[-_]+", " ", res).strip().title(),
+        })
+    return out
+
+
+def _created_ids(store: Store, records: list[dict]) -> set[str]:
+    ids: set[str] = set()
+    for r in records:
+        m = re.search(r"(\d+)/?$", urlsplit(r.get("location") or "").path)
+        if m:
+            ids.add(m.group(1))
+        row = store.conn.execute("SELECT resp_body FROM exchanges WHERE id=?",
+                                 (r["id"],)).fetchone()
+        doc = _loads_any(row["resp_body"]) if row and row["resp_body"] else None
+        if isinstance(doc, dict) and isinstance(doc.get("id"), (int, str)):
+            ids.add(str(doc["id"]))
+    return ids
+
+
+def _item_dicts(doc) -> list[dict]:
+    if isinstance(doc, dict):
+        lists = [v for v in doc.values() if isinstance(v, list)]
+        doc = lists[0] if len(lists) == 1 else [doc]
+    return [d for d in doc[:_LIST_CAP] if isinstance(d, dict)] if isinstance(doc, list) else []
+
+
+def _seed_observations(store: Store, created: set[str]) -> list[dict]:
+    root = store.db_path.parent
+    ids: dict[str, set[int]] = {}
+    for x in store.conn.execute(
+            "SELECT x.resp_body, x.resp_body_path, e.path_pattern FROM exchanges x "
+            "JOIN endpoints e ON e.id=x.endpoint_id WHERE x.method='GET' "
+            "AND x.status BETWEEN 200 AND 299 AND e.kind NOT IN ('static','page') "
+            "AND (x.content_type LIKE '%json%') ORDER BY x.id"):
+        res = _resource(x["path_pattern"])
+        if not res:
+            continue
+        body = _read_body(root, x["resp_body"], x["resp_body_path"])
+        doc = _loads_any(body) if body else None
+        for d in _item_dicts(doc):
+            v = d.get("id")
+            if isinstance(v, int) and not isinstance(v, bool) and str(v) not in created:
+                ids.setdefault(res, set()).add(v)
+    return [{"resource": res, "id_min": min(v), "id_max": max(v), "count": len(v)}
+            for res, v in sorted(ids.items())]
+
+
+def data_setup(store: Store, run_id: str) -> dict:
+    pre = []
+    for fl in store.conn.execute("SELECT preconditions FROM flows ORDER BY id"):
+        p = _loads(fl["preconditions"], {})
+        reqs = [{"endpoint": r.get("endpoint"), "json_path": r.get("json_path"),
+                 "consumer_location": r.get("consumer_location"),
+                 "evidence": _exref(run_id, r["producer_exchange_id"])
+                 if r.get("producer_exchange_id") is not None else None}
+                for r in p.get("requires") or []]
+        if reqs and p.get("flow_key"):
+            pre.append({"flow_key": p["flow_key"], "requires": reqs})
+    records = created_records(store)
+    meta_path = store.db_path.parent / "run.json"
+    try:
+        cfg = json.loads(meta_path.read_text()).get("config") or {}
+    except (OSError, ValueError):
+        cfg = {}
+    form_data = cfg.get("form_data") if isinstance(cfg.get("form_data"), dict) else {}
+    fixtures = bool(form_data.get("fixtures")) or (store.db_path.parent / "fixtures.yaml").exists()
+    return {
+        "preconditions": pre,
+        "created_records": [{
+            "exchange_id": r["id"], "role": r["role"], "method": r["method"],
+            "endpoint": r.get("path_pattern") or urlsplit(_redactor.url(r["url"] or "")).path,
+            "status": r["status"], "marker": r.get("marker") or "",
+            "ref": _exref(run_id, r["id"])} for r in records],
+        "fixtures_used": fixtures,
+        "seed_observations": _seed_observations(store, _created_ids(store, records)),
+    }
+
+
+def mask_identity(s: str) -> str:
+    """``chris@example.com`` -> ``c***@example.com``; ``chris`` -> ``c***``."""
+    if not s:
+        return ""
+    local, at, domain = s.partition("@")
+    return (local[:1] + "***" + at + domain) if local else s
+
+
+def _identities(doc, depth: int = 0):
+    if depth > 6:
+        return
+    if isinstance(doc, dict):
+        for k, v in doc.items():
+            if isinstance(v, str) and str(k).lower() in _OBSERVED_KEYS \
+                    and not _SENSITIVE_NAME.search(str(k)):
+                if _EMAIL.match(v) or (str(k).lower() != "email" and _NAME.match(v)):
+                    yield v
+            elif isinstance(v, (dict, list)):
+                yield from _identities(v, depth + 1)
+    elif isinstance(doc, list):
+        for v in doc[:200]:
+            yield from _identities(v, depth + 1)
+
+
+def _observed_identities(store: Store, run_id: str) -> list[tuple[str, int]]:
+    root = store.db_path.parent
+    seen: dict[str, int] = {}
+    for x in store.conn.execute(
+            "SELECT id, content_type, resp_body, resp_body_path FROM exchanges "
+            "WHERE status BETWEEN 200 AND 299 ORDER BY id"):
+        if len(seen) >= _OBSERVED_CAP:
+            break
+        ct = (x["content_type"] or "").lower()
+        is_json, is_html = "json" in ct, "html" in ct
+        if not (is_json or is_html):
+            continue
+        body = _read_body(root, x["resp_body"], x["resp_body_path"])
+        if not body:
+            continue
+        found: list[str] = []
+        if is_json:
+            doc = _loads_any(body)
+            found += list(_identities(doc)) if doc is not None else []
+        else:
+            found += [m for m in _MAILTO.findall(body) if _EMAIL.match(m)]
+        for v in found:
+            if len(seen) < _OBSERVED_CAP:
+                seen.setdefault(v, x["id"])
+    return list(seen.items())
+
+
+def accounts(store: Store, run_id: str, *, mask: bool) -> dict:
+    conn = store.conn
+    counts: dict[tuple[str, str], int] = {}
+    for r in conn.execute("SELECT role, item_kind, count(*) n FROM role_access "
+                          "WHERE outcome='allowed' GROUP BY role, item_kind"):
+        counts[(r["role"], r["item_kind"])] = r["n"]
+    roles = [{"name": r["name"], "login_type": r["login_type"],
+              "auth_ok": None if r["auth_ok"] is None else bool(r["auth_ok"]),
+              "reachable_routes": counts.get((r["name"], "route"), 0),
+              "reachable_endpoints": counts.get((r["name"], "endpoint"), 0)}
+             for r in conn.execute("SELECT name, login_type, auth_ok FROM roles ORDER BY name")]
+    created = [{"exchange_id": r["id"], "role": r["role"], "method": r["method"],
+                "endpoint": r.get("path_pattern") or urlsplit(r["url"] or "").path,
+                "ref": _exref(run_id, r["id"])}
+               for r in created_records(store)
+               if _SIGNUP_PATH.search(urlsplit(r["url"] or "").path.rstrip("/").rsplit("/", 1)[-1])]
+    observed = [{"value": mask_identity(v) if mask else v, "where": _exref(run_id, xid)}
+                for v, xid in _observed_identities(store, run_id)]
+    return {"roles": roles, "created_by_run": created, "observed": observed}
+
+
+def _outcome(outcomes: set[str]) -> str:
+    real = outcomes - _NOISE_OUTCOMES
+    if not real:
+        return "not_tested"
+    return next(iter(real)) if len(real) == 1 else "mixed(" + ",".join(sorted(real)) + ")"
+
+
+def coverage(store: Store, run_id: str) -> dict:
+    conn = store.conn
+    outcomes: dict[tuple[str, int], dict[str, set[str]]] = {}
+    for r in conn.execute("SELECT item_kind, item_id, role, outcome FROM role_access"):
+        outcomes.setdefault((r["item_kind"], r["item_id"]), {}).setdefault(
+            r["role"], set()).add(r["outcome"])
+    route_id = {r["pattern"]: r["id"] for r in conn.execute("SELECT id, pattern FROM routes")}
+    ep_id = {f"{e['method']} {e['path_pattern']}": e["id"] for e in conn.execute(
+        "SELECT id, method, path_pattern FROM endpoints")}
+    role_names = [r["name"] for r in conn.execute("SELECT name FROM roles ORDER BY name")]
+    grid: dict[str, dict[str, str]] = {}
+    for f in features(store, run_id):
+        items = [("route", route_id[p]) for p in f["routes"] if p in route_id] + \
+                [("endpoint", ep_id[e]) for e in f["endpoints"] if e in ep_id]
+        grid[f["key"]] = {
+            role: _outcome({o for it in items for o in outcomes.get(it, {}).get(role, set())})
+            for role in role_names}
+    dec = {r["decision"]: r["n"] for r in conn.execute(
+        "SELECT decision, count(*) n FROM approvals GROUP BY decision")}
+    return {
+        "features_x_roles": grid,
+        "unexercised": compute_gaps(store).summary(),
+        "approvals": {"pending": dec.get("pending", 0), "denied": dec.get("deny", 0),
+                      "skipped": dec.get("skip", 0)},
     }

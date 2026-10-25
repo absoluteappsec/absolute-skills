@@ -187,3 +187,117 @@ def test_data_model_dedupes_schema_entities_and_bare_id(tmp_path):
     assert [f["name"] for f in proj[0]["fields"]] == ["id", "name"]
     assert [r["id"] for r in proj[0]["evidence"]] == [1, 2]
     assert next(e for e in ents if e["name"] == "things")["id_format"] == "unknown"
+
+
+# ----------------------------------------------------------------- sections II
+import pytest  # noqa: E402
+
+from appmap.profile.sections import (accounts, coverage, data_setup, features,  # noqa: E402
+                                     mask_identity)
+
+
+@pytest.mark.parametrize("raw,masked", [
+    ("chris@example.com", "c***@example.com"),
+    ("chris", "c***"),
+    ("a@b.io", "a***@b.io"),
+    ("", ""),
+])
+def test_mask_identity(raw, masked):
+    assert mask_identity(raw) == masked
+
+
+def _with_store(run, fn):
+    store, run_id = _open(run)
+    try:
+        return fn(store, run_id), run_id
+    finally:
+        store.close()
+
+
+def test_features_ssr(ssr_built_run):
+    feats, run_id = _with_store(ssr_built_run, features)
+    by = {f["resource"]: f for f in feats}
+    assert {"projects", "admin"} <= set(by)
+    proj = by["projects"]
+    assert "admin|POST /projects/new" in proj["flow_keys"]
+    assert "/projects/new" in proj["routes"] and "GET /api/projects" in proj["endpoints"]
+    assert proj["forms"] and {"admin", "alice"} <= set(proj["roles"])
+    assert proj["name_suggestion"] == "Projects"
+    import hashlib
+    want = "ft-" + hashlib.sha1(
+        ("projects|" + "|".join(sorted(proj["flow_keys"]))).encode()).hexdigest()[:12]
+    assert proj["key"] == want
+    assert by["admin"]["roles"] == ["admin"]
+    assert len({f["key"] for f in feats}) == len(feats)
+
+
+def test_data_setup_ssr(ssr_built_run):
+    out, run_id = _with_store(ssr_built_run, data_setup)
+    pre = {p["flow_key"]: p for p in out["preconditions"]}
+    assert "admin|POST /projects/new" in pre and pre["admin|POST /projects/new"]["requires"]
+    assert all(p["requires"] for p in out["preconditions"])
+    recs = out["created_records"]
+    assert recs and any(r["method"] == "POST" and r["endpoint"] == "/projects/new" for r in recs)
+    assert all(r["ref"] == {"run_id": run_id, "kind": "exchange", "id": r["exchange_id"]}
+               for r in recs)
+    assert out["fixtures_used"] is False
+    seed = {s["resource"]: s for s in out["seed_observations"]}
+    assert seed["projects"]["id_min"] == 1 and seed["projects"]["count"] >= 1
+    assert seed["projects"]["id_max"] >= seed["projects"]["id_min"]
+
+
+def test_data_setup_spa_seed_unwraps_wrapper(spa_built_run):
+    out, _ = _with_store(spa_built_run, data_setup)
+    seed = {s["resource"]: s for s in out["seed_observations"]}
+    assert seed["items"]["id_min"] == 1 and seed["items"]["count"] >= 10
+
+
+def test_accounts_ssr(ssr_built_run):
+    out, run_id = _with_store(ssr_built_run, lambda s, r: accounts(s, r, mask=False))
+    roles = {r["name"]: r for r in out["roles"]}
+    assert set(roles) == {"admin", "alice", "anonymous"}
+    assert roles["admin"]["login_type"] == "form" and roles["anonymous"]["login_type"] == "none"
+    assert roles["admin"]["reachable_routes"] > roles["alice"]["reachable_routes"]
+    assert roles["admin"]["reachable_endpoints"] >= 1
+    assert "password" not in json.dumps(out["roles"]).lower()
+    assert len(out["observed"]) <= 50
+
+
+def test_accounts_observed_and_masking(tmp_path):
+    root = tmp_path / "appmap-x-20260101-000000"
+    (root / "bodies").mkdir(parents=True)
+    s = Store(root / "appmap.sqlite")
+    s.init_schema()
+    s.add_exchange(None, "admin", "ui", method="GET", url="http://x/api/me", status=200,
+                   content_type="application/json",
+                   resp_body=json.dumps({"username": "chris", "email": "chris@example.com",
+                                         "password": "hunter2", "token": "abc123",
+                                         "login": True}))
+    s.add_exchange(None, "admin", "ui", method="GET", url="http://x/contact", status=200,
+                   content_type="text/html",
+                   resp_body='<a href="mailto:help@corp.example?subject=x">mail</a>')
+    s.close()
+    store = Store.open_readonly(root / "appmap.sqlite")
+    plain = accounts(store, "20260101-000000", mask=False)
+    masked = accounts(store, "20260101-000000", mask=True)
+    store.close()
+    vals = {o["value"] for o in plain["observed"]}
+    assert vals == {"chris", "chris@example.com", "help@corp.example"}
+    assert {o["value"] for o in masked["observed"]} == {"c***", "c***@example.com",
+                                                        "h***@corp.example"}
+    assert all(o["where"]["kind"] == "exchange" for o in plain["observed"])
+    blob = json.dumps(plain)
+    assert "hunter2" not in blob and "abc123" not in blob
+
+
+def test_coverage_ssr(ssr_built_run):
+    out, _ = _with_store(ssr_built_run, coverage)
+    feats, _ = _with_store(ssr_built_run, features)
+    admin = next(f for f in feats if f["resource"] == "admin")
+    grid = out["features_x_roles"]
+    assert grid[admin["key"]]["admin"] == "allowed"
+    assert grid[admin["key"]]["alice"] == "forbidden"
+    assert set(grid) == {f["key"] for f in feats}
+    assert set(out["unexercised"]) >= {"unexercised_endpoints", "unreached_routes"}
+    assert out["approvals"]["pending"] >= 1 and out["approvals"]["denied"] >= 1
+    assert set(out["approvals"]) == {"pending", "denied", "skipped"}
