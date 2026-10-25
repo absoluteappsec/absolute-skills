@@ -216,11 +216,12 @@ No observations.
 {{ external_links }} out-of-scope link(s) recorded (`SELECT * FROM external_links`).
 {% endif %}
 
-## Records created by this run
+## Records created or changed by this run
 
 {% if records.rows %}
-Every successful (2xx/3xx) state-changing request this run sent (login traffic and
-login/logout endpoints left out): candidates for post-run cleanup. {{ records.matched }} carry
+Every successful (2xx/3xx) state-changing request this run sent, plus each executed approved
+action's own request whatever its method (e.g. a GET that deletes), with login traffic and
+login/logout endpoints left out: candidates for post-run cleanup or restore. {{ records.matched }} carry
 the run marker `{{ records.marker }}`{% if records.variants %} or one of this run's truncations of it ({% for v in records.variants %}`{{ v }}`{% if not loop.last %}, {% endif %}{% endfor %}){% endif %} in their query string or body (`Marker` column); they are listed first.
 
 | Exchange | Role | Origin | Request | Status | Marker | Location |
@@ -230,7 +231,7 @@ the run marker `{{ records.marker }}`{% if records.variants %} or one of this ru
 {% endfor %}
 {% if records.more %}
 
-… {{ records.more }} more — see appmap.sqlite (`SELECT * FROM exchanges WHERE upper(method) NOT IN ('GET','HEAD','OPTIONS') AND status BETWEEN 200 AND 399 AND origin != 'login'`)
+… {{ records.more }} more — see appmap.sqlite (`SELECT * FROM exchanges WHERE (upper(method) NOT IN ('GET','HEAD','OPTIONS') OR origin = 'approved') AND status BETWEEN 200 AND 399 AND origin != 'login'`; approved GETs other than the approvals' own requests are pages loaded around them)
 {% endif %}
 {% else %}
 No successful state-changing requests were sent by this run.

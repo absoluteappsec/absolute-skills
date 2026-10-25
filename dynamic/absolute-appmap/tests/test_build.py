@@ -20,7 +20,7 @@ FAST = {"max_requests_per_second": 200, "quiet_window_ms": 150,
         "max_states_per_route_pattern": 3}
 SECTIONS = ["## Run summary", "## Route tree", "## Endpoint inventory", "## Role access matrix",
             "## Key flows", "## Forms", "## GraphQL operations", "## Unexercised surface",
-            "## Coverage gaps", "## Observations", "## Records created by this run",
+            "## Coverage gaps", "## Observations", "## Records created or changed by this run",
             "## Where to dig deeper"]
 
 
@@ -177,7 +177,7 @@ def test_app_map_sections_present(ssr_run, tmp_path, capsys):
     assert "POST /projects/new" in md
     # R23: every successful write of the run is listed; the SSR name field only had room
     # for "appmap-20261" (no run date), so the created project has no marker annotation
-    created = md.split("## Records created by this run", 1)[1].split("## Where", 1)[0]
+    created = md.split("## Records created or changed by this run", 1)[1].split("## Where", 1)[0]
     rows = [line.split(" | ") for line in created.splitlines() if line.startswith("| ")
             and line.split("|")[1].strip().isdigit()]
     news = [r for r in rows if "/projects/new" in r[3]]
@@ -665,7 +665,7 @@ def test_apply_names_ignores_unhashable_entries(tmp_path):
 def _records(store, root) -> list[tuple[int, str]]:
     """(exchange id, marker annotation) rows of the Records section, in order."""
     md = render_app_map(store, open_run_dir(root))
-    rec = md.split("## Records created by this run", 1)[1].split("## Where", 1)[0]
+    rec = md.split("## Records created or changed by this run", 1)[1].split("## Where", 1)[0]
     return [(int(c[1]), c[6].strip().strip("`")) for c in
             (line.split("|") for line in rec.splitlines() if line.startswith("| "))
             if c[1].strip().isdigit()]
@@ -756,7 +756,7 @@ def test_records_skip_login_traffic_and_cap(tmp_path):
         for i in range(120):
             _x(store, "u", "POST", f"{b}/notes?n={i}", status=201)
         md = render_app_map(store, open_run_dir(root))
-        rec = md.split("## Records created by this run", 1)[1].split("## Where", 1)[0]
+        rec = md.split("## Records created or changed by this run", 1)[1].split("## Where", 1)[0]
         ids = [i for i, _mk in _records(store, root)]
         assert ids[0] == keep and len(ids) == 100
         assert "21 more — see appmap.sqlite" in rec
@@ -818,5 +818,34 @@ def test_records_skip_writes_bounced_to_login_or_denied(tmp_path):
         keep = store.add_exchange(None, "u", "ui", method="POST", url=f"{b}/projects/new",
                                   status=302, resp_headers={"Location": "/projects/31"})
         assert [i for i, _mk in _records(store, root)] == [keep]
+    finally:
+        store.close()
+
+
+def test_records_include_executed_approved_actions_any_method(tmp_path):
+    """Field fix 3: an approved GET delete (VTM task_delete) changed data and is listed;
+    the pages loaded after it (also origin 'approved') and unexecuted approvals are not."""
+    store, root = _synthetic(tmp_path)
+    try:
+        b = "https://example.test"
+        store.upsert_approval("ap-0001", role="u", category="delete", label="Delete",
+                              action_path=[{"type": "goto", "url": f"{b}/7/task_delete/13"}],
+                              predicted_request={"method": "GET", "url": f"{b}/7/task_delete/13"},
+                              decision="approve", executed_event="ev-1")
+        store.upsert_approval("ap-0002", role="u", category="delete", label="Delete",
+                              action_path=[{"type": "goto", "url": f"{b}/7/task_delete/14"}],
+                              predicted_request={"method": "GET", "url": f"{b}/7/task_delete/14"},
+                              decision="approve")
+        gone = store.add_exchange(None, "u", "approved", method="GET",
+                                  url=f"{b}/7/task_delete/13", status=302,
+                                  resp_headers={"Location": "/dashboard"})
+        store.add_exchange(None, "u", "approved", method="GET", url=f"{b}/dashboard",
+                           status=200)
+        _x(store, "u", "GET", f"{b}/7/task_delete/14", status=302)  # not executed by approval
+        post = store.add_exchange(None, "u", "approved", method="POST",
+                                  url=f"{b}/chat/session/9/delete/", status=200)
+        assert [i for i, _mk in _records(store, root)] == [gone, post]
+        md = render_app_map(store, open_run_dir(root))
+        assert "## Records created by this run" not in md
     finally:
         store.close()

@@ -956,13 +956,33 @@ def _login_paths(store: Store) -> set[str]:
     return out
 
 
+def _executed_approved_gets(store: Store) -> set[str]:
+    """URLs (no fragment, no trailing slash) of executed approvals whose own request is a
+    GET (field fix 3: VTM's task_delete): state-changing although safe by method."""
+    out = set()
+    for r in store.conn.execute("SELECT predicted_request FROM approvals "
+                                "WHERE executed_event IS NOT NULL"):
+        pr = _loads(r["predicted_request"], {}) or {}
+        if str(pr.get("method") or "").upper() == "GET" and pr.get("url"):
+            out.add(_url_key(pr["url"]))
+    return out
+
+
+def _url_key(url: str) -> str:
+    p = urlsplit(url or "")
+    return f"{p.scheme}://{p.netloc.lower()}{p.path.rstrip('/') or '/'}" + (
+        f"?{p.query}" if p.query else "")
+
+
 def _ctx_records(store: Store) -> dict:
-    """Records created by this run (ruling R23): every exchange in the run directory was
-    sent by this run, so this is every successful (2xx/3xx) non-GET exchange except login
-    traffic, login/logout endpoints and writes redirected to a login page (session lost:
-    nothing was created). ``marker`` annotates the marker or run-specific truncation found
-    in the query string or body (never the URL host or path); rows with a marker come
-    first."""
+    """Records created or changed by this run (ruling R23): every exchange in the run
+    directory was sent by this run, so this is every successful (2xx/3xx) non-GET exchange
+    except login traffic, login/logout endpoints and writes redirected to a login page
+    (session lost: nothing was created), plus each executed approved action's own request
+    whatever its method (field fix 3: a GET delete). ``marker`` annotates the marker or
+    run-specific truncation found in the query string or body (never the URL host or
+    path); rows with a marker come first."""
+    approved_gets = _executed_approved_gets(store)
     login_paths = _login_paths(store)
     marker = run_marker(store)
     variants = marker_variants(store, marker) if marker else set()
@@ -971,8 +991,11 @@ def _ctx_records(store: Store) -> dict:
     for x in _rows(store, """SELECT x.id, x.role, x.method, x.url, x.status, x.origin, x.req_body,
             x.req_body_path, x.resp_headers, e.path_pattern
         FROM exchanges x LEFT JOIN endpoints e ON e.id=x.endpoint_id
-        WHERE upper(x.method) NOT IN ('GET','HEAD','OPTIONS') AND x.status BETWEEN 200 AND 399
-          AND x.origin != 'login' ORDER BY x.id"""):
+        WHERE (upper(x.method) NOT IN ('GET','HEAD','OPTIONS')
+               OR (x.origin = 'approved' AND upper(x.method) = 'GET'))
+          AND x.status BETWEEN 200 AND 399 AND x.origin != 'login' ORDER BY x.id"""):
+        if (x["method"] or "").upper() == "GET" and _url_key(x["url"]) not in approved_gets:
+            continue  # a page loaded around an approved action, not the action itself
         if _AUTH_PATH.search(urlsplit(x["url"] or "").path):
             continue
         x["marker"] = ""
