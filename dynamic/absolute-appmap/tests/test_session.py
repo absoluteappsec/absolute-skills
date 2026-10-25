@@ -140,3 +140,35 @@ async def test_saved_state_restored(browser, ssr_url, make_cfg, run_dir, tmp_pat
     page = await h.recorder.new_page(sess2.context)
     assert (await page.goto(f"{ssr_url}/admin")).status == 200
     await sess2.context.close()
+
+
+# -- field fix 3: a failed form login says why and blocks automatic retries ------------
+async def test_failed_form_login_reports_why_and_blocks(browser, ssr_url, make_cfg, run_dir,
+                                                        tmp_path, monkeypatch):
+    from appmap.browser.session import login_blocked
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("APPMAP_ALICE_PASS", "wrong")
+    cfg = make_cfg(ssr_url)
+    h = Harness(cfg, run_dir(tmp_path, cfg))
+    alice = next(r for r in cfg.roles if r.name == "alice")
+    assert login_blocked(h.store, alice) is None  # never attempted: not blocked
+    sess = await h.open(browser, "alice")
+    assert not await login(sess, cfg, h.events)
+    why = sess.login_error or ""
+    assert "login page still shown" in why
+    assert "HTTP 401" in why
+    assert "Invalid credentials" in why
+    assert "wrong" not in why
+    assert "Invalid credentials" in (login_blocked(h.store, alice) or "")
+    # a non-interactive login of a blocked role is refused without a request
+    n = len(rows(h, "SELECT id FROM exchanges WHERE upper(method)='POST'"))
+    assert not await login(sess, cfg, h.events)
+    assert len(rows(h, "SELECT id FROM exchanges WHERE upper(method)='POST'")) == n
+    # only an interactive (appmap auth) login retries, and success clears the block
+    monkeypatch.setenv("APPMAP_ALICE_PASS", "alice-pw-Fx2")
+    cfg2 = make_cfg(ssr_url)
+    sess.role = next(r for r in cfg2.roles if r.name == "alice")
+    assert await login(sess, cfg2, h.events, interactive=True)
+    assert login_blocked(h.store, alice) is None
+    await sess.context.close()

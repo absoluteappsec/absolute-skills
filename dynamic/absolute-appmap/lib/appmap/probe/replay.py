@@ -25,8 +25,9 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from playwright.async_api import Browser, async_playwright
 
 from ..approvals import ApprovalQueue, PendingAction
-from ..browser.session import (MAX_RELOGINS, RoleSession, auth_probe_urls, is_session_lost,
-                               login, open_role_session, state_path)
+from ..browser.session import (MAX_RELOGINS, RoleSession, auth_probe_urls, blocked_message,
+                               is_session_lost, login, login_blocked, open_role_session,
+                               state_path)
 from ..config import RunConfig
 from ..destructive import ActionDescriptor, Flag, classify
 from ..direct import DirectClient
@@ -955,6 +956,11 @@ async def _open_sessions(browser: Browser, cfg: RunConfig, rd: RunDir, rt, deadl
     for role in cfg.roles:
         if expired(deadline):
             break
+        why = login_blocked(rt.store, role)
+        if why:  # field fix 3: only 'appmap auth' retries a failed login
+            warnings.append(blocked_message(role.name, why, str(rd.root)))
+            log.warning("role %s: last login failed (%s); not probed", role.name, why)
+            continue
         sess = await open_role_session(browser, cfg, rd, role, rt.recorder)
         opened[role.name] = sess
         if role.login.type == "manual" and not state_path(rd, role.name).exists():

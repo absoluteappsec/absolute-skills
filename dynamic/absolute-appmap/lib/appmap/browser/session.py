@@ -39,6 +39,8 @@ class RoleSession:
     # Where the last successful login landed (a page that needs the session): the first
     # liveness probe when a 401 or login redirect may only mean "not yours".
     landing_url: str | None = None
+    # Why the last login of this session failed (field fix 3), for status output.
+    login_error: str | None = None
 
 
 def _origin(url: str) -> str:
@@ -142,6 +144,46 @@ async def _new_login_page(sess: RoleSession) -> Page:
 
 
 # -- login -------------------------------------------------------------------
+_LOGIN_FAILED_KEY = "login_failed:"  # meta key prefix: why the role's last login failed
+# Visible error text after a failed login: common error containers, else lines that read
+# like a login error.
+_ERROR_TEXT_JS = """() => {
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const vis = (el) => el.getClientRects().length > 0;
+  const sel = '[role=alert],.error,.errors,.errorlist,.alert,.alert-danger,.invalid-feedback,'
+            + '.flash,.notice,.message,.messages,.help-block,.form-error,.field-error';
+  for (const el of document.querySelectorAll(sel)) {
+    const t = norm(el.innerText);
+    if (t && vis(el)) return t;
+  }
+  const rx = /invalid|incorrect|failed|wrong|denied|locked|not match|try again|unable/i;
+  for (const line of (document.body ? document.body.innerText : '').split('\\n')) {
+    if (rx.test(line)) return norm(line);
+  }
+  return '';
+}"""
+
+
+def login_blocked(store, role: Role) -> str | None:
+    """Why ``role`` must not be logged in automatically: its last form login failed
+    (``roles.auth_ok = 0`` for a form role). Only ``appmap auth`` retries it (lockout
+    risk). None when it never failed (or was never attempted)."""
+    if role.login.type != "form" or store is None:
+        return None
+    row = store.conn.execute("SELECT login_type, auth_ok FROM roles WHERE name=?",
+                             (role.name,)).fetchone()
+    if row is None or row["auth_ok"] is None or row["auth_ok"] != 0 \
+            or row["login_type"] != "form":
+        return None
+    return store.get_meta(_LOGIN_FAILED_KEY + role.name) or "last form login failed"
+
+
+def blocked_message(role: str, why: str, run: str | None = None) -> str:
+    cmd = f"appmap auth --run {run or '<run>'} --role {role}"
+    return (f"role {role}: skipped, its last login failed ({why}); a failed login is never "
+            f"retried automatically (lockout risk). Fix the credentials, then run '{cmd}'")
+
+
 async def _visible(page: Page, selector: str) -> bool:
     try:
         return await page.locator(selector).first.is_visible()
@@ -167,10 +209,22 @@ async def _form_login(sess: RoleSession, cfg: RunConfig, page: Page) -> bool:
     spec = sess.role.login
     creds = cfg.credentials(sess.role.name)
     if creds is None:
+        sess.login_error = (f"credentials not set (environment variables "
+                            f"{spec.username_env}/{spec.password_env})")
         return False
     user, password = creds
     login_url = _login_url(cfg, sess.role)
     await sess.context.clear_cookies()
+    statuses: list[int] = []
+
+    def on_response(resp) -> None:
+        try:
+            if resp.request.is_navigation_request() and resp.frame == page.main_frame:
+                statuses.append(resp.status)
+        except Exception:
+            pass
+
+    page.on("response", on_response)
     await page.goto(login_url)
     # Drop a stale token so an SPA shows its login form again.
     cleared = await page.evaluate(
@@ -182,11 +236,45 @@ async def _form_login(sess: RoleSession, cfg: RunConfig, page: Page) -> bool:
     try:
         await page.locator(pw_sel).first.wait_for(state="visible", timeout=5000)
     except Exception:
+        sess.login_error = (f"no visible password field at the login URL"
+                            f"{f' (HTTP {statuses[-1]})' if statuses else ''}")
         return False
     await page.locator(spec.username_selector or USERNAME_SELECTOR).first.fill(user)
     await page.locator(pw_sel).first.fill(password)
+    statuses.clear()
     await page.locator(spec.submit_selector or SUBMIT_SELECTOR).first.click()
-    return await _await_success(page, sess, login_url)
+    if await _await_success(page, sess, login_url):
+        return True
+    sess.login_error = await _failure_reason(page, sess, login_url, statuses)
+    return False
+
+
+async def _failure_reason(page: Page, sess: RoleSession, login_url: str,
+                          statuses: list[int]) -> str:
+    """Why a submitted form login did not succeed: where the page ended, the HTTP status
+    of the submit's response and any visible error text (never the credentials)."""
+    spec = sess.role.login
+    parts = []
+    try:
+        still = _path(page.url) == _path(login_url) \
+            or await _visible(page, spec.password_selector or PASSWORD_SELECTOR)
+    except Exception:
+        still = False
+    if spec.success_selector:
+        parts.append(f"success selector {spec.success_selector!r} not shown")
+    parts.append("login page still shown" if still else
+                 "no success signal after submitting")
+    if statuses:
+        parts.append(f"HTTP {statuses[-1]}")
+    try:
+        text = (await page.evaluate(_ERROR_TEXT_JS) or "")[:120]
+    except Exception:
+        text = ""
+    if text:
+        if sess.recorder is not None:
+            text = sess.recorder.redactor.text(text)
+        parts.append(f"page says: {text!r}")
+    return "; ".join(parts)
 
 
 async def _manual_login(sess: RoleSession, cfg: RunConfig, page: Page) -> bool:
@@ -203,6 +291,13 @@ async def login(sess: RoleSession, cfg: RunConfig, events: EventLog, *,
     browser, so only ``appmap auth`` passes ``interactive=True``; everywhere else (crawl,
     probe) a manual role without a usable saved session fails closed."""
     role, spec, rec = sess.role, sess.role.login, sess.recorder
+    sess.login_error = None
+    blocked = login_blocked(rec.store, role) if rec and not interactive else None
+    if blocked:
+        sess.login_error = blocked
+        msg = blocked_message(role.name, blocked)
+        events.emit("error", role=role.name, message=msg)
+        return False  # never retried outside 'appmap auth' (no request sent)
     if spec.type == "manual" and not interactive:
         msg = (f"role {role.name}: manual login needs the operator; run "
                f"'appmap auth --manual-login --role {role.name}'")
@@ -236,6 +331,7 @@ async def login(sess: RoleSession, cfg: RunConfig, events: EventLog, *,
                 pass
     except Exception as exc:
         events.emit("error", role=role.name, message=f"login failed: {exc}")
+        sess.login_error = sess.login_error or f"login error: {str(exc).splitlines()[0]}"
         ok = False
     finally:
         if rec:
@@ -255,10 +351,18 @@ async def login(sess: RoleSession, cfg: RunConfig, events: EventLog, *,
             rec.login_pages.discard(page)
     if ok and rec:
         rec.last_status[role.name] = None
-    ev = events.emit("login", role=role.name, ok=ok, login_type=spec.type)
+    if not ok and spec.type == "form" and not sess.login_error:
+        sess.login_error = "login did not succeed"
+    ev = events.emit("login", role=role.name, ok=ok, login_type=spec.type,
+                     error=sess.login_error if not ok else None)
     if rec:
         rec.store.upsert_role(role.name, login_type=spec.type, auth_ok=ok,
                               last_login_event=ev.id)
+        key = _LOGIN_FAILED_KEY + role.name
+        if ok:
+            rec.store.conn.execute("DELETE FROM meta WHERE key=?", (key,))
+        elif spec.type == "form":
+            rec.store.set_meta(key, rec.redactor.text(sess.login_error))
     return ok
 
 

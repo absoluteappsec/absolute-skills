@@ -209,3 +209,41 @@ async def test_unsafe_307_redirect_hop_classified(case, code, browser, stub_serv
     held = [a for a in _approvals(rd)
             if "/items/7/delete" in (a["predicted_request"] or "")]
     assert held and held[0]["category"] == "delete"
+
+
+# -- field fix 3: account-editing forms are held, never submitted -----------------------
+_USER_CHANGE = (
+    "<form method='post' action='/admin/auth/user/1/change/'>"
+    "<input name='username' value='admin'><input type='email' name='email' value='a@x.io'>"
+    "<input type='checkbox' name='is_staff' checked>"
+    "<select name='groups' multiple><option value='1'>editors</option></select>"
+    "<input type='submit' value='Save'>"
+    "<input type='submit' name='_continue' value='Save and continue editing'></form>")
+_BULK = ("<form method='post' action='/admin/auth/user/'>"
+         "<select name='action'><option value=''>---</option>"
+         "<option value='make_active'>Activate</option></select>"
+         "<input type='checkbox' name='_selected_action' value='1'>"
+         "<button type='submit' name='index' value='0'>Go</button></form>")
+_DISPLAY = ("<form method='post' action='/profile'><input name='display_name'>"
+            "<input type='submit' value='Save'></form>")
+
+
+async def test_account_edit_forms_held_never_submitted(browser, stub_server, make_cfg,
+                                                       run_dir, tmp_path):
+    routes = {
+        "/": H("<a href='/admin/auth/user/1/change/'>admin</a> <a href='/admin/auth/user/'>"
+               "users</a> <a href='/profile'>profile</a>", title="Home"),
+        "/admin/auth/user/1/change/": H(_USER_CHANGE, title="admin | Change user"),
+        "/admin/auth/user/": H(_BULK, title="Select user to change"),
+        "/profile": H(_DISPLAY, title="Profile"),
+    }
+    srv, rd, stats = await _crawl(routes, browser, stub_server, make_cfg, run_dir, tmp_path)
+    assert stats.status == "done"
+    posts = [p for m, p in srv.requests if m == "POST"]
+    assert "/admin/auth/user/1/change/" not in posts
+    assert "/admin/auth/user/" not in posts
+    assert "/profile" in posts  # a plain display-name form is not held
+    held = {(json.loads(a["predicted_request"] or "{}").get("url") or "").split("/", 3)[-1]:
+            a["category"] for a in _approvals(rd)}
+    assert held.get("admin/auth/user/1/change/") == "account_change"
+    assert held.get("admin/auth/user/") == "account_change"

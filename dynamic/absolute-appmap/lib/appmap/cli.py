@@ -225,7 +225,8 @@ def manual_login_roles(roles, *, explicit: bool):
             if explicit or r.login.type in ("form", "manual") else r for r in roles]
 
 
-async def _auth(cfg, rd, roles, headed: bool) -> dict[str, bool]:
+async def _auth(cfg, rd, roles, headed: bool,
+                reasons: dict[str, str] | None = None) -> dict[str, bool]:
     from playwright.async_api import async_playwright
 
     from appmap.browser.session import login, open_role_session
@@ -241,6 +242,8 @@ async def _auth(cfg, rd, roles, headed: bool) -> dict[str, bool]:
                     sess = await open_role_session(browser, cfg, rd, role, rt.recorder)
                     try:
                         results[role.name] = await login(sess, cfg, rt.events, interactive=True)
+                        if not results[role.name] and reasons is not None:
+                            reasons[role.name] = sess.login_error or "login failed"
                         log.info("auth: role %s (%s) -> %s", role.name, role.login.type,
                                  "ok" if results[role.name] else "FAILED")
                     finally:
@@ -268,7 +271,8 @@ def cmd_auth(args) -> int:
     headed = any(r.login.type == "manual" for r in roles)
     handler = _attach_log(rd, make_redactor(cfg))
     try:
-        results = asyncio.run(_auth(cfg, rd, roles, headed))
+        reasons: dict[str, str] = {}
+        results = asyncio.run(_auth(cfg, rd, roles, headed, reasons))
         ok = bool(results) and all(results.values())
         _write_meta(rd, cfg, meta, "authenticated" if ok else "auth_failed")
     except Exception as e:
@@ -280,7 +284,9 @@ def cmd_auth(args) -> int:
     failed = [n for n, v in results.items() if not v]
     emit_status("auth", ok=ok, status="authenticated" if ok else "auth_failed",
                 counts={"roles": len(results), "roles_ok": len(results) - len(failed)},
-                errors=[f"role {n}: login failed" for n in failed],
+                errors=[f"role {n}: login failed: {reasons.get(n) or 'unknown reason'}; "
+                        "not retried automatically (lockout risk) - check the credentials, "
+                        "then rerun 'appmap auth' for this role" for n in failed],
                 next=f"appmap crawl --run {_q(rd.root)}" if ok else None)
     return 0 if ok else 1
 
@@ -452,6 +458,13 @@ def cmd_probe(args) -> int:
         _record_activity(rd)
         _detach_log(handler)
     status = "in_progress" if counts.get("timed_out") else "done"
+    if args.role and any(w.startswith(f"role {args.role}: skipped, its last login failed")
+                         for w in warnings):
+        emit_status("probe", ok=False, status="auth_failed",
+                    counts={k: v for k, v in counts.items() if k != "timed_out"},
+                    pending_approvals=pending, errors=warnings,
+                    next=_auth_next(run, cfg, [args.role]))
+        return 1
     again = f"appmap probe --run {run} --phase {args.phase}" + (
         f" --role {_q(args.role)}" if args.role else "")
     if status == "in_progress":

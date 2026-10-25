@@ -28,12 +28,13 @@ from .browser.fingerprint import SKELETON_JS, dom_fingerprint, state_id
 from .browser.forms import FormInfo, discover_forms, fill_and_submit
 from .browser.locators import resolve
 from .browser.recorder import TrafficRecorder
-from .browser.session import (MAX_RELOGINS, RoleSession, auth_probe_urls, is_session_lost,
-                              login, open_role_session, state_path)
+from .browser.session import (MAX_RELOGINS, RoleSession, auth_probe_urls, blocked_message,
+                              is_session_lost, login, login_blocked, open_role_session,
+                              state_path)
 from .browser.settle import install, wait_settled
 from .config import Role, RunConfig
 from .datagen import DataGen
-from .destructive import ActionDescriptor, Flag, classify
+from .destructive import ActionDescriptor, Flag, body_fields, classify
 from .events import EventLog
 from .frontier import Frontier, FrontierItem
 from .gate import RequestGate
@@ -70,7 +71,12 @@ _FORMS_JS = """() => [...document.forms].map(f => {
   let action;
   try { action = new URL(f.getAttribute('action') ?? location.href, document.baseURI).href; }
   catch (e) { action = location.href; }
-  return {xpath: '/' + parts.join('/'),
+  const fields = [...f.elements].filter(e => e.name
+      && !['submit', 'button', 'reset', 'image'].includes((e.type || '').toLowerCase()))
+    .map(e => e.tagName === 'SELECT' && e.name === 'action'
+      ? {name: e.name, type: 'select', options: [...e.options].map(op => op.value).slice(0, 50)}
+      : {name: e.name, type: (e.type || e.tagName).toLowerCase()});
+  return {xpath: '/' + parts.join('/'), fields,
           method: ((o && o.value) || f.getAttribute('method') || 'GET').toUpperCase(), action,
           confirm: /confirm\\s*\\(/.test(f.getAttribute('onsubmit') || '')
             || f.hasAttribute('data-confirm') || f.hasAttribute('data-turbo-confirm')};
@@ -97,6 +103,8 @@ class CrawlStats:
     approvals: dict[str, int] = field(default_factory=dict)
     # roles whose login or re-login failed: stopped, their pending items kept
     auth_failed: list[str] = field(default_factory=list)
+    # roles not run at all because their last login failed (only 'appmap auth' retries)
+    skipped_roles: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -132,6 +140,18 @@ def canon_url(url: str) -> str:
 
 def _xpath(locators: list[dict]) -> str | None:
     return next((l["value"] for l in locators if l.get("strategy") == "xpath"), None)
+
+
+def _form_fields(form: FormInfo) -> list[dict]:
+    """Field names/types the classifier sees (field fix 3); a bulk-action select keeps
+    its option values."""
+    out = []
+    for f in form.fields:
+        d = {"name": f.name, "type": f.type}
+        if f.name == "action" and f.widget in ("select", "multiselect"):
+            d["options"] = list(f.options)[:50]
+        out.append(d)
+    return out
 
 
 def _signature(c: Clickable) -> tuple:
@@ -337,7 +357,11 @@ class Crawler:
             origin = request.frame.url
         except Exception:  # worker / not-yet-attached popup
             origin = request.headers.get("referer") or request.url
-        if self._hold_write(request.method, request.url, role, page, origin):
+        try:
+            body = request.post_data
+        except Exception:  # binary body
+            body = None
+        if self._hold_write(request.method, request.url, role, page, origin, body=body):
             await route.abort("blockedbyclient")
         else:
             await route.fallback()
@@ -356,7 +380,8 @@ class Crawler:
             origin = url
         return not self._hold_write(method, url, role, page, origin)
 
-    def _hold_write(self, method: str, url: str, role: str, page, origin: str) -> bool:
+    def _hold_write(self, method: str, url: str, role: str, page, origin: str, *,
+                    body: str | None = None) -> bool:
         """Classify a non-GET request charged to the current (or most recent) action or
         page load. Held: recorded as a guard hit, queued for approval, returns True (the
         caller aborts it)."""
@@ -364,13 +389,18 @@ class Crawler:
         if g is None:  # nothing processed yet: charge it to the page that sent it
             g = {"kind": "load", "label": "", "context": "", "state": None, "item": None,
                  "path": [{"type": "goto", "url": self._safe_url(origin)}], "hits": []}
+        login_page = page is not None and page in self.recorder.login_pages
+        # Field fix 3: the account fields of the acting form, or of the request body itself
+        # (never on a login page: its own submit carries username + password).
+        fields = None if login_page else (
+            (g.get("fields") or []) + (body_fields(body or "") or []) or None)
         try:
             flag = classify(ActionDescriptor("request", method, url, g["label"],
-                                             g["context"], False, role, "ui"), self.cfg.profile)
+                                             g["context"], False, role, "ui", fields=fields),
+                            self.cfg.profile)
         except Exception:  # fail closed
             flag = Flag(True, "delete", ["request could not be classified"])
-        if not flag.held or (flag.category == "data_create"
-                             and page is not None and page in self.recorder.login_pages):
+        if not flag.held or (flag.category == "data_create" and login_page):
             # A login flow's own submit (data_create only in production) must go through;
             # destructive requests from the login page, and anything from other pages or
             # workers while it runs, stay guarded.
@@ -395,11 +425,11 @@ class Crawler:
 
     def _arm_guard(self, role: str, kind: str, path: list[dict], *, label: str = "",
                    context: str = "", state: str | None = None,
-                   item: int | None = None) -> list:
+                   item: int | None = None, fields: list[dict] | None = None) -> list:
         """Attribute subsequent non-GET requests to ``path`` (an action or a page load);
         returns the list the guard appends aborted (flag, method, url) hits to."""
         self._guard = {"kind": kind, "label": label, "context": context, "state": state,
-                       "item": item, "path": path, "hits": []}
+                       "item": item, "path": path, "hits": [], "fields": fields}
         self._last_guard[role] = self._guard
         return self._guard["hits"]
 
@@ -702,7 +732,8 @@ class Crawler:
         label = self._step_label(step) or a.label
         mark = self._exchange_mark()
         hits = self._arm_guard(role, "action", path, label=label,
-                               context=step.get("context", ""), state=src.id if src else None)
+                               context=step.get("context", ""), state=src.id if src else None,
+                               fields=step.get("fields"))
         started = self._start_approval(a, mode, label)
         # R21: a predicted write passes by method + URL; without one, only held requests of
         # the acted-on page during this action window pass (popups/workers stay guarded).
@@ -1028,7 +1059,8 @@ class Crawler:
         mark = self._exchange_mark()
         result = None
         hits = self._arm_guard(role, "action", path, label=self._step_label(step),
-                               context=step.get("context", ""), state=src.id, item=item.id)
+                               context=step.get("context", ""), state=src.id, item=item.id,
+                               fields=step.get("fields"))
         if step["type"] == "click":
             loc = await self._resolve(page, step["locators"])
             ev = self.events.emit("click", role=role, label=step.get("label", ""),
@@ -1372,7 +1404,8 @@ class Crawler:
             owner = next((m for m in form_meta if xp and xp.startswith(m["xpath"] + "/")), None)
             if owner:  # a secondary button of a form acts with that form's request
                 step.update(method=owner["method"], action=self._safe_url(owner["action"]),
-                            has_confirm=owner["confirm"], context=st.title)
+                            has_confirm=owner["confirm"], context=st.title,
+                            fields=owner.get("fields") or [])
             if held_only and not classify(self._step_descriptor(step, role),
                                           self.cfg.profile).held:
                 continue
@@ -1429,7 +1462,8 @@ class Crawler:
         step = {"type": "submit", "form_label": form.label,
                 "locators": self._safe_locs(form.submit_locators), "form_id": form_id,
                 "method": form.method, "action": self._safe_url(form.action) if form.action else None,
-                "has_confirm": form.has_confirm, "context": st.title}
+                "has_confirm": form.has_confirm, "context": st.title,
+                "fields": _form_fields(form)}
         self._push_action(role, st, parent + [step], depth, PRIORITY["submit"])
 
     def _push_action(self, role: str, st: _State, path: list[dict], depth: int,
@@ -1450,16 +1484,18 @@ class Crawler:
         if step.get("type") == "submit":
             return ActionDescriptor("submit", step.get("method"), step.get("action"),
                                     step.get("form_label", ""), step.get("context", ""),
-                                    bool(step.get("has_confirm")), role, "ui")
+                                    bool(step.get("has_confirm")), role, "ui",
+                                    fields=step.get("fields"))
         return ActionDescriptor("click", step.get("method"), step.get("href") or step.get("action"),
                                 step.get("label", ""), step.get("context", ""),
-                                bool(step.get("has_confirm")), role, "ui")
+                                bool(step.get("has_confirm")), role, "ui",
+                                fields=step.get("fields"))
 
     @staticmethod
     def _form_descriptor(form: FormInfo, role: str, context: str) -> ActionDescriptor:
         # form.method already carries a hidden ``_method`` override (Rails/Laravel)
         return ActionDescriptor("submit", form.method, form.action, form.label, context,
-                                form.has_confirm, role, "ui")
+                                form.has_confirm, role, "ui", fields=_form_fields(form))
 
     @staticmethod
     def _step_label(step: dict) -> str:
@@ -1704,8 +1740,15 @@ async def _crawl_with(cfg: RunConfig, rd: RunDir, names: list[str] | None, budge
     sessions: dict[str, RoleSession] = {}
     crawl_roles: list[str] = []
     failed: dict[str, str] = {}
+    blocked: dict[str, str] = {}
     try:
         for role in select_roles(cfg, names):
+            why = login_blocked(rt.store, role)
+            if why:  # field fix 3: only 'appmap auth' retries a failed login
+                blocked[role.name] = why
+                warnings.append(blocked_message(role.name, why, str(rd.root)))
+                log.warning("role %s: last login failed (%s); skipped", role.name, why)
+                continue
             sess = await open_role_session(browser, cfg, rd, role, rt.recorder)
             sessions[role.name] = sess
             # No saved session (``appmap auth`` not run): log in now. A manual role is
@@ -1720,8 +1763,11 @@ async def _crawl_with(cfg: RunConfig, rd: RunDir, names: list[str] | None, budge
         crawler = Crawler(cfg, rd, rt.store, rt.events, rt.gate, rt.queue, rt.recorder,
                           sessions, make_datagen(cfg, rd))
         crawler.auth_failed.update(failed)
+        if blocked and not crawl_roles:  # every requested role is blocked: nothing ran
+            crawler.auth_failed.update({r: f"last login failed ({w})" for r, w in blocked.items()})
         stats = await crawler.run(crawl_roles, budget_minutes=budget, approved_only=approved_only)
         stats.warnings = warnings + stats.warnings
+        stats.skipped_roles = sorted(blocked)
         return stats
     finally:
         await rt.recorder.drain()
