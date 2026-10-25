@@ -312,3 +312,46 @@ def test_spec_urls_from_docs_page():
     assert spec_urls_from_html(multi, base) == ["http://t.test/api/docs/v1.json",
                                                 "http://t.test/v2.yaml"]
     assert spec_urls_from_html("<p>url: 'x.json'</p>", base) == []
+
+
+async def test_oversized_spec_skipped_with_event(api, make_cfg, run_dir, tmp_path, stub_server,
+                                                 monkeypatch):
+    from werkzeug.wrappers import Response
+
+    import appmap.probe.schemas as schemas
+    monkeypatch.setattr(schemas, "MAX_SPEC_BYTES", 500)
+    big = _YAML_SPEC + "\n".join(f"x-pad-{i}: {'y' * 40}" for i in range(20))
+    srv = stub_server({"/api/schema/": lambda r: Response(big, content_type="application/yaml")})
+    cfg = make_cfg(srv.url)
+    rd = run_dir(tmp_path, cfg)
+    rt, client = _rt(cfg, rd)
+    counts = await probe_schemas(client, api, cfg, rt.store, "anonymous")
+    assert counts["openapi_ops"] == 0
+    assert "spec too large" in rd.events_path.read_text()
+    rt.store.close()
+
+
+def test_load_spec_size_cap(monkeypatch):
+    import appmap.probe.schemas as schemas
+    monkeypatch.setattr(schemas, "MAX_SPEC_BYTES", 10)
+    assert schemas.load_spec('{"paths": {}, "openapi": "3"}') is None
+    monkeypatch.setattr(schemas, "MAX_SPEC_BYTES", 10_000)
+    assert schemas.load_spec("paths: {}\n") == {"paths": {}}
+
+
+async def test_docs_ui_spec_urls_capped(api, make_cfg, run_dir, tmp_path, stub_server,
+                                        monkeypatch):
+    from werkzeug.wrappers import Response
+
+    import appmap.probe.schemas as schemas
+    monkeypatch.setattr(schemas, "MAX_DOCS_SPEC_URLS", 2)
+    urls = ", ".join(f'{{url: "/specs/s{i}.json"}}' for i in range(6))
+    page = f"<script>SwaggerUIBundle({{urls: [{urls}]}})</script>"
+    srv = stub_server({"/swagger-ui/": lambda r: Response(page, mimetype="text/html")})
+    cfg = make_cfg(srv.url)
+    rd = run_dir(tmp_path, cfg)
+    rt, client = _rt(cfg, rd)
+    await probe_schemas(client, api, cfg, rt.store, "anonymous")
+    fetched = [p for _, p in srv.requests if p.startswith("/specs/")]
+    assert fetched == ["/specs/s0.json", "/specs/s1.json"]
+    rt.store.close()

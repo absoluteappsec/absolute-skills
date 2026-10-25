@@ -67,26 +67,30 @@ _DJ_REGEX_LEFT = re.compile(r"[\\()\[\]*+?|<>]")
 
 def _django_pattern(raw: str) -> str | None:
     p = html.unescape(re.sub(r"<[^>]+>", "", raw))
-    p = _DJ_NAME.sub("", p).replace("^", "").replace("$", "")
-    p = re.sub(r"\s+", "", p)
+    p = re.sub(r"\s+", "", _DJ_NAME.sub("", p))
+    if not p:
+        return None  # an empty list item, or only a [name='...']
+    p = p.replace("^", "").replace("$", "")
     p = _DJ_GROUP.sub(lambda m: "{%s}" % m.group(1), p)
     p = _DJ_CONVERTER.sub(lambda m: "{%s}" % m.group(1), p)
     p = _DJ_ESCAPED.sub(r"\1", p).replace("\\Z", "")
     if _DJ_REGEX_LEFT.search(p):
         return None  # unnamed groups, alternations, character classes: no usable path
-    return "/" + p.lstrip("/")
+    return "/" + p.lstrip("/")  # ``^$`` is the root
 
 
 def parse_django_urlconf(text: str) -> list[str]:
     """Route patterns listed on a Django DEBUG 404 page ("Using the URLconf defined in
-    ..."), one per list item, prefixes joined; regex groups and path converters become
-    ``{name}``. Patterns that still contain regex syntax are dropped."""
+    ..."), one per list item (``<code>`` segments, or the item's bare text on older
+    Django), prefixes joined; regex groups and path converters become ``{name}``. Empty
+    items and patterns that still contain regex syntax are dropped."""
     m = _DJANGO_URLCONF.search(text or "")
     if not m:
         return []
     out: list[str] = []
     for li in _LI.findall(m.group(1)):
-        p = _django_pattern("".join(_CODE.findall(li)))
+        codes = _CODE.findall(li)
+        p = _django_pattern(" ".join(codes) if codes else li)
         if p and p not in out:
             out.append(p)
     return out

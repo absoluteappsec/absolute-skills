@@ -280,3 +280,66 @@ def test_multipart_request_body_redacted_in_store_and_params(env):
     names = {r["name"] for r in rows(store, "SELECT name FROM params WHERE location='body'")}
     assert {"csrfmiddlewaretoken", "username", "password1", "ssn"} <= names
     assert "avatar" not in names
+
+
+# --- fix round 1: fail-closed multipart parsing -----------------------------------
+
+def _two_parts(closing=b"--B--\r\n", last_tail=b"\r\n"):
+    return (b"--B\r\nContent-Disposition: form-data; name=\"user\"\r\n\r\nalice\r\n"
+            b"--B\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2"
+            + last_tail + closing)
+
+
+@pytest.mark.parametrize("body", [
+    _two_parts(closing=b""),                    # missing closing delimiter
+    _two_parts(closing=b"", last_tail=b""),     # no trailing CRLF either
+    _two_parts(closing=b"--B"),                 # closing delimiter truncated after '--B'
+])
+def test_multipart_unterminated_last_part_still_redacted(body):
+    from appmap.recording import redact_multipart
+    out = redact_multipart(Redactor([], []), body, "multipart/form-data; boundary=B")
+    assert b"hunter2" not in out and b"<redacted:password>" in out
+    assert b"alice" in out
+
+
+def test_multipart_truncated_last_part_headers():
+    from appmap.recording import redact_multipart
+    body = (b"--B\r\nContent-Disposition: form-data; name=\"csrfmiddlewaretoken\"\r\n\r\n"
+            b"tok-ABCDEFGH-123\r\n--B\r\nContent-Disposition: form-da")
+    out = redact_multipart(Redactor([], []), body, "multipart/form-data; boundary=B")
+    assert b"tok-ABCDEFGH-123" not in out
+    assert out.endswith(b"--B\r\nContent-Disposition: form-da")
+
+
+def test_multipart_epilogue_kept_after_closing_delimiter():
+    from appmap.recording import redact_multipart
+    out = redact_multipart(Redactor([], []), _two_parts() + b"epilogue",
+                           "multipart/form-data; boundary=B")
+    assert out.endswith(b"--B--\r\nepilogue") and b"hunter2" not in out
+
+
+def test_multipart_json_and_urlencoded_parts_redacted_by_key():
+    from appmap.recording import redact_multipart
+    body = (b"--B\r\nContent-Disposition: form-data; name=\"meta\"\r\n"
+            b"Content-Type: application/json\r\n\r\n{\"api_key\": \"k-123456789\", \"n\": 1}\r\n"
+            b"--B\r\nContent-Disposition: form-data; name=\"q\"\r\n"
+            b"Content-Type: application/x-www-form-urlencoded\r\n\r\n"
+            b"authenticity_token=zzz-987654321&x=1\r\n--B--\r\n")
+    out = redact_multipart(Redactor([], []), body, "multipart/form-data; boundary=B")
+    assert b"k-123456789" not in out and b"zzz-987654321" not in out
+    assert b"<redacted:api_key>" in out and b"x=1" in out and b'"n": 1' in out
+
+
+def test_multipart_boundary_sniffed_when_content_type_lacks_it():
+    from appmap.recording import redact_multipart
+    out = redact_multipart(Redactor([], []), _two_parts(), "multipart/form-data")
+    assert b"hunter2" not in out and b"<redacted:password>" in out and b"alice" in out
+
+
+def test_multipart_non_ascii_literal_secret_in_text_part():
+    from appmap.recording import redact_multipart
+    secret = "pässwörd-Ünïcode-1"
+    body = ("--B\r\nContent-Disposition: form-data; name=\"bio\"\r\n\r\nmine is "
+            + secret + "\r\n--B--\r\n").encode("utf-8")
+    out = redact_multipart(Redactor([secret], []), body, "multipart/form-data; boundary=B")
+    assert secret.encode("utf-8") not in out and b"<redacted:secret>" in out

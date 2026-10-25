@@ -1,6 +1,7 @@
 """OpenAPI/Swagger and GraphQL introspection discovery."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -27,6 +28,9 @@ _REDOC_ATTR = re.compile(r"""<redoc\b[^>]*\bspec-url\s*=\s*(?:"([^"]*)"|'([^']*)
                          re.I)
 _REDOC_INIT = re.compile(r"""Redoc\.init\(\s*(?:"([^"]+)"|'([^']+)')""")
 _UI_WINDOW = 4000
+MAX_SPEC_BYTES = 5 * 1024 * 1024  # untrusted documents: larger ones are skipped unparsed
+MAX_DOCS_SPEC_URLS = 50           # spec URLs followed from Swagger UI / ReDoc pages per probe
+_YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 GRAPHQL_PATHS = ("/graphql", "/api/graphql")
 _METHODS = ("get", "put", "post", "delete", "options", "head", "patch", "trace")
 _IN = {"path": "path", "query": "query", "header": "header", "cookie": "cookie",
@@ -167,13 +171,15 @@ def spec_urls_from_html(text: str, page_url: str) -> list[str]:
 
 def load_spec(text: str):
     """A schema document parsed as JSON, else YAML (drf-spectacular serves YAML by
-    default); None when it is neither."""
+    default); None when it is neither or larger than ``MAX_SPEC_BYTES``."""
+    if len(text) > MAX_SPEC_BYTES:
+        return None
     try:
         return json.loads(text)
     except ValueError:
         pass
     try:
-        return yaml.safe_load(text)
+        return yaml.load(text, Loader=_YAML_LOADER)
     except yaml.YAMLError:
         return None
 
@@ -220,13 +226,23 @@ async def probe_schemas(client: DirectClient, api, cfg, store: Store, role: str,
             "OR lower(substr(url, 1, instr(url || '?', '?') - 1)) LIKE '%.yml')"):
         if url not in candidates and scope.allows(url):
             candidates.append(url)
+    followed = 0
+
+    def follow(page_text: str, page_url: str) -> None:
+        """Queue the spec URLs a docs UI page names (at most MAX_DOCS_SPEC_URLS per probe)."""
+        nonlocal followed
+        for u in spec_urls_from_html(page_text, page_url):
+            if followed >= MAX_DOCS_SPEC_URLS:
+                return
+            if u not in candidates and scope.allows(u):
+                candidates.append(u)
+                followed += 1
+
     # Swagger UI / ReDoc pages the crawl already recorded name their spec URL.
     for row in store.conn.execute(
             "SELECT url, resp_body FROM exchanges WHERE resp_body LIKE '%SwaggerUIBundle(%' "
             "OR resp_body LIKE '%<redoc%' OR resp_body LIKE '%Redoc.init(%'").fetchall():
-        for u in spec_urls_from_html(row["resp_body"], row["url"]):
-            if u not in candidates and scope.allows(u):
-                candidates.append(u)
+        follow(row["resp_body"], row["url"])
     i = 0
     while i < len(candidates):
         url = candidates[i]
@@ -240,18 +256,25 @@ async def probe_schemas(client: DirectClient, api, cfg, store: Store, role: str,
             continue
         ctype = (got[1].headers.get("content-type") or "").lower()
         try:
-            text = await got[1].text()
-        except Exception:  # undecodable body: not a schema
+            raw = await got[1].body()
+        except Exception:  # body unavailable: not a schema
             continue
+        if len(raw) > MAX_SPEC_BYTES:
+            log.warning("openapi %s: spec too large (%d bytes), skipped", url, len(raw))
+            if client.events is not None:
+                client.events.emit("error", role=role, url=url,
+                                   error=f"openapi spec too large ({len(raw)} bytes > "
+                                         f"{MAX_SPEC_BYTES}), skipped")
+            continue
+        text = raw.decode("utf-8", "replace")
         if "html" in ctype:
             # never a schema (a catch-all SPA's index.html); maybe a docs page naming one
             if is_docs_ui(text):
-                for u in spec_urls_from_html(text, url):
-                    if u not in candidates and scope.allows(u):
-                        candidates.append(u)
+                follow(text, url)
             continue
         try:
-            ops = parse_openapi(load_spec(text))
+            # YAML parsing of an untrusted document is CPU-bound: keep it off the loop
+            ops = await asyncio.to_thread(lambda: parse_openapi(load_spec(text)))
         except Exception as exc:  # malformed real-world document: skip it, keep probing
             log.warning("openapi %s: unparseable document (%s: %s)", url, type(exc).__name__, exc)
             if client.events is not None:

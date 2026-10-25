@@ -250,3 +250,31 @@ async def test_django_debug_404_routes_queued(api, stub_server, make_cfg, run_di
         assert srv.url + "/admin/" in urls
         assert not any("{" in u or "project_id" in u for u in urls)  # only concrete paths
     rt.store.close()
+
+
+_DJANGO_OLD_404 = """<html><body><div id="info">
+  <p>Using the URLconf defined in <code>mysite.urls</code>,
+  Django tried these URL patterns, in this order:</p>
+  <ol>
+      <li>^admin/ </li>
+      <li>^taskManager/ ^$ [name='index']</li>
+      <li>^taskManager/ ^forgot_password/$ [name='forgot_password']</li>
+      <li>^$ [name='home']</li>
+      <li>   </li>
+      <li>[name='nameless']</li>
+  </ol>
+  <p>The current URL, <code>robots.txt</code>, didn't match any of these.</p></div>
+</body></html>"""
+
+
+def test_parse_django_urlconf_old_format_without_code():
+    from appmap.probe.passive import parse_django_urlconf
+    assert parse_django_urlconf(_DJANGO_OLD_404) == [
+        "/admin/", "/taskManager/", "/taskManager/forgot_password/", "/"]
+
+
+def test_parse_django_urlconf_skips_empty_items():
+    from appmap.probe.passive import parse_django_urlconf
+    page = ("<p>Using the URLconf defined in <code>x</code></p><ol><li><code></code></li>"
+            "<li><code>[name='i']</code></li><li><code>a/</code></li></ol>")
+    assert parse_django_urlconf(page) == ["/a/"]

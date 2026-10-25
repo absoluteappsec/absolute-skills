@@ -218,87 +218,121 @@ _MP_NAME = re.compile(rb"""\bname\s*=\s*(?:"([^"]*)"|([^;\s]+))""", re.I)
 _MP_FILENAME = re.compile(rb"\bfilename\*?\s*=", re.I)
 
 
+_MP_SNIFF = re.compile(rb"\A(?:\r?\n)*--([0-9A-Za-z'()+_,\-./:=?]{1,70})[ \t]*\r?\n")
+
+
 def is_multipart(content_type: str | None) -> bool:
     return _base_ct(content_type) == "multipart/form-data"
 
 
-def _mp_boundary(content_type: str | None) -> bytes | None:
+def _mp_boundary(content_type: str | None, body: bytes = b"") -> bytes | None:
+    """Boundary from the Content-Type, else sniffed from the body's first delimiter line."""
     m = _MP_BOUNDARY.search(content_type or "")
-    return (m.group(1) or m.group(2)).encode("latin-1", "replace") if m else None
+    if m:
+        return (m.group(1) or m.group(2)).encode("latin-1", "replace")
+    m = _MP_SNIFF.match(body or b"")
+    return m.group(1) if m else None
 
 
-def _mp_split(body: bytes, boundary: bytes) -> list[tuple[bytes, bytes, bytes, bytes]] | None:
-    """``[(head, sep, content, tail)]`` per part plus the framing kept around them, or None
-    when ``body`` is not framed by ``boundary``. ``head`` holds the part's lead newline and
-    headers, ``sep`` the blank line, ``tail`` the newline that belongs to the next delimiter."""
+_Part = tuple  # (head, sep, content, tail)
+
+
+def _mp_part(chunk: bytes) -> _Part:
+    """``head`` (lead newline + headers), ``sep`` (blank line), ``content``, ``tail`` (the
+    newline that belongs to the next delimiter). A part truncated inside its headers is
+    all head."""
+    for sep in (b"\r\n\r\n", b"\n\n"):
+        i = chunk.find(sep)
+        if i >= 0:
+            break
+    else:
+        return chunk, b"", b"", b""
+    head, content = chunk[:i], chunk[i + len(sep):]
+    tail = b"\r\n" if content.endswith(b"\r\n") else b"\n" if content.endswith(b"\n") else b""
+    return head, sep, content[:len(content) - len(tail)], tail
+
+
+def _mp_split(body: bytes, boundary: bytes):
+    """``(preamble, parts, epilogue)`` or None when ``body`` holds no delimiter.
+    ``epilogue`` (from the closing ``--boundary--`` on) is None for an unterminated body:
+    its last chunk is then a part, so a truncated body never leaves a field unredacted."""
     chunks = body.split(b"--" + boundary)
-    if len(chunks) < 3:
+    if len(chunks) < 2:
         return None
-    parts = []
-    for chunk in chunks[1:-1]:
-        for sep in (b"\r\n\r\n", b"\n\n"):
-            i = chunk.find(sep)
-            if i >= 0:
-                break
-        else:
-            return None
-        head, content = chunk[:i], chunk[i + len(sep):]
-        tail = b"\r\n" if content.endswith(b"\r\n") else b"\n" if content.endswith(b"\n") else b""
-        parts.append((head, sep, content[:len(content) - len(tail)], tail))
-    return parts
+    last = chunks[-1]
+    epilogue = last if last.startswith(b"--") else None
+    middle = chunks[1:-1] if epilogue is not None else chunks[1:]
+    return chunks[0], [_mp_part(c) for c in middle], epilogue
+
+
+def _mp_header(head: bytes, name: bytes) -> bytes | None:
+    for line in head.splitlines():
+        k, colon, v = line.partition(b":")
+        if colon and k.strip().lower() == name:
+            return v.strip()
+    return None
 
 
 def _mp_name(head: bytes) -> tuple[str | None, bool]:
     """Field name of a part and whether it is a file upload."""
-    for line in head.splitlines():
-        if line.lower().startswith(b"content-disposition"):
-            m = _MP_NAME.search(line)
-            name = (m.group(1) if m.group(1) is not None else m.group(2)) if m else None
-            return (name.decode("utf-8", "replace") if name is not None else None,
-                    bool(_MP_FILENAME.search(line)))
-    return None, False
+    line = _mp_header(head, b"content-disposition")
+    if line is None:
+        return None, False
+    m = _MP_NAME.search(line)
+    name = (m.group(1) if m.group(1) is not None else m.group(2)) if m else None
+    return (name.decode("utf-8", "replace") if name is not None else None,
+            bool(_MP_FILENAME.search(line)))
 
 
 def multipart_fields(body: bytes, content_type: str | None) -> list[tuple[str, str]]:
     """``(name, value)`` of every non-file part (values decoded as UTF-8)."""
-    boundary = _mp_boundary(content_type)
-    parts = _mp_split(body, boundary) if boundary else None
+    boundary = _mp_boundary(content_type, body)
+    split = _mp_split(body, boundary) if boundary else None
     out = []
-    for head, _sep, content, _tail in parts or []:
+    for head, _sep, content, _tail in (split[1] if split else []):
         name, is_file = _mp_name(head)
         if name is not None and not is_file:
             out.append((name, content.decode("utf-8", "replace")))
     return out
 
 
-def _lat(redact, raw: bytes) -> bytes:
-    return redact(raw.decode("latin-1")).encode("latin-1", errors="replace")
+def _via_text(redact, raw: bytes) -> bytes:
+    """Apply a str redaction to bytes: as UTF-8 when it decodes (non-ASCII literal secrets
+    match), else through a lossless latin-1 view."""
+    try:
+        return redact(raw.decode("utf-8")).encode("utf-8")
+    except UnicodeDecodeError:
+        return redact(raw.decode("latin-1")).encode("latin-1", errors="replace")
 
 
 def redact_multipart(redactor: Redactor, body: bytes, content_type: str | None) -> bytes:
     """Redact a ``multipart/form-data`` body part by part, keeping its framing: text parts
     by field name (the urlencoded/JSON key rules: password, csrf, token, secret, api_key),
-    then as text; file parts keep their bytes apart from literal-secret scrubbing. A body
-    that does not parse as multipart is scrubbed as opaque bytes."""
-    boundary = _mp_boundary(content_type)
-    parts = _mp_split(body, boundary) if boundary else None
-    if parts is None:
+    then by their own Content-Type (JSON by key, urlencoded by name) or as text; file
+    parts keep their bytes apart from literal-secret scrubbing. Fails closed: the boundary
+    is sniffed when the Content-Type lacks one, an unterminated body's last chunk is a
+    part, and a body without any delimiter is scrubbed as opaque bytes."""
+    boundary = _mp_boundary(content_type, body)
+    split = _mp_split(body, boundary) if boundary else None
+    if split is None:
         return redact_bytes(redactor, body)
-    delim = b"--" + boundary
-    chunks = body.split(delim)
-    out = [_lat(redactor.literals, chunks[0])]
+    preamble, parts, epilogue = split
+    out = [_via_text(redactor.literals, preamble)]
     for head, sep, content, tail in parts:
         name, is_file = _mp_name(head)
         kind = redactor.key_kind(name) if name is not None and not is_file else None
         if kind:
             content = f"<redacted:{kind}>".encode()
         elif is_file:
-            content = _lat(redactor.literals, content)
+            content = _via_text(redactor.literals, content)
         else:
-            content = _lat(redactor.text, content)
-        out.append(_lat(redactor.text, head) + sep + content + tail)
-    out.append(_lat(redactor.literals, chunks[-1]))
-    return delim.join(out)
+            part_ct = _mp_header(head, b"content-type")
+            part_ct = part_ct.decode("latin-1") if part_ct else None
+            content = _via_text(lambda t: redact_text(redactor, t, part_ct), content)
+        out.append(_via_text(redactor.text, head) + sep + content + tail)
+    if epilogue is not None:
+        out.append(_via_text(redactor.literals, epilogue))
+    return (b"--" + boundary).join(out)
 
 
 def redact_bytes(redactor: Redactor, raw: bytes) -> bytes:
@@ -311,11 +345,8 @@ def redact_text(redactor: Redactor, text: str, content_type: str | None = None) 
     multipart/form-data part by part (``redact_multipart``), anything else (HTML included:
     hidden CSRF inputs, meta tokens) as text."""
     if is_multipart(content_type):
-        try:
-            return redact_multipart(redactor, text.encode("latin-1"), content_type).decode("latin-1")
-        except UnicodeEncodeError:  # real Unicode text: work on its UTF-8 bytes
-            return redact_multipart(redactor, text.encode("utf-8", "surrogatepass"),
-                                    content_type).decode("utf-8", "replace")
+        return redact_multipart(redactor, text.encode("utf-8", "surrogatepass"),
+                                content_type).decode("utf-8", "surrogatepass")
     if "x-www-form-urlencoded" in (content_type or "").lower():
         return redactor.url("x?" + text)[2:]
     obj = _json_or_none(text)
