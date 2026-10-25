@@ -6,7 +6,9 @@ PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$PLUGIN_DIR/lib/appmap/__init__.py")"
 VENV="${XDG_CACHE_HOME:-$HOME/.cache}/absolute-appmap/$VERSION/venv"
 
-if [ ! -x "$VENV/bin/appmap" ]; then
+# .appmap-ready is written last by setup.sh: a missing one means a first run or an
+# interrupted install (e.g. Chromium download), which setup.sh completes idempotently.
+if [ ! -x "$VENV/bin/appmap" ] || [ ! -f "$VENV/.appmap-ready" ]; then
   bash "$PLUGIN_DIR/scripts/setup.sh" >&2
 fi
 exec "$VENV/bin/appmap" "$@"

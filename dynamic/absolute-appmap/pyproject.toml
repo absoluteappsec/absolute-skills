@@ -7,7 +7,7 @@ name = "absolute-appmap"
 version = "0.1.0"
 description = "Playwright-based web application crawler producing an application map"
 license = { text = "MIT" }
-authors = [{ name = "Absolute AppSec", email = "info@absoluteappsec.com" }]
+authors = [{ name = "Absolute AppSec" }]
 requires-python = ">=3.11"
 dependencies = ["playwright>=1.48,<2", "pyyaml>=6", "jinja2>=3.1"]
 

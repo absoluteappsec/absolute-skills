@@ -453,7 +453,8 @@ def test_wrapper_version():
     building it (network, minutes) only runs when APPMAP_E2E_WRAPPER is set."""
     cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
     venv = cache / "absolute-appmap" / "0.1.0" / "venv" / "bin" / "appmap"
-    installed = venv.exists()
+    # without setup's completion sentinel the wrapper (re)runs setup.sh (network)
+    installed = venv.exists() and (venv.parents[1] / ".appmap-ready").exists()
     if not installed and not os.environ.get("APPMAP_E2E_WRAPPER"):
         pytest.skip(f"{venv} missing; set APPMAP_E2E_WRAPPER=1 to test the full install")
     t0 = time.monotonic()

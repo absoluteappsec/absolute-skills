@@ -41,8 +41,22 @@ def emit_status(
     print("APPMAP_STATUS " + json.dumps(obj), flush=True)
 
 
+class _UsageError(Exception):
+    def __init__(self, parser: argparse.ArgumentParser, message: str):
+        super().__init__(message)
+        self.parser = parser
+
+
+class _Parser(argparse.ArgumentParser):
+    """Raises instead of exiting on a usage error, so ``main`` can still end with an
+    APPMAP_STATUS line. Subparsers inherit the class."""
+
+    def error(self, message: str):
+        raise _UsageError(self, message)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="appmap", description="Web application crawler and mapper")
+    parser = _Parser(prog="appmap", description="Web application crawler and mapper")
     parser.add_argument("--version", action="version", version=f"appmap {__version__}")
     sub = parser.add_subparsers(dest="command")
     p = sub.add_parser("init", help="create a run directory from a config file")
@@ -122,6 +136,9 @@ def _add_query_parser(sub) -> None:
            ("flow", "flows.id"))
     sp = recipe("sql", "run one read-only SELECT/WITH statement")
     sp.add_argument("sql", help="the SELECT statement")
+    sp.add_argument("--limit", type=int, default=None,
+                    help="print at most this many rows (default 1000; 0 = no limit); "
+                         "counts.truncated says how many were left out")
 
 
 # -- run-directory plumbing ------------------------------------------------------
@@ -540,7 +557,8 @@ def cmd_build(args) -> int:
 
 
 def cmd_query(args) -> int:
-    from appmap.query import QueryError, format_table, run_recipe, run_sql
+    from appmap.query import (DEFAULT_SQL_LIMIT, QueryError, format_table, run_recipe,
+                              run_sql_limited)
     from appmap.rundir import open_run_dir
     from appmap.store import Store
 
@@ -557,9 +575,11 @@ def cmd_query(args) -> int:
     except (QueryError, OSError) as e:
         emit_status("query", ok=False, status="error", errors=[str(e)])
         return 1
+    truncated = None
     try:
         if args.recipe == "sql":
-            rows = run_sql(store, args.sql)
+            limit = DEFAULT_SQL_LIMIT if args.limit is None else args.limit
+            rows, truncated = run_sql_limited(store, args.sql, limit if limit > 0 else None)
         else:
             params = {k: getattr(args, k, None)
                       for k in ("role", "endpoint", "method", "path", "state", "flow")}
@@ -574,7 +594,13 @@ def cmd_query(args) -> int:
     else:
         for r in rows:
             print(json.dumps(r, default=str), flush=True)
-    emit_status("query", ok=True, status="complete", counts={"rows": len(rows), "recipe": name})
+    counts = {"rows": len(rows), "recipe": name}
+    nxt = None
+    if truncated is not None:
+        counts["truncated"] = truncated
+        if truncated:
+            nxt = "add LIMIT/OFFSET or a narrower WHERE to the SQL, or pass --limit 0"
+    emit_status("query", ok=True, status="complete", counts=counts, next=nxt)
     return 0
 
 
@@ -655,15 +681,27 @@ HANDLERS = {"init": cmd_init, "auth": cmd_auth, "crawl": cmd_crawl, "probe": cmd
             "query": cmd_query}
 
 
+def _usage_error(parser: argparse.ArgumentParser, message: str) -> int:
+    """argparse-style usage + message on stderr, then the APPMAP_STATUS line."""
+    parser.print_usage(sys.stderr)
+    print(f"{parser.prog}: error: {message}", file=sys.stderr, flush=True)
+    words = parser.prog.split()  # "appmap", "appmap crawl", "appmap query sql"
+    command = words[1] if len(words) > 1 else "appmap"
+    emit_status(command, ok=False, status="usage_error", errors=[message],
+                next=f"{parser.prog} --help")
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
-    except SystemExit as e:  # argparse exits for --version / errors
+    except SystemExit as e:  # argparse exits for --version / --help
         return e.code if isinstance(e.code, int) else 0
+    except _UsageError as e:
+        return _usage_error(e.parser, str(e))
     if not args.command:
-        parser.print_help()
-        return 2
+        return _usage_error(parser, "a subcommand is required")
     handler = HANDLERS[args.command]
     run = getattr(args, "run", None)
     if args.command not in LOCKED or not run or not Path(run).is_dir():

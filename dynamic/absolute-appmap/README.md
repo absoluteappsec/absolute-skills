@@ -27,7 +27,8 @@ start at [`AGENTS.md`](AGENTS.md).
 ## Requirements
 
 - Python 3.11+ (3.11–3.13 recommended; the setup script prefers 3.12/3.11 when the default
-  `python3` is 3.14 or newer).
+  `python3` is 3.14 or newer, refuses anything older than 3.11, and honours
+  `APPMAP_PYTHON=/path/to/python`).
 - Network access on first use: `scripts/appmap` runs `scripts/setup.sh`, which creates a
   virtualenv in `${XDG_CACHE_HOME:-~/.cache}/absolute-appmap/<version>/venv` and installs
   Playwright's Chromium.
@@ -162,6 +163,35 @@ Saved login sessions are kept outside the run directory, in
   authorized for the engagement, and delete it (and the saved sessions) when the engagement ends.
 - Created records carry the marker `appmap-<run_id>`; `APP-MAP.md` lists every record the run
   created for cleanup.
+
+## Known Limitations
+
+Known gaps in v0.1.0, with workarounds where one exists:
+
+- **Failed forms are not retried within a run.** A form whose submission failed validation
+  after its retries stays failed; adding values to `fixtures.yaml` only helps forms not yet
+  tried. Check `appmap status --gaps` (`unsuccessful_forms`) and exercise those by hand or in a
+  new run with the fixtures in place.
+- **No way to add an action to the approval queue by hand.** Only actions the crawler held are
+  queued. To keep the crawler away from something it does not hold, add it to
+  `scope.deny_patterns`.
+- **`limits.concurrency` is validated and recorded but not used:** roles are crawled one at a
+  time, one page at a time.
+- **Vue Router hash-mode routes** (`/#/path`) and a router `base` are not handled by route
+  extraction; such routes are found only when the UI links to them.
+- **Bearer/header-auth roles probe unauthenticated:** `probe --phase passive` reuses the
+  cookies `appmap auth` saved, not learned `Authorization`/CSRF headers, so schemas and
+  sitemaps behind header auth answer it as anonymous. The browser crawl and active probe are
+  authenticated.
+- **`query sql` denies `pragma_table_info()`** (and other PRAGMA functions); read the columns
+  from `SCHEMA.md` instead.
+- **An approved action's window is not single-shot (ruling R21):** when no write was predicted,
+  every held request the acted-on page sends during the action window passes, so a page that
+  polls can send it more than once.
+- **Popup and cross-site iframe residuals:** a popup's very first request is refused and
+  replayed once its page is armed, and redirect hops inside out-of-process (cross-site)
+  iframes are not seen by the per-page redirect gate; both are scope-checked on their first
+  hop only.
 
 ## Development
 

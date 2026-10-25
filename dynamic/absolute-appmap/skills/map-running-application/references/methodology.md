@@ -57,7 +57,8 @@ How to read it:
 | `status` | `reported` | Plain report |
 | | `new_pass` | `--new-pass` closed a pass: read `counts.prev_pass` and `counts.new_in_prev_pass` |
 | | `no_change` | `--new-pass` refused: nothing ran since the current pass began |
-| `query` | `complete` / `error` | `counts.rows`, `counts.recipe` |
+| `query` | `complete` / `error` | `counts.rows`, `counts.recipe`; `sql` also `counts.truncated` (rows beyond `--limit`, default 1000) |
+| any | `usage_error` | Bad arguments (argparse message in `errors`; usage on stderr). Nothing ran; fix the command (`next` is its `--help`) |
 | `auth`, `crawl`, `probe`, `approvals`, `build` | `locked` | Another of these commands is running on the same run directory (`<run>/.lock`). `ok` is false and nothing was done. Wait for the other command to finish, then rerun (`next`). Never run two at once |
 
 `appmap status --run <run>` counts: `states`, `transitions`, `endpoints`, `routes`, `exchanges`,

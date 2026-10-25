@@ -61,13 +61,23 @@ def _authorizer(action, *_args):
     return sqlite3.SQLITE_OK if action in _ALLOWED_ACTIONS else sqlite3.SQLITE_DENY
 
 
-def _execute(store: Store, sql: str, params=()) -> list[dict]:
+def _execute(store: Store, sql: str, params=(), limit: int | None = None) -> list[dict]:
+    return _execute_limited(store, sql, params, limit)[0]
+
+
+def _execute_limited(store: Store, sql: str, params=(),
+                     limit: int | None = None) -> tuple[list[dict], int]:
+    """Rows (at most ``limit`` when given) and how many more the statement returned."""
     conn = store.conn
     deadline = time.monotonic() + STATEMENT_TIMEOUT_S
     conn.set_authorizer(_authorizer)
     conn.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 10000)
     try:
-        return [dict(r) for r in conn.execute(sql, params)]
+        cur = conn.execute(sql, params)
+        if limit is None:
+            return [dict(r) for r in cur], 0
+        rows = [dict(r) for r in cur.fetchmany(limit)] if limit > 0 else []
+        return rows, sum(1 for _ in cur)
     except sqlite3.OperationalError as e:
         if "interrupted" in str(e):
             raise QueryError(f"query exceeded the {STATEMENT_TIMEOUT_S:g}s statement timeout")
@@ -88,13 +98,21 @@ def _first_words(sql: str, n: int) -> list[str]:
     return re.findall(r"[A-Za-z_]+", sql)[:n]
 
 
+DEFAULT_SQL_LIMIT = 1000  # rows printed by ``query sql`` unless --limit says otherwise
+
+
 def run_sql(store: Store, sql: str) -> list[dict]:
     """Run one read statement (SELECT / WITH / EXPLAIN QUERY PLAN) and return its rows."""
+    return run_sql_limited(store, sql, None)[0]
+
+
+def run_sql_limited(store: Store, sql: str, limit: int | None) -> tuple[list[dict], int]:
+    """``run_sql`` returning at most ``limit`` rows (None: all) plus the number left out."""
     words = [w.upper() for w in _first_words(sql, 3)]
     if not (words[:1] in (["SELECT"], ["WITH"]) or words == ["EXPLAIN", "QUERY", "PLAN"]):
         raise QueryError("only a single SELECT, WITH or EXPLAIN QUERY PLAN statement is allowed")
     try:
-        return _execute(store, sql)
+        return _execute_limited(store, sql, limit=limit)
     except QueryError as e:
         if "one statement at a time" in str(e):
             raise QueryError("only a single statement is allowed") from e

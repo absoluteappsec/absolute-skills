@@ -248,3 +248,26 @@ def test_path_to_state_matches_sql_on_random_graphs(tmp_path, seed_):
     assert run_recipe(store, "path-to-state", state="st-nope") == []
     store.close()
 
+
+
+def test_cli_sql_row_cap_and_truncated_count(tmp_path, capsys):
+    """M2: query sql prints at most 1000 rows by default; counts.truncated says how many
+    were left out; --limit overrides (0 = all)."""
+    db = tmp_path / "appmap.sqlite"
+    s = Store(db)
+    s.init_schema()
+    s.close()
+    big = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 1205) " \
+          "SELECT x FROM c"
+
+    def run(*extra):
+        assert main(["query", "--run", str(tmp_path), "sql", big, *extra]) == 0
+        out = capsys.readouterr().out.strip().splitlines()
+        return out[:-1], json.loads(out[-1].removeprefix("APPMAP_STATUS "))
+    rows, st = run()
+    assert len(rows) == 1000 and st["counts"]["rows"] == 1000
+    assert st["counts"]["truncated"] == 205 and st["next"]
+    rows, st = run("--limit", "10")
+    assert len(rows) == 10 and st["counts"]["truncated"] == 1195
+    rows, st = run("--limit", "0")
+    assert len(rows) == 1205 and st["counts"]["truncated"] == 0 and st["next"] is None

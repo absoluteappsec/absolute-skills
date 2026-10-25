@@ -63,7 +63,10 @@ Examples: `appmap query --run <run> flows --role admin`,
 `appmap query --run <run> sql "SELECT method, path_pattern, kind FROM endpoints WHERE kind != 'static' ORDER BY path_pattern"`
 
 - One `SELECT`, `WITH` or `EXPLAIN QUERY PLAN` statement; anything that writes, attaches, or runs
-  `PRAGMA` is refused; 10-second statement timeout.
+  `PRAGMA` is refused (including `pragma_table_info()`: read columns from `SCHEMA.md`);
+  10-second statement timeout.
+- At most 1000 rows are printed by default; `counts.truncated` in `APPMAP_STATUS` says how many
+  were left out. Narrow the query (`WHERE`, `LIMIT`/`OFFSET`) or pass `--limit N` (`0` = all).
 - JSON columns (`TEXT JSON` in the schema) work with `json_extract` / `json_each`.
 - `frontier` and `frontier_links` are crawler-internal; do not build on them.
 - Ready-made queries for common tasks: `references/example-queries.md`.

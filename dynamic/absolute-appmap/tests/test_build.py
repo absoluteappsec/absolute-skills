@@ -800,3 +800,24 @@ def test_value_link_from_location_header_synthetic(tmp_path):
     finally:
         store.close()
 
+
+def test_records_skip_writes_bounced_to_login_or_denied(tmp_path):
+    """M3: a write answered by a redirect to the login page (lost session) or by 401/403
+    created nothing and is not listed."""
+    store, root = _synthetic(tmp_path)
+    try:
+        meta = json.loads((root / "run.json").read_text())
+        meta["config"]["roles"] = [{"name": "u", "login": {
+            "type": "form", "url": "https://example.test/auth/start"}}]
+        (root / "run.json").write_text(json.dumps(meta))
+        b = "https://example.test"
+        for to in ("/login?next=/projects", "https://example.test/auth/start"):
+            store.add_exchange(None, "u", "ui", method="POST", url=f"{b}/projects/new",
+                               status=302, resp_headers={"Location": to})
+        _x(store, "u", "POST", f"{b}/projects/9/archive", status=403)
+        _x(store, "u", "POST", f"{b}/projects/9/rename", status=401)
+        keep = store.add_exchange(None, "u", "ui", method="POST", url=f"{b}/projects/new",
+                                  status=302, resp_headers={"Location": "/projects/31"})
+        assert [i for i, _mk in _records(store, root)] == [keep]
+    finally:
+        store.close()

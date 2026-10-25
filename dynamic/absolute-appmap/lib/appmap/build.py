@@ -946,12 +946,24 @@ def _value_forms(token: str) -> set[str]:
 _AUTH_PATH = re.compile(r"(?:^|/)(?:log|sign)[-_]?(?:in|out|on|off)(?:/|$|\.)", re.I)
 
 
+def _login_paths(store: Store) -> set[str]:
+    """Paths of the configured roles' login pages (from run.json)."""
+    out = set()
+    for r in ((_run_meta(store).get("config") or {}).get("roles") or []):
+        url = ((r or {}).get("login") or {}).get("url") if isinstance(r, dict) else None
+        if isinstance(url, str) and url:
+            out.add(urlsplit(url).path.rstrip("/") or "/")
+    return out
+
+
 def _ctx_records(store: Store) -> dict:
     """Records created by this run (ruling R23): every exchange in the run directory was
     sent by this run, so this is every successful (2xx/3xx) non-GET exchange except login
-    traffic and login/logout endpoints. ``marker`` annotates the marker or run-specific
-    truncation found in the query string or body (never the URL host or path); rows with
-    a marker come first."""
+    traffic, login/logout endpoints and writes redirected to a login page (session lost:
+    nothing was created). ``marker`` annotates the marker or run-specific truncation found
+    in the query string or body (never the URL host or path); rows with a marker come
+    first."""
+    login_paths = _login_paths(store)
     marker = run_marker(store)
     variants = marker_variants(store, marker) if marker else set()
     short = variants - {marker}
@@ -975,6 +987,10 @@ def _ctx_records(store: Store) -> dict:
                 x["marker"] = max(hit, key=len) if hit else ""
         hdrs = _loads(x["resp_headers"], {}) or {}
         x["location"] = next((v for k, v in hdrs.items() if str(k).lower() == "location"), None)
+        if x["location"]:
+            to = urlsplit(urljoin(x["url"] or "", x["location"])).path
+            if _AUTH_PATH.search(to) or (to.rstrip("/") or "/") in login_paths:
+                continue  # bounced to the login page: the write did not happen
         (matched if x["marker"] else other).append(x)
     shown, more = _cap(matched + other, CAPS["records"])
     return {"rows": shown, "more": more, "marker": marker or "",

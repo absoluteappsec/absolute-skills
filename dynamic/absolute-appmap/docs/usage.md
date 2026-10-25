@@ -22,7 +22,10 @@ dynamic/absolute-appmap/scripts/appmap --version     # prints: appmap 0.1.0
 On first use the wrapper runs `scripts/setup.sh`, which creates a virtualenv in
 `${XDG_CACHE_HOME:-~/.cache}/absolute-appmap/<version>/venv`, installs the package and
 downloads Playwright's Chromium (a few minutes; progress goes to stderr). Later calls start
-immediately. Run `scripts/setup.sh` directly to (re)install ahead of time.
+immediately; an interrupted install (no `.appmap-ready` file in the venv yet) is completed on
+the next call. Run `scripts/setup.sh` directly to (re)install ahead of time. Setup stops with a
+clear message when no Python 3.11+ is found; point it at one with
+`APPMAP_PYTHON=/path/to/python3.12`.
 
 Crawling uses **Chromium only**: browser scope enforcement relies on the Chrome DevTools
 Protocol, so Firefox and WebKit are not supported.
@@ -212,10 +215,10 @@ held; cross-role replays of POST/PUT/PATCH are not.
      label: Delete
      reasons: ["label matches delete keyword 'delete'"]
      predicted_request: {method: POST, url: https://staging.example.com/projects/26/delete}
+     created_by_run: true
      decision: approve
      note: 'operator: approve - project 26 was created by this run'
    - id: ap-0001
-     created_by_run: true
      role: admin
      category: logout
      label: Logout

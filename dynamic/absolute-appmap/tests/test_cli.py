@@ -30,3 +30,18 @@ def test_subcommands_registered_with_handlers():
     sub = next(a for a in build_parser()._actions if a.dest == "command")
     assert set(sub.choices) == names == set(cli.HANDLERS)
     assert cli.LOCKED <= names
+
+
+def test_usage_errors_emit_status(capsys):
+    """M1: argparse errors end with an APPMAP_STATUS line (usage_error, ok false)."""
+    for argv, cmd in ((["crawl"], "crawl"), (["crawl", "--run", "x", "--budget-minutes", "y"],
+                                              "crawl"),
+                      (["probe", "--run", "x", "--phase", "loud"], "probe"),
+                      (["nope"], "appmap"), ([], "appmap"),
+                      (["query", "--run", "x", "sql"], "query")):
+        assert main(argv) == 2
+        captured = capsys.readouterr()
+        obj = json.loads(captured.out.strip().splitlines()[-1].removeprefix("APPMAP_STATUS "))
+        assert obj["command"] == cmd and obj["ok"] is False and obj["status"] == "usage_error"
+        assert obj["errors"] and obj["next"].endswith("--help")
+        assert "usage:" in captured.err
