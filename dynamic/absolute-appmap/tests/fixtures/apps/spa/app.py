@@ -116,10 +116,17 @@ def create_app() -> Flask:
 
     @app.post("/graphql")
     def graphql():
-        if not user():
-            return unauth()
         d = request.get_json(silent=True) or {}
         q, v = d.get("query", ""), d.get("variables") or {}
+        if "__schema" in q:  # introspection is open (schema discovery needs no session)
+            return jsonify(data={"__schema": {
+                "queryType": {"name": "Query"}, "mutationType": {"name": "Mutation"},
+                "subscriptionType": None,
+                "types": [{"name": "Query", "kind": "OBJECT", "fields": [{"name": "items"}]},
+                          {"name": "Mutation", "kind": "OBJECT",
+                           "fields": [{"name": "deleteItem"}]}]}})
+        if not user():
+            return unauth()
         if "DeleteItem" in q:
             return jsonify(data={"deleteItem": state["items"].pop(v.get("id"), None) is not None})
         if "ListItems" in q:

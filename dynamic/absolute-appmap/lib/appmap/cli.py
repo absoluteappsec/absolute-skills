@@ -11,7 +11,7 @@ from pathlib import Path
 from appmap import __version__
 
 COMMANDS = ["init", "auth", "crawl", "probe", "approvals", "build", "status", "query"]
-IMPLEMENTED = {"init", "auth", "crawl"}
+IMPLEMENTED = {"init", "auth", "crawl", "probe"}
 
 log = logging.getLogger("appmap.cli")
 
@@ -63,6 +63,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="stop cleanly after this long (default 8); rerun to resume")
     p.add_argument("--approved-only", action="store_true",
                    help="only execute actions approved in approvals.yaml")
+    p = sub.add_parser("probe", help="non-browser discovery (robots/sitemaps/schemas)")
+    p.add_argument("--run", required=True, help="run directory")
+    p.add_argument("--phase", required=True, choices=["passive", "active"],
+                   help="passive: robots, sitemaps, well-known, OpenAPI, GraphQL introspection")
+    p.add_argument("--role", help="probe as this role (default: the first configured role)")
+    p.add_argument("--budget-minutes", type=float, default=8.0,
+                   help="stop cleanly after this long (default 8); rerun to resume")
     for name in COMMANDS:
         if name not in IMPLEMENTED:
             sub.add_parser(name, help=f"{name} (not yet implemented)")
@@ -256,7 +263,97 @@ def cmd_crawl(args) -> int:
     return 0 if ok else 1
 
 
-HANDLERS = {"init": cmd_init, "auth": cmd_auth, "crawl": cmd_crawl}
+async def _probe_passive(cfg, rd, role_name: str, budget_minutes: float) -> dict[str, int]:
+    import functools
+    import time
+
+    from playwright.async_api import async_playwright
+
+    from appmap.browser.session import state_path
+    from appmap.crawl import build_runtime
+    from appmap.direct import DirectClient
+    from appmap.frontier import Frontier
+    from appmap.probe.passive import probe_passive
+    from appmap.probe.schemas import probe_schemas
+    from appmap.recording import record_exchange
+
+    deadline = time.monotonic() + budget_minutes * 60
+    rt = build_runtime(cfg, rd)
+    counts: dict[str, int] = {"timed_out": 0}
+    try:
+        known = [r["pattern"] for r in rt.store.conn.execute(
+            "SELECT pattern FROM routes WHERE kind='spa_route'")]
+        rec = functools.partial(record_exchange, rt.store, rt.events, rt.redactor, rd,
+                                known_patterns=known)
+        client = DirectClient(rt.gate, rec, rt.events)
+        kwargs = {}
+        saved = state_path(rd, role_name)
+        if saved.exists():  # authenticated schemas/sitemaps need the role's session
+            st = json.loads(saved.read_text(encoding="utf-8"))
+            kwargs["storage_state"] = {"cookies": st.get("cookies", []),
+                                       "origins": st.get("origins", [])}
+        async with async_playwright() as pw:
+            api = await pw.request.new_context(**kwargs)
+            try:
+                steps = []
+                if cfg.discovery.passive_sources:
+                    steps.append(lambda: probe_passive(client, api, cfg, rt.store,
+                                                       Frontier(rt.store), role_name,
+                                                       deadline=deadline))
+                if cfg.discovery.schemas:
+                    steps.append(lambda: probe_schemas(client, api, cfg, rt.store, role_name,
+                                                       deadline=deadline))
+                for step in steps:
+                    for k, v in (await step()).items():
+                        counts[k] = max(counts.get(k, 0), v) if k == "timed_out" \
+                            else counts.get(k, 0) + v
+            finally:
+                await api.dispose()
+    finally:
+        rt.store.close()
+    return counts
+
+
+def cmd_probe(args) -> int:
+    from appmap.crawl import make_redactor, select_roles
+    from appmap.throttle import CircuitOpen
+
+    if args.phase != "passive":
+        emit_status("probe", ok=False, status="not_implemented",
+                    errors=[f"probe --phase {args.phase} is not implemented yet"])
+        return 1
+    try:
+        rd, cfg, meta = _open_run(args.run)
+        role = select_roles(cfg, [args.role or cfg.roles[0].name])[0]
+    except Exception as e:
+        emit_status("probe", ok=False, status="error", errors=[str(e)])
+        return 1
+    run = _q(rd.root)
+    handler = _attach_log(rd, make_redactor(cfg))
+    try:
+        counts = asyncio.run(_probe_passive(cfg, rd, role.name, args.budget_minutes))
+    except CircuitOpen as e:
+        log.warning("probe: %s", e)
+        emit_status("probe", ok=False, status="paused_circuit",
+                    errors=["circuit breaker tripped (too many 429/5xx responses); "
+                            "check the target before resuming"])
+        return 1
+    except Exception as e:
+        log.exception("probe failed")
+        emit_status("probe", ok=False, status="error", errors=[str(e)])
+        return 1
+    finally:
+        _detach_log(handler)
+    status = "in_progress" if counts.get("timed_out") else "done"
+    again = f"appmap probe --run {run} --phase passive" + (
+        f" --role {_q(args.role)}" if args.role else "")
+    emit_status("probe", ok=True, status=status,
+                counts={k: v for k, v in counts.items() if k != "timed_out"},
+                next=again if status == "in_progress" else f"appmap crawl --run {run}")
+    return 0
+
+
+HANDLERS = {"init": cmd_init, "auth": cmd_auth, "crawl": cmd_crawl, "probe": cmd_probe}
 
 
 def main(argv: list[str] | None = None) -> int:
