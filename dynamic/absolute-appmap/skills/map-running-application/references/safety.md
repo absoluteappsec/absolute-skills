@@ -87,7 +87,9 @@ executed twice.
 - Redaction is on everywhere (SQLite, JSON, HAR, events, DOM snapshots, logs): passwords,
   `Authorization` headers, session cookies, bearer/JWT tokens, API keys, CSRF tokens and the
   configured roles' passwords (wherever they appear) are replaced by shape-preserving placeholders such as
-  `<redacted:jwt>`. Opaque tokens are covered too: form-urlencoded and query parameters by name
+  `<redacted:jwt>`. Opaque tokens are covered too: form-urlencoded, `multipart/form-data`
+  (each text part by its field name — e.g. `password`, `csrfmiddlewaretoken`; uploaded file
+  bytes are kept apart from literal secrets) and query parameters by name
   (`authenticity_token`, `csrf…`), HTML hidden inputs and `<meta>` tags named like
   csrf/token/secret/password, and every value the session actually used (cookie values,
   `Authorization` and CSRF header values seen at runtime or saved by `appmap auth`, 8+ chars)

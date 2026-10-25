@@ -11,6 +11,13 @@ lowercased) so `deleteUser`, `Deleted` and `/api/sendEmail` match but `payload` 
 
 1. **logout** — `log out`, `logout`, `sign out`, `log off`, `sign off` in the label or URL.
 2. **delete** — HTTP `DELETE`, always.
+2a. **outbound_message** (account recovery) — only for form submissions and non-GET
+   requests, label or URL only: forgot/forgotten password (or username/login), password
+   reset request, resend verification/confirmation/activation email/link/code, send (me)
+   a (password) reset link/email/code, email me, magic link. These make the server send
+   mail, so `POST /forgot_password/` is held as `outbound_message` (not
+   `credential_change`). A "Forgot password?" link that only navigates (GET), or a login
+   form whose surrounding text mentions it, is not held.
 3. Keyword categories, checked against label, then URL, then context text:
 
 | Category | Keywords (and inflections) |

@@ -20,7 +20,7 @@ Conventions:
   (`/items/:id` style, recorded as found).
 - **Redaction:** credentials and session tokens are replaced in every table by
   `<redacted:KIND>` (`password`, `secret`, `cookie`, `authorization`, `jwt`, `csrf`,
-  `api_key`; `undecodable` replaces a binary body that could not be checked for secrets); everything else, including customer data, is kept. If `run.json` has
+  `api_key`; `undecodable` replaces a binary body that could not be checked for secrets); everything else, including customer data, is kept. Request bodies are redacted by field name whether JSON, form-urlencoded or `multipart/form-data` (each text part by its name; file parts keep their bytes apart from literal secrets; the multipart framing is kept, so `bodies/<id>.req.bin` stays a well-formed body). If `run.json` has
   `contains_production_data: true`, treat the run directory as sensitive production data.
 - Paths in the run directory (`screenshot`, `dom_snapshot`, `*_body_path`) are relative to
   the run directory.
@@ -30,7 +30,7 @@ Conventions:
 | Vocabulary | Values |
 |---|---|
 | `exchanges.origin` | `ui` (browser crawl), `replay` (direct API replay of captured requests), `cross_role` (another role's request replayed for the access matrix), `schema` (requests built from OpenAPI/GraphQL schemas), `passive` (robots, sitemaps, well-known files, bundles fetched directly), `bundle` (requests to URLs mined from JS bundles), `approved` (an approved held action executed), `login` (role authentication) |
-| `sources.source` | `ui`, `spa_router`, `bundle`, `openapi`, `graphql`, `sitemap`, `robots`, `well_known`, `source_map`, `replay`, `wordlist` |
+| `sources.source` | `ui`, `spa_router`, `bundle`, `openapi`, `graphql`, `sitemap`, `robots`, `well_known`, `source_map`, `replay`, `wordlist`. `well_known` also covers routes listed by a Django DEBUG 404 page ("Using the URLconf defined in …") recorded during the passive probe; `openapi` covers specs found via Swagger UI / ReDoc pages |
 | `sources.item_kind`, `role_access.item_kind` | `route` (→ `routes.id`), `endpoint` (→ `endpoints.id`) |
 | `role_access.outcome` | `allowed` (2xx, same JSON shape as the discovering role's response), `redirect_login` (401, or landed on the login page), `forbidden` (403), `not_found` (404/410), `different_content` (3xx, 400/422 — authorization passed but the input was rejected —, redirected to another path, or 2xx with a different JSON shape), `error` (405, 5xx, network failure), `not_tested` (held for approval, logout, or tied to an approval) |
 | `routes.kind` | `page` (server-rendered or visited URL), `spa_route` (client-side router route) |
