@@ -63,11 +63,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="stop cleanly after this long (default 8); rerun to resume")
     p.add_argument("--approved-only", action="store_true",
                    help="only execute actions approved in approvals.yaml")
-    p = sub.add_parser("probe", help="non-browser discovery (robots/sitemaps/schemas)")
+    p = sub.add_parser("probe", help="direct-request discovery and cross-role replay")
     p.add_argument("--run", required=True, help="run directory")
     p.add_argument("--phase", required=True, choices=["passive", "active"],
-                   help="passive: robots, sitemaps, well-known, OpenAPI, GraphQL introspection, JS bundles")
-    p.add_argument("--role", help="probe as this role (default: the first configured role)")
+                   help="passive: robots, sitemaps, well-known, OpenAPI, GraphQL introspection, "
+                        "JS bundles; active: API replay, forced browsing (if enabled), "
+                        "cross-role replay")
+    p.add_argument("--role", help="probe as this role (default: the first configured role; "
+                                  "active: API replay for every role)")
     p.add_argument("--budget-minutes", type=float, default=8.0,
                    help="stop cleanly after this long (default 8); rerun to resume")
     for name in COMMANDS:
@@ -323,10 +326,6 @@ def cmd_probe(args) -> int:
     from appmap.crawl import make_redactor, select_roles
     from appmap.throttle import CircuitOpen
 
-    if args.phase != "passive":
-        emit_status("probe", ok=False, status="not_implemented",
-                    errors=[f"probe --phase {args.phase} is not implemented yet"])
-        return 1
     try:
         rd, cfg, meta = _open_run(args.run)
         role = select_roles(cfg, [args.role or cfg.roles[0].name])[0]
@@ -335,8 +334,18 @@ def cmd_probe(args) -> int:
         return 1
     run = _q(rd.root)
     handler = _attach_log(rd, make_redactor(cfg))
+    warnings: list[str] = []
+    pending = 0
     try:
-        counts = asyncio.run(_probe_passive(cfg, rd, role.name, args.budget_minutes))
+        if args.phase == "active":
+            from appmap.probe.replay import run_active
+
+            res = asyncio.run(run_active(cfg, rd, roles=[role.name] if args.role else None,
+                                         probe_role=role.name,
+                                         budget_minutes=args.budget_minutes))
+            counts, warnings, pending = res.counts, res.warnings, res.pending_approvals
+        else:
+            counts = asyncio.run(_probe_passive(cfg, rd, role.name, args.budget_minutes))
     except CircuitOpen as e:
         log.warning("probe: %s", e)
         emit_status("probe", ok=False, status="paused_circuit",
@@ -350,11 +359,18 @@ def cmd_probe(args) -> int:
     finally:
         _detach_log(handler)
     status = "in_progress" if counts.get("timed_out") else "done"
-    again = f"appmap probe --run {run} --phase passive" + (
+    again = f"appmap probe --run {run} --phase {args.phase}" + (
         f" --role {_q(args.role)}" if args.role else "")
+    if status == "in_progress":
+        nxt = again
+    elif args.phase == "passive":
+        nxt = f"appmap crawl --run {run}"
+    else:
+        nxt = (f"appmap approvals --run {run} write" if pending
+               else f"appmap build --run {run}")
     emit_status("probe", ok=True, status=status,
                 counts={k: v for k, v in counts.items() if k != "timed_out"},
-                next=again if status == "in_progress" else f"appmap crawl --run {run}")
+                pending_approvals=pending, errors=warnings, next=nxt)
     return 0
 
 
