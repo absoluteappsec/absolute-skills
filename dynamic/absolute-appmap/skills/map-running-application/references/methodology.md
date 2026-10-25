@@ -57,6 +57,9 @@ How to read it:
 | `status` | `reported` | Plain report |
 | | `new_pass` | `--new-pass` closed a pass: read `counts.prev_pass` and `counts.new_in_prev_pass` |
 | | `no_change` | `--new-pass` refused: nothing ran since the current pass began |
+| `profile` | `profiled` | Profile written (`profile.json`, `APP-PROFILE.md`, `profile-names.yaml`). `counts`: `technologies`, `features`, `entities`, `environments`. `errors` holds warnings (e.g. an unparseable `profile-names.yaml`, left untouched and copied to `.bak`); `next` asks for the purpose/feature names until they are filled |
+| | `partial` | Written, but something could not be determined (no build, failed role, unfinished crawl, unreadable section); see `could_not_determine` in `profile.json` |
+| | `error` | Nothing written: no `appmap.sqlite`, or the output directory is not writable (pass `--out`) |
 | `query` | `complete` / `error` | `counts.rows`, `counts.recipe`; `sql` also `counts.truncated` (rows beyond `--limit`, default 1000) |
 | any | `usage_error` | Bad arguments (argparse message in `errors`; usage on stderr). Nothing ran; fix the command (`next` is its `--help`) |
 | `auth`, `crawl`, `probe`, `approvals`, `build` | `locked` | Another of these commands is running on the same run directory (`<run>/.lock`). `ok` is false and nothing was done. Wait for the other command to finish, then rerun (`next`). Never run two at once |
@@ -65,6 +68,9 @@ How to read it:
 `forms`, `approvals` (same keys as the approvals command), `pass`, `new_in_pass`,
 `pending_frontier`, plus `prev_pass`/`new_in_prev_pass` with `--new-pass` and `gaps` (list sizes)
 with `--gaps`.
+
+`profile` and `query` take no lock: they only read the run (`profile` writes its own three
+files, atomically, into the first run directory or `--out`) and never contact the target.
 
 ## Budgets and reruns
 
@@ -89,6 +95,7 @@ the run; reaching it gives `limit_reached`, which counts as a stop condition for
 | 6 | `appmap approvals --run <run> write` … `apply`, `appmap crawl --run <run> --approved-only`, `appmap crawl --run <run>` | `review-approvals` | no pending items, approved ones executed |
 | 7 | `appmap status --run <run> --new-pass`, `appmap status --run <run> --gaps` | (this skill) | stop rule met |
 | 8 | `appmap build --run <run>` | `build-app-map` | `complete` with names applied |
+| 9 (optional) | `appmap profile --run <run>` | `profile-running-application` | `profiled`/`partial` with purpose and feature names filled |
 
 Approval checkpoints: held actions are queued while the crawl continues elsewhere. Review them
 (Step 6, `review-approvals`) **when a crawl pass drains** (crawl reports `done` with
@@ -165,6 +172,7 @@ Saved sessions live in `~/.cache/absolute-appmap/sessions/<run_id>/`. If they ha
 | Confirm / downgrade / add held actions, with reasons; present to the human | `review-approvals` |
 | Flow names, descriptions and form purposes | `build-app-map` |
 | Which gaps deserve a targeted pass; when coverage is good enough | Step 7 above |
+| Application purpose, feature names, descriptions and "how it works" (optional profile) | `profile-running-application` |
 
 Everything else is mechanical and belongs to the CLI. If you find yourself wanting to click
 through the app or send requests by hand, stop: that bypasses scope, throttling, approvals and

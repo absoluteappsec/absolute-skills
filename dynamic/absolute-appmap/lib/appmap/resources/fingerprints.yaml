@@ -601,7 +601,7 @@ rules:
   - tech: Cookie session
     category: auth
     evidence: [cookie]
-    match: '^(?:sessionid|session|connect\.sid|JSESSIONID|PHPSESSID|laravel_session|ASP\.NET_SessionId|_session_id|_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*_session|[A-Za-z0-9_.-]*[_.-]sess(?:ion)?(?:id)?)$'
+    match: '^(?:sessionid|session|sid|connect\.sid|JSESSIONID|PHPSESSID|laravel_session|ASP\.NET_SessionId|_session_id|_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*_session|[A-Za-z0-9_.-]*[_.-]sess(?:ion)?(?:id)?)$'
     version: null
     confidence: likely
     implies: null

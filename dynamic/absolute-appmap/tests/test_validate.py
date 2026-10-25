@@ -32,7 +32,7 @@ def _append(path: Path, text: str) -> None:
 def test_validate_passes_on_repo():
     res = run_validate()
     assert res.returncode == 0, res.stdout + res.stderr
-    assert res.stdout.strip().splitlines()[-1] == "OK: validated 8 skill(s) and plugin.json"
+    assert res.stdout.strip().splitlines()[-1] == "OK: validated 9 skill(s) and plugin.json"
 
 
 def test_validate_passes_on_copy(plugin_copy):

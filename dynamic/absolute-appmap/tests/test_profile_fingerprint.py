@@ -214,3 +214,15 @@ def test_react_banner_anchored_to_react_files(rules):
         react = next(t for t in detect([_ev("script", banner)], rules) if t.name == "React")
         assert react.versions == ([version] if version else [])
         assert react.confidence == "confirmed"
+
+
+@pytest.mark.parametrize("name", ["sid", "connect.sid", "sessionid", "app_session"])
+def test_session_cookie_names(name, rules):
+    found = {t.name for t in detect([_ev("cookie", name, "a", 0)], rules)}
+    assert "Cookie session" in found
+
+
+@pytest.mark.parametrize("name", ["sidebar", "consid", "theme"])
+def test_non_session_cookie_names(name, rules):
+    found = {t.name for t in detect([_ev("cookie", name, "a", 0)], rules)}
+    assert "Cookie session" not in found

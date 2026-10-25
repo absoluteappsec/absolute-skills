@@ -400,6 +400,33 @@ UNIQUE(`url`, `found_on`).
 key per public table above (internal tables and internal `meta` keys left out). JSON columns
 are decoded into objects/arrays. `meta` is a list of `{"key", "value"}` rows.
 
+## `profile.json`
+
+Written by `appmap profile` (not by `build`), next to `APP-PROFILE.md` and
+`profile-names.yaml`, in the first run directory or `--out`. Descriptive only.
+
+| Key | Contents |
+|---|---|
+| `profile_schema_version` | `"1.0.0"` |
+| `generated_at`, `status` | ISO timestamp; `profiled` or `partial` |
+| `warnings` | Notes (e.g. no API schema found, low route overlap between runs) |
+| `observed_accounts_masked` | `true` when observed usernames/emails are masked (production input without `--include-observed-accounts`) |
+| `could_not_determine` | `[{item, run_id, reason}]` |
+| `environments` | Per run: `run_id`, `base_urls`, `hosts`, `profile`, `started_at`, `tool_version`, `contains_production_data` |
+| `technologies` | `[{name, category, versions, versions_by_environment, confidence, evidence}]`; `confidence` is `confirmed` or `likely`; `evidence` is `[{ref, kind, snippet}]` (snippet ≤ 200 chars, redacted) |
+| `layout` | `areas` (`prefix`, `routes`, `endpoints`, `roles`), `entry_points` (role → URLs), `api_groups` (`resource`, `endpoints`) |
+| `features` | `[{key, resource, flow_keys, routes, endpoints, forms, roles, name_suggestion}]`; `key` is stable across re-runs |
+| `data_model` | `[{name, source, fields, id_format, endpoints, evidence}]`; `source` is `openapi`, `graphql` or `inferred`; fields have `name`, `type`, `required`, `constraints`, `enum`, `example_redacted` |
+| `data_setup` | `preconditions` (`flow_key`, `requires`), `created_records`, `created_records_more`, `fixtures_used`, `seed_observations` (`resource`, `id_min`, `id_max`, `count`) |
+| `accounts` | `roles` (`name`, `login_type`, `auth_ok`, `reachable_routes`, `reachable_endpoints`), `created_by_run`, `observed` (`value`, `where`) — never passwords or tokens |
+| `coverage` | `features_x_roles` (feature key → role → outcome), `unexercised` (as `gaps`), `approvals` (`pending`, `denied`, `skipped`) |
+| `differences` | Several runs only: `technologies`, `routes`, `endpoints`, `role_access` not shared by every run; else `null` |
+| `other_runs` | Several runs only: the per-run sections above for every run after the first |
+| `purpose`, `feature_names` | Applied from `profile-names.yaml` (`feature_names`: key → `name`, `description`, `how_it_works`) |
+
+Every evidence ref is `{"run_id", "kind", "id"}` with `kind` one of `exchange`, `state`, `file`,
+`route`, `endpoint`, `flow`, `form`; resolve it in that run's `appmap.sqlite`.
+
 ## Query recipes
 
 `appmap query --run <run> <recipe> [args]` runs these (named parameters `:role`, `:endpoint`,

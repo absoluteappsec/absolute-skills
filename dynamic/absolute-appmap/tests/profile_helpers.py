@@ -8,6 +8,10 @@ from pathlib import Path
 
 import pytest
 
+# Secrets each fixture server issued (sid cookies, CSRF tokens, JWTs), by built run directory,
+# so profile tests can scan their outputs for them after the server has stopped.
+ISSUED_SECRETS: dict[Path, set[str]] = {}
+
 
 def _built(name: str, roles_for, created_sql: str, tmp_path_factory) -> Path:
     from test_e2e import Instrumented, workflow  # lazy: avoids a conftest import cycle
@@ -16,6 +20,7 @@ def _built(name: str, roles_for, created_sql: str, tmp_path_factory) -> Path:
     try:
         res = workflow(server, tmp_path_factory.mktemp(f"profile-{name}"),
                        roles_for(server.url), created_sql)
+        ISSUED_SECRETS[res["run"]] = set(server.secrets)
         return res["run"]
     finally:
         server.stop()
