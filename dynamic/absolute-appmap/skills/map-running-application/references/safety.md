@@ -66,9 +66,12 @@ executed twice.
   one for a non-GET request (the 3xx is recorded); in the browser each such hop is classified
   like any other request (held → aborted and queued).
 - Held categories: `delete` (incl. any HTTP DELETE and any action that opens a `confirm()`
-  dialog), `credential_change`, `payment`, `outbound_message`, `deactivate`, `logout`, and
+  dialog), `credential_change`, `account_change` (forms that edit an account: fields such as
+  `username`, `is_staff`, `groups`, account-admin URLs, bulk actions on a user list; held
+  even in cross-role replay), `payment`, `outbound_message`, `deactivate`, `logout`, and
   `data_create` (production). Held actions are queued; the crawl continues elsewhere.
-- Cross-role replays of POST/PUT/PATCH are **not** held (they measure access control); held
+- Cross-role replays of POST/PUT/PATCH are **not** held (they measure access control) — except
+  `account_change` / `credential_change` writes (account fields in the body), which are; held
   destructive actions — including every DELETE — are never replayed cross-role.
 - **(you)** Review the queue, recommend with reasons, present it to the human, record only the
   human's decisions. Never approve by yourself, never write a broad `approve` rule the human did
@@ -124,7 +127,8 @@ DOM snapshots — in production too. A run directory can therefore contain custo
 
 - Generated free-text values carry `marker_prefix` (default `appmap-<run_id>`), so records the
   run created can be found.
-- `APP-MAP.md` → "Records created by this run" lists every successful state-changing request
-  the run sent (marker matches first). Give that list to the operator for cleanup; do not delete
+- `APP-MAP.md` → "Records created or changed by this run" lists every successful
+  state-changing request the run sent, plus each executed approved action whatever its method
+  (a GET that deletes) (marker matches first). Give that list to the operator for cleanup; do not delete
   records yourself unless the operator asks and approves each deletion through the approval
   queue.

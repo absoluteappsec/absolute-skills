@@ -42,6 +42,8 @@ APPMAP_STATUS {"command": "...", "ok": true, "status": "...", "counts": {...}, "
 - Branch on `status`. `crawl` and `probe` stop after a time budget (default 8 minutes) with
   `"in_progress"`: rerun the same command until the status changes.
 - `"paused_circuit"`: the target is failing or rate limiting — stop and tell the operator.
+- A form role whose last login failed is skipped by `crawl`/`probe` (warning in `errors`);
+  only `auth` retries it, after the operator fixed the credentials (lockout risk).
 - `"auth_failed"` (crawl): a role's login failed and it was stopped — rerun `auth` for it (the
   operator logs in for manual roles), never retry logins in a loop.
 - `"locked"`: another command is running on the same run directory — run one at a time.

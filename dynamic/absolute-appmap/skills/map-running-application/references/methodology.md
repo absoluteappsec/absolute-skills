@@ -45,12 +45,13 @@ How to read it:
 | | `done` | Frontier exhausted for the selected roles |
 | | `limit_reached` | Cumulative crawl time hit `limits.max_runtime_minutes`. Stop crawling |
 | | `paused_circuit` | Too many 429/5xx from the target. **Stop and tell the operator** |
-| | `auth_failed` | A role's login or mid-crawl re-login failed (`errors` names it; at most 2 re-logins in a row, a failed one is never repeated). That role stopped with its pending items kept; other roles ran. `ok` is false; run `next` (`appmap auth … --role R`, with the operator for manual roles), then rerun crawl |
+| | `auth_failed` | A role's login or mid-crawl re-login failed (`errors` names it; at most 2 re-logins in a row, a failed one is never repeated). That role stopped with its pending items kept; other roles ran. `ok` is false; run `next` (`appmap auth … --role R`, with the operator for manual roles), then rerun crawl. A form role whose **last** login already failed is not tried at all: without `--role` it is skipped with a warning (`role R: skipped, its last login failed …`) and the status comes from the other roles; `auth_failed` only when every requested role is skipped. Only `appmap auth` retries it, after the operator fixed the credentials |
 | | `error` | Unexpected failure; `errors` and `crawl.log` explain |
 | `crawl --approved-only` | `done` / `in_progress` / `paused_circuit` / `auth_failed` | Approved items executed / budget used, rerun with `--approved-only` / stop and tell the operator. `counts` has `executed`, `failed`, `skipped` |
 | `probe` | `in_progress` | Budget used up; rerun the same command |
 | | `done` | Phase finished |
 | | `paused_circuit` | Stop and tell the operator |
+| | `auth_failed` | `--role R` names a role whose last login failed: nothing probed as R; `next` is `appmap auth … --role R` (after the operator fixed the credentials). Without `--role` such roles are skipped with a warning in `errors` and the probe runs for the rest |
 | | `error` | Unexpected failure |
 | `approvals` | `listed` / `written` / `applied` | For `list` / `write` / `apply`. `counts`: `pending`, `approved`, `denied`, `skipped`, `executed`, `approved_unexecuted`, `failed`, `changed` |
 | `build` | `complete` | Map written. `counts`: `flows`, `flow_steps`, `value_links`, `preconditions`, `names_applied`, `forms`, `endpoints`, `routes`, `states` |
@@ -115,7 +116,9 @@ Call order matters:
      submitted (often held for approval). Better fixtures help forms not yet attempted; see
      `crawl-application`.
    - `unreached_routes` — routes no role reached. A missing role, a deny pattern, or a route only
-     reachable after an approved action.
+     reachable after an approved action. A route whose only answer was a redirect to another
+     (non-login) page (`/` → `/dashboard/`) is not a gap: it is listed under
+     `reached_via_redirect` in the `status --gaps` JSON (not counted in `counts.gaps`).
    - `unexplored_actions` — frontier items still `pending` (crawl again) or `failed`; approved
      items not yet executed (`approved_pending`) or failed with a `reason`.
    - `pending_approvals` / `denied_approvals` — held surface; pending ones go to the human.

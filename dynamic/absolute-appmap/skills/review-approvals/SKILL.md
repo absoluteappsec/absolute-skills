@@ -1,6 +1,6 @@
 ---
 name: review-approvals
-description: Use during an appmap run whenever actions are held for approval (pending_approvals above zero) - refresh approvals.yaml, review each held destructive or data-creating action (delete, credential change, payment, outbound message, deactivate, logout, production writes), confirm or downgrade the heuristic flag with reasons, look for dangerous actions the heuristics missed, present the batch to the human grouped by category, record only the human's decisions, apply them and execute approved actions with appmap crawl --approved-only. Triggers on "review the approval queue", "what needs approval", "approve the deletes of test records", "revoke that approval", "pending approvals".
+description: Use during an appmap run whenever actions are held for approval (pending_approvals above zero) - refresh approvals.yaml, review each held destructive or data-creating action (delete, credential change, account change, payment, outbound message, deactivate, logout, production writes), confirm or downgrade the heuristic flag with reasons, look for dangerous actions the heuristics missed, present the batch to the human grouped by category, record only the human's decisions, apply them and execute approved actions with appmap crawl --approved-only. Triggers on "review the approval queue", "what needs approval", "approve the deletes of test records", "revoke that approval", "pending approvals".
 ---
 
 ## Purpose
@@ -44,6 +44,16 @@ items:
 rules: []
 ```
 
+A `pending` item with `execution: failed: target moved/predicted request not observed` was
+approved before, but when it ran its control no longer acted on that target (a list shifted
+after an earlier delete, or the row is gone): nothing was executed and it went back to
+`pending`. Rules never re-approve such an item; present it again and only the human's new
+`approve` retries it.
+
+The queue does not grow when a list shifts: an action with the same role, label and target
+request (method and URL; a GET only when it is the action itself) as an existing item, in any
+state, reuses that item.
+
 ---
 
 ## Step 2 — Review Each Item (your analysis)
@@ -56,7 +66,9 @@ For every `pending` item, gather context and form a recommendation:
    (`created_by_run: true`, the run marker `appmap-<run_id>` in it, or an id returned by one of
    this run's writes)? Or pre-existing/shared data?
 3. Side effects: emails/SMS/invites to real people, payments, external integrations, account
-   lockout or deactivation, loss of the role's own access.
+   lockout or deactivation, loss of the role's own access. For `account_change` /
+   `credential_change` items, find **whose** account it is (the id in the URL, the form's
+   prefilled username): the crawler would submit generated values into it.
 4. Reversibility and environment: staging vs production (`run.json` → `profile`).
 
 Then classify, always with a one-line reason (see `references/destructive-heuristics.md`):
@@ -81,8 +93,8 @@ Then classify, always with a one-line reason (see `references/destructive-heuris
 
 ## Step 3 — Present the Batch to the Human
 
-Group by `category` (logout, delete, credential_change, payment, outbound_message, deactivate,
-data_create). For each group show a compact table — id, role, label, predicted request, why it was
+Group by `category` (logout, delete, credential_change, account_change, payment,
+outbound_message, deactivate, data_create). For each group show a compact table — id, role, label, predicted request, why it was
 held, **your recommendation and reason** — and ask for a decision per item or per group.
 
 - Say plainly that unanswered items stay pending (unexercised) and that is acceptable.
@@ -128,6 +140,12 @@ If `counts.approved_unexecuted > 0`:
 2. Read `counts.executed`, `counts.failed`, `counts.skipped` and `errors` (one line per item that
    failed, e.g. the control could not be found again, or a logout marked `skip`). An item that was
    interrupted mid-execution is recorded as executed with outcome unknown — never re-run.
+   An item whose predicted request was not observed (the action sent nothing, or only a
+   request to another record, which the guard blocked) or whose anchored list row is gone is
+   failed with "target moved/predicted request not observed", **not** executed, and back to
+   `pending` — report it to the human with the others at the next review. List-row controls
+   whose only locators are positional carry a content anchor (the row's `data-*id`, href or
+   text), so after one delete the next approved item still finds its own row.
 3. Then a normal `appmap crawl --run <run>` to explore whatever the approved actions revealed
    (new pages, created records). Its new held actions come back to Step 1.
 

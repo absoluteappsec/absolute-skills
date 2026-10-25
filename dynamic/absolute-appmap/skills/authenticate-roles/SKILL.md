@@ -42,8 +42,17 @@ keyboard input: `appmap auth --run <run> --role <role>` (for `form`, `storage_st
 roles).
 
 Read the status line: `status: "authenticated"` with `counts.roles_ok == counts.roles` is
-success; `auth_failed` lists the failing roles in `errors`; `error` means the command itself
-failed (unknown role, unreadable run directory).
+success; `auth_failed` lists the failing roles in `errors` with **why** each form login failed
+(e.g. `role admin: login failed: login page still shown; HTTP 401; page says: 'Invalid
+credentials'`, or `credentials not set (environment variables …)`, or `no visible password
+field at the login URL`); `error` means the command itself failed (unknown role, unreadable run
+directory).
+
+A failed form login is recorded (`roles.auth_ok = 0`): from then on `crawl` and `probe` skip
+that role with a warning instead of trying again, so a wrong password costs one attempt, not
+one per command (account lockout). Do **not** rerun `auth` for it in a loop: show the operator
+the reason, let them fix the credentials (environment variable, config), then run
+`appmap auth --run <run> --role <role>` once — the only command that retries a failed login.
 
 ---
 
@@ -95,6 +104,7 @@ operator.
 | MFA prompt, CAPTCHA, SSO redirect | Not scriptable | Step 3 (manual), or `type: manual` in the config |
 | `storage_state` fails | File missing or expired | Ask the operator for a fresh state file |
 | `crawl` reports `auth_failed` for a role | Its session was lost and the re-login failed (changed password, expired manual session) | Re-authenticate that role (Step 3 for manual roles, with the operator); then rerun the crawl — its pending items were kept |
+| `crawl`/`probe` warn `role R: skipped, its last login failed (…)` | R's last form login failed; it is not retried outside `appmap auth` (lockout risk) | Show the operator the reason; after they fix the credentials, `appmap auth --run <run> --role R` |
 | SSO login page blocked / login never completes | The IdP host is out of scope | Add the IdP host(s) to `scope.login_allow_hosts` (login pages only) |
 
 Edit the config file in place (it is re-read on every command), then rerun

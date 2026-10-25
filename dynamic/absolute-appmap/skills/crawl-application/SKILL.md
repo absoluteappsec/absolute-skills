@@ -34,6 +34,12 @@ app yourself to "help" the crawler.
   fixed time, pick a budget a few minutes below that limit.
 - Roles without a saved session are logged in first; `manual` roles must have been
   authenticated by the operator beforehand (`authenticate-roles`).
+- A `form` role whose **last login failed** (`appmap auth` or an earlier crawl/probe) is never
+  logged in again by `crawl` or `probe` (account lockout risk): it is skipped with a warning in
+  `errors` (`role R: skipped, its last login failed (<why>) … run 'appmap auth --run <run>
+  --role R'`), and the other roles run normally (status from them, not `auth_failed`). Only
+  when every requested role is skipped does the crawl return `auth_failed`. Tell the operator
+  the reason; once they fixed the credentials, `appmap auth --role R` is the only retry.
 - The crawl never prompts for a manual login. If a `manual` role's session is lost mid-crawl (or
   any role's re-login fails), that role stops with `auth_failed` and its pending items kept;
   re-authenticate it with the operator (`authenticate-roles`), then rerun the crawl.
@@ -67,8 +73,14 @@ Read the `APPMAP_STATUS` line after every invocation:
 
 Also read every time: `counts` (`states`, `transitions`, `forms`, `exchanges`,
 `queued_approvals`), `pending_approvals`, and `errors` — warnings such as
-`role X: … role stopped, its pending items are kept` (rerun `authenticate-roles` for X) or
-`approvals.yaml: …` (a malformed decision or rule).
+`role X: … role stopped, its pending items are kept` (rerun `authenticate-roles` for X),
+`role X: skipped, its last login failed …` (the operator fixes the credentials, then
+`appmap auth --role X`) or `approvals.yaml: …` (a malformed decision or rule).
+
+Forms that edit an account (fields such as `username`, `is_staff`, `groups`, password- or
+email-named fields, Django admin user forms and bulk actions) are held as `account_change` /
+`credential_change` and never submitted without approval; registration and login forms are
+not held (`review-approvals` → destructive heuristics).
 
 ---
 

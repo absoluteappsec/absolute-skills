@@ -37,9 +37,9 @@ Conventions:
 | `endpoints.kind` | `rest`, `graphql_op`, `websocket`, `sse`, `static`, `page` |
 | `endpoints.graphql_type` | `query`, `mutation`, `subscription` (NULL unless `kind='graphql_op'`) |
 | `params.location` | `path`, `query`, `body`, `header`, `cookie` |
-| `locators.strategy` | `testid`, `role_name` (value `role\|accessible name`), `label`, `text`, `css`, `xpath`; lower `rank` = more stable |
+| `locators.strategy` | `testid`, `role_name` (value `role\|accessible name`), `label`, `text`, `css`, `xpath`; lower `rank` = more stable. Action paths (`approvals.action_path`, `frontier.action_path`) may also carry `anchor` for a list-row control whose only unique locators are positional: value JSON `{"tag", "attr": [data-*id name, value] or null, "href", "row"}` naming the row it acts on; a positional match must be that element, else it is re-found by the anchor (not stored in `locators`) |
 | `transitions.action_type` | `navigate` (link or URL load), `click`, `submit` |
-| `approvals.category` | `delete`, `credential_change`, `payment`, `outbound_message`, `deactivate`, `logout`, `data_create` |
+| `approvals.category` | `delete`, `credential_change`, `account_change` (a form/write that edits an account: privilege or identity fields such as `is_staff`, `groups`, `username`, an account-admin URL, or a bulk action on a user list), `payment`, `outbound_message`, `deactivate`, `logout`, `data_create` |
 | `approvals.decision` | `pending`, `approve`, `deny`, `skip` |
 | `roles.login_type` | `form`, `manual`, `none`, `storage_state` |
 | `observations.kind` | `server_error`, `rate_limited`, `stack_trace`, `debug_page`, `captcha`, `access_denied` (a 401 / login page answered while the role's session was confirmed alive) |
@@ -61,7 +61,10 @@ Public keys: `schema_version` (e.g. `1.0.0`), `crawl_elapsed_s` (total browser-c
 across invocations). Run id, target, tool version and profile are in `run.json`.
 
 **Internal keys** (bookkeeping; not exported to `appmap.json`):
-`approval_failed:<approval id>` (why an approved action could not run),
+`approval_failed:<approval id>` (why an approved action could not run; on a `pending` item
+it means "target moved/predicted request not observed": not executed, waits for the human to
+approve it again), `login_failed:<role>` (why the role's last form login failed; while
+`roles.auth_ok = 0` crawl and probe skip the role, only `appmap auth` retries it),
 `approval_inflight:<approval id>` (event id of an approved action let through but not yet
 finished), `pass` (current double-back pass, absent = 1), `pass_<n>_baseline` (JSON counts
 `{"states","endpoints","routes"}` when pass n began), `pass_<n>_baseline_ts` and
@@ -76,7 +79,7 @@ form endpoint; names only, never values).
 |---|---|---|
 | `name` | TEXT PK | Role name from the config |
 | `login_type` | TEXT | See vocabulary |
-| `auth_ok` | INTEGER | 1 = last login verified, 0 = failed, NULL = not attempted |
+| `auth_ok` | INTEGER | 1 = last login verified, 0 = failed (a `form` role is then skipped by crawl/probe until `appmap auth` succeeds), NULL = not attempted |
 | `last_login_event` | TEXT | Event id of the last `login` event |
 
 ### `states`
@@ -342,10 +345,10 @@ Destructive or held actions (mirrored in `approvals.yaml`).
 | `category` | TEXT | See vocabulary |
 | `label` | TEXT | Control label or URL |
 | `reasons` | TEXT JSON | Why it was held |
-| `action_path` | TEXT JSON | Steps to perform it: `[{"type": "goto", "url"}, {"type": "click", "label", "locators": [{"strategy","value","rank"}], "mutating"?}, {"type": "submit", "form_label", "form_id", "method", "action", "locators", "has_confirm"}, {"type": "request", "method", "url", "body", "content_type"}]` |
+| `action_path` | TEXT JSON | Steps to perform it: `[{"type": "goto", "url"}, {"type": "click", "label", "locators": [{"strategy","value","rank"}], "href"?, "mutating"?, "fields"?}, {"type": "submit", "form_label", "form_id", "method", "action", "locators", "has_confirm", "fields"}, {"type": "request", "method", "url", "body", "content_type"}]`; `fields` = the form's controls `[{"name", "type", "options"?}]` the classifier saw |
 | `predicted_request` | TEXT JSON | `{"method", "url"}` expected to be sent, or NULL |
 | `decision` | TEXT | See vocabulary |
-| `decided_by` | TEXT | `user`, `rule`, `appmap` |
+| `decided_by` | TEXT | `user`, `rule`, `appmap` (`appmap`: a logout marked `skip`, or an approved item put back to `pending` because its target moved) |
 | `executed_event` | TEXT | Event id of `approval_executed` (its `data.exchange_ids` lists the requests sent) once performed |
 | `created_by_run` | INTEGER | 1 when the action was found on the page of a record this crawl just created (a successful submit that landed on that record's URL), else 0. Rule match key `created_by_run: true` in `approvals.yaml`. Added in schema 1.0.x; older databases gain it (default 0) on open |
 
@@ -603,6 +606,14 @@ FROM routes r
 WHERE NOT EXISTS (SELECT 1 FROM role_access a WHERE a.item_kind = 'route'
                   AND a.item_id = r.id AND a.outcome = 'allowed')
   AND NOT EXISTS (SELECT 1 FROM states s WHERE s.route_pattern = r.pattern)
+  -- reached via redirect (listed separately as reached_via_redirect): a GET of the route
+  -- answered 3xx to a page other than the login page ('/' -> '/dashboard/')
+  AND NOT EXISTS (SELECT 1 FROM endpoints e JOIN exchanges x ON x.endpoint_id = e.id
+                  WHERE e.host = r.host AND e.path_pattern = r.pattern
+                    AND upper(x.method) = 'GET' AND x.status BETWEEN 300 AND 399
+                    AND x.origin IN ('ui','replay','cross_role','schema','approved')
+                    AND lower(x.resp_headers) NOT LIKE '%"location": "%login%'
+                    AND lower(x.resp_headers) NOT LIKE '%"location": "%sign%in%')
 UNION ALL
 SELECT 'unexplored_action', CAST(fr.id AS TEXT), fr.role || ' ' || fr.kind || ' ' ||
        CASE fr.kind WHEN 'url' THEN fr.url ELSE fr.action_path END, fr.status
@@ -663,11 +674,16 @@ SELECT e.method, e.path_pattern, group_concat(ra.role || '=' || ra.outcome, ', '
 FROM role_access ra JOIN endpoints e ON ra.item_kind = 'endpoint' AND e.id = ra.item_id
 GROUP BY e.id HAVING count(DISTINCT ra.outcome) > 1;
 
--- records created by this run (as in APP-MAP.md): every exchange in the run directory was
--- sent by this run, so all successful writes except login traffic are candidates
-SELECT id, role, origin, method, url, status FROM exchanges
-WHERE upper(method) NOT IN ('GET','HEAD','OPTIONS') AND status BETWEEN 200 AND 399
-  AND origin != 'login'
+-- records created or changed by this run (as in APP-MAP.md): every exchange in the run
+-- directory was sent by this run, so all successful writes except login traffic are
+-- candidates, plus each executed approval's own request whatever its method (a GET delete)
+SELECT id, role, origin, method, url, status FROM exchanges x
+WHERE (upper(method) NOT IN ('GET','HEAD','OPTIONS')
+       OR (origin = 'approved' AND EXISTS (
+             SELECT 1 FROM approvals a WHERE a.executed_event IS NOT NULL
+               AND json_extract(a.predicted_request, '$.method') = 'GET'
+               AND rtrim(json_extract(a.predicted_request, '$.url'), '/') = rtrim(x.url, '/'))))
+  AND status BETWEEN 200 AND 399 AND origin != 'login'
 ORDER BY id;
 -- APP-MAP.md also drops login/logout endpoints and annotates each row with the run marker
 -- (or a run-specific truncation of it) found in its query string or body; to search for

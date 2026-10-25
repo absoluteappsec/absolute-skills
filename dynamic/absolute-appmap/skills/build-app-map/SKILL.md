@@ -87,7 +87,8 @@ top to bottom:
   matrix, key flows, forms, GraphQL operations;
 - **Unexercised surface** (pending/denied approvals), **Coverage gaps**, **Observations** (5xx,
   stack traces, debug pages, CAPTCHA, rate limiting);
-- **Records created by this run** — the cleanup list for the operator.
+- **Records created or changed by this run** — the cleanup/restore list for the operator:
+  successful writes plus every executed approved action, whatever its method (a GET delete).
 
 If something looks wrong (a role with no states, an empty matrix, a flow you could not name), go
 back to the relevant phase skill rather than papering over it. Structure of the document:

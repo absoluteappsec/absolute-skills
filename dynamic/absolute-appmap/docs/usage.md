@@ -153,7 +153,7 @@ $A build --run "$RUN"                                 # fill names.yaml, then bu
 | Step | Command | Leave the step when `status` is |
 |---|---|---|
 | Open the run | `init` | `initialized` (`config_error`: fix the file, rerun) |
-| Authenticate | `auth` | `authenticated` (`auth_failed`: see `errors`, fix, rerun for that `--role`) |
+| Authenticate | `auth` | `authenticated` (`auth_failed`: `errors` say why each login failed; fix the credentials, rerun once for that `--role` — crawl and probe skip a role whose last login failed, they never retry it) |
 | Passive probe | `probe --phase passive` | `done` (rerun while `in_progress`) |
 | Crawl | `crawl` | `done` or `limit_reached` (rerun while `in_progress`; `auth_failed`: a role's login or re-login failed and it stopped with its items kept — rerun `auth` for it, then `crawl`) |
 | Active probe | `probe --phase active` | `done` (rerun while `in_progress`) |
@@ -236,7 +236,7 @@ held; cross-role replays of POST/PUT/PATCH are not.
    created (a successful create that landed on the record's URL), so it works for numeric ids;
    a rule on the run marker (`url_contains: appmap-<run_id>`) only matches slug URLs or labels
    carrying the marker. Other records need per-item decisions — check whether the id was
-   returned by one of the run's own writes (the "Records created by this run" section of
+   returned by one of the run's own writes (the "Records created or changed by this run" section of
    `APP-MAP.md` after a build, or the `exchanges` table).
 3. `$A approvals --run "$RUN" apply` loads the decisions (`counts.changed`); problems with the
    file are reported in `errors` (`approvals.yaml: rule #2 skipped: …`).

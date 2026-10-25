@@ -15,9 +15,9 @@ narrative enters through `names.yaml` (flow names/descriptions, form purposes).
 | Forms | `forms`, `fields` | Page, method, action endpoint, your purpose, result (succeeded / failed / not submitted), fields |
 | GraphQL operations | `endpoints` (`kind = 'graphql_op'`) | Type, operation name, endpoint, sources, exchange count |
 | Unexercised surface | `approvals` (pending, deny) | Held actions never performed, with reasons |
-| Coverage gaps | same lists as `appmap status --gaps` | Endpoints only from discovery sources; forms never submitted successfully; routes reached by no role; unexplored or failed actions |
+| Coverage gaps | same lists as `appmap status --gaps` | Endpoints only from discovery sources; forms never submitted successfully; routes reached by no role (redirect-only routes count as reached); unexplored or failed actions |
 | Observations | `observations`, `external_links` | 5xx, stack traces, debug pages, CAPTCHA, rate limiting; out-of-scope link count |
-| Records created by this run | `exchanges` (successful non-GET, non-login) | Cleanup candidates; marker matches listed first |
+| Records created or changed by this run | `exchanges` (successful non-GET, non-login) plus each executed approval's own request (any method) | Cleanup/restore candidates; marker matches listed first |
 | Where to dig deeper | — | Pointers to `appmap.sqlite`, `SCHEMA.md`, `events.jsonl`, `traffic/`, `appmap query` recipes |
 
 ## Naming guidance
@@ -37,5 +37,5 @@ consumer the form does not change state.
 1. Does every role have states and an auth status of "auth ok"?
 2. Is the role access matrix populated, and do `hidden-but-reachable` results make sense?
 3. Are the remaining gaps explained (approval denied, operator-only data, limits) in your report?
-4. Are the records created by this run listed for the operator's cleanup?
+4. Are the records created or changed by this run listed for the operator's cleanup?
 5. For production: is the handling notice present and repeated to the operator?
