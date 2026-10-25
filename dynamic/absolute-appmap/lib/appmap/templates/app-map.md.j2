@@ -1,0 +1,254 @@
+# Application map: {{ host }}
+
+{% if production %}
+> **Handling notice:** this run used the `production` profile. The run directory (including
+> this file, `appmap.sqlite`, `appmap.json`, `events.jsonl`, `traffic/`, `bodies/` and
+> `artifacts/`) may contain real production customer data, including PII. Credentials and
+> session tokens are redacted; everything else is kept. Treat it as sensitive engagement data:
+> store it encrypted, share it only with people authorized for this engagement, and delete it
+> when the engagement ends.
+
+{% endif %}
+## Run summary
+
+| | |
+|---|---|
+| Target | {% for t in summary.targets %}`{{ t | cell }}`{% if not loop.last %}, {% endif %}{% endfor %} |
+| Run id | `{{ summary.run_id }}` |
+| Profile | {{ summary.profile }} |
+| Roles | {% for r in summary.roles %}{{ r.name | cell }} ({{ r.login_type or "?" }}, {{ "auth ok" if r.auth_ok else ("auth FAILED" if r.auth_ok is not none else "auth not run") }}){% if not loop.last %}, {% endif %}{% endfor %} |
+| Started / updated | {{ summary.started }} / {{ summary.updated }} |
+| Crawl time | {{ summary.crawl_time or "n/a" }} (pass {{ summary.pass }}) |
+| Schema | {{ schema_version }} |
+
+Counts: {% for k, v in summary.counts.items() %}{{ k }} {{ v }}{% if not loop.last %} · {% endif %}{% endfor %}.
+
+## Route tree
+
+{% if routes.rows %}
+{% for r in routes.rows %}
+{{ "  " * r.depth }}- `{{ r.pattern }}`{% if routes.multi_host %} ({{ r.host }}){% endif %}{% if not r.prefix_only %}{% if r.kind == "spa_route" %} *(SPA route)*{% endif %}{% if r.sources %} — sources: {{ r.sources }}{% endif %}{% if r.reached_by %}; reached by: {{ r.reached_by }}{% else %}; not reached{% endif %}{% endif %}
+
+{% endfor %}
+{% if routes.more %}
+- … {{ routes.more }} more — see appmap.sqlite (`SELECT * FROM routes`)
+{% endif %}
+{% else %}
+No routes recorded.
+{% endif %}
+
+## Endpoint inventory
+
+{% if endpoints.groups %}
+{% for g in endpoints.groups %}
+### `{{ g.name }}` ({{ g.total }})
+
+| Method | Path | Kind | Statuses | Roles seen | Sources |
+|---|---|---|---|---|---|
+{% for e in g.rows %}
+| {{ e.method }} | `{{ e.path_pattern | cell }}`{% if e.graphql_op %} `{{ e.graphql_op | cell }}`{% endif %} | {{ e.kind }} | {{ e.statuses }} | {{ e.roles or "" }} | {{ e.sources or "" }} |
+{% endfor %}
+{% if g.more %}
+
+… {{ g.more }} more — see appmap.sqlite (`SELECT * FROM endpoints WHERE path_pattern LIKE '{{ g.name }}%'`)
+{% endif %}
+
+{% endfor %}
+{% if endpoints.more_groups %}
+… {{ endpoints.more_groups }} more groups ({{ endpoints.more_endpoints }} endpoints) — see appmap.sqlite (`SELECT * FROM endpoints`)
+
+{% endif %}
+{% else %}
+No endpoints recorded.
+
+{% endif %}
+{% if endpoints.static %}
+{{ endpoints.static }} static asset endpoint(s) omitted (`kind='static'`).
+
+{% endif %}
+## Role access matrix
+
+{% if matrix.rows %}
+Outcomes from cross-role replay: `allowed`, `redirect_login`, `forbidden`, `not_found`,
+`different_content`, `error`, `not_tested`.
+
+| Kind | Item |{% for r in matrix.roles %} {{ r | cell }} |{% endfor %}
+
+|---|---|{% for r in matrix.roles %}---|{% endfor %}
+
+{% for row in matrix.rows %}
+| {{ row.kind }} | `{{ row.item | cell }}` |{% for c in row.cells %} {{ c }} |{% endfor %}
+
+{% endfor %}
+{% if matrix.more %}
+
+… {{ matrix.more }} more — see appmap.sqlite (`SELECT * FROM role_access`)
+{% endif %}
+{% else %}
+No cross-role replay results (run `appmap probe --phase active`).
+{% endif %}
+
+## Key flows
+
+{% if flows.rows %}
+{% for f in flows.rows %}
+### {{ f.name }}
+
+Role: {{ f.role }} · origin: {{ f.origin }} · flow id {{ f.id }}
+{% if f.description and not f.generated %}
+
+{{ f.description }}
+{% endif %}
+
+{% for s in f.steps %}
+{{ s.ordinal }}. {% if s.type == "goto" %}goto `{{ s.url }}`{% else %}{{ s.type }} “{{ s.label }}”{% endif %}{% if s.method and s.type != "goto" %} → {{ s.method }} `{{ s.path_pattern or s.url }}`{% if s.status %} ({{ s.status }}){% endif %}{% endif %}{% if s.mutating %} **[mutating]**{% endif %}{% if s.transition_id %} · transition {{ s.transition_id }}{% endif %}{% if s.exchange_id %} · exchange {{ s.exchange_id }}{% endif %}
+
+{% endfor %}
+{% if f.more_steps %}
+… {{ f.more_steps }} more steps — see appmap.sqlite (`SELECT * FROM flow_steps WHERE flow_id={{ f.id }}`)
+{% endif %}
+{% if f.requires %}
+
+Preconditions (values produced outside this flow):
+{% for r in f.requires %}
+- `{{ r.json_path }}` from `{{ r.endpoint }}` (exchange {{ r.producer_exchange_id }}), used in the {{ r.consumer_location }} of exchange {{ r.consumer_exchange_id }}
+{% endfor %}
+{% endif %}
+
+{% endfor %}
+{% if flows.more %}
+… {{ flows.more }} more — see appmap.sqlite (`SELECT * FROM flows`)
+
+{% endif %}
+{% else %}
+No flows derived (no successful form submission or executed approval).
+
+{% endif %}
+## Forms
+
+{% if forms.rows %}
+| Form | Page | Method | Action | Purpose | Result | Fields |
+|---|---|---|---|---|---|---|
+{% for f in forms.rows %}
+| {{ f.label | cell }} (id {{ f.id }}{% if f.ids | length > 1 %}, {{ f.ids | length }} copies{% endif %}) | `{{ f.page | cell }}` | {{ f.method }} | {{ f.action | cell }} | {{ f.purpose | cell }} | {{ f.result }} | {{ f.fields | cell }} |
+{% endfor %}
+{% if forms.more %}
+
+… {{ forms.more }} more — see appmap.sqlite (`SELECT * FROM forms`)
+{% endif %}
+{% else %}
+No forms recorded.
+{% endif %}
+
+## GraphQL operations
+
+{% if graphql.rows %}
+| Type | Operation | Endpoint | Sources | Exchanges |
+|---|---|---|---|---|
+{% for g in graphql.rows %}
+| {{ g.graphql_type or "" }} | `{{ g.graphql_op | cell }}` | `{{ g.path_pattern | cell }}` | {{ g.sources or "" }} | {{ g.exchanges }} |
+{% endfor %}
+{% if graphql.more %}
+
+… {{ graphql.more }} more — see appmap.sqlite (`SELECT * FROM endpoints WHERE kind='graphql_op'`)
+{% endif %}
+{% else %}
+No GraphQL operations recorded.
+{% endif %}
+
+## Unexercised surface
+
+Actions held for approval and never performed: known surface that was not exercised.
+
+{% for key, title in [("pending_approvals", "Pending"), ("denied_approvals", "Denied")] %}
+{% set a = approvals[key] %}
+**{{ title }} ({{ a.total }})**
+
+{% if a.rows %}
+| Id | Role | Category | Label | Reasons |
+|---|---|---|---|---|
+{% for r in a.rows %}
+| {{ r.id }} | {{ r.role | cell }} | {{ r.category or "" }} | {{ r.label | cell }} | {{ r.reasons | join("; ") | cell }} |
+{% endfor %}
+{% if a.more %}
+
+… {{ a.more }} more — see appmap.sqlite (`SELECT * FROM approvals`)
+{% endif %}
+{% else %}
+None.
+{% endif %}
+
+{% endfor %}
+## Coverage gaps
+
+{% for key, title in [("unexercised_endpoints", "Endpoints known only from discovery sources"), ("unsuccessful_forms", "Forms never submitted successfully"), ("unreached_routes", "Routes reached by no role"), ("unexplored_actions", "Unexplored or failed actions")] %}
+{% set g = gaps[key] %}
+- **{{ title }}: {{ g.total }}**
+{% for r in g.rows %}
+  - {% if key == "unexercised_endpoints" %}{{ r.method }} `{{ r.path_pattern }}`{% if r.graphql_op %} {{ r.graphql_op }}{% endif %} ({{ r.sources | join(", ") }}){% elif key == "unsuccessful_forms" %}form {{ r.id }} on {{ r.state_id }} ({{ "attempted" if r.attempted else "not attempted" }}){% elif key == "unreached_routes" %}`{{ r.pattern }}` ({{ r.kind }}){% else %}{{ r.kind }} {{ r.role or "" }} {{ r.get("url") or r.get("label") or r.id }} — {{ r.status }}{% if r.get("reason") %}: {{ r.reason }}{% endif %}{% endif %}
+
+{% endfor %}
+{% if g.more %}
+  - … {{ g.more }} more — see `appmap status --run <run> --gaps`
+{% endif %}
+{% endfor %}
+
+## Observations
+
+{% if observations.rows %}
+{% for k in observations.kinds %}{{ k.kind }}: {{ k.n }}{% if not loop.last %} · {% endif %}{% endfor %}
+
+
+| Kind | Role | URL | Detail |
+|---|---|---|---|
+{% for o in observations.rows %}
+| {{ o.kind }} | {{ o.role or "" }} | `{{ o.url | cell }}` | {{ (o.detail or "")[:160] | cell }} |
+{% endfor %}
+{% if observations.more %}
+
+… {{ observations.more }} more — see appmap.sqlite (`SELECT * FROM observations`)
+{% endif %}
+{% else %}
+No observations.
+{% endif %}
+{% if external_links %}
+
+{{ external_links }} out-of-scope link(s) recorded (`SELECT * FROM external_links`).
+{% endif %}
+
+## Records created by this run
+
+{% if records.rows %}
+Successful (2xx/3xx) state-changing requests whose URL or body carries the run marker
+`{{ records.marker }}` (or its first {{ records.hint | length }} characters, `{{ records.hint }}`,
+where a field was too short for the whole marker). Use them for post-run cleanup.
+
+| Exchange | Role | Request | Status | Location |
+|---|---|---|---|---|
+{% for r in records.rows %}
+| {{ r.id }} | {{ r.role or "" }} | {{ r.method }} `{{ r.url | cell }}` | {{ r.status }} | {{ (r.location or "") | cell }} |
+{% endfor %}
+{% if records.more %}
+
+… {{ records.more }} more — see appmap.sqlite
+{% endif %}
+{% else %}
+No records identifiably created by this run.
+{% endif %}
+
+## Where to dig deeper
+
+- `appmap.sqlite` — the full map; schema, vocabularies and query recipes in `SCHEMA.md`.
+- `appmap.json` — the same tables as one JSON document (crawl-internal tables left out).
+- `events.jsonl` — every action and observation; `*_event` / `event_id` columns point here.
+- `traffic/<role>.har`, `bodies/`, `artifacts/` — raw HTTP, large bodies, screenshots and DOM.
+- `appmap query --run <run> <recipe>` with recipes `flows`, `forms-posting-to`,
+  `hidden-but-reachable`, `endpoint-shape`, `path-to-state`, `role-matrix`, `gaps`.
+
+Example queries:
+
+```sh
+sqlite3 appmap.sqlite "SELECT name, role FROM flows"
+sqlite3 appmap.sqlite "SELECT method, path_pattern, kind FROM endpoints WHERE kind != 'static'"
+sqlite3 appmap.sqlite "SELECT * FROM role_access WHERE outcome = 'allowed'"
+```

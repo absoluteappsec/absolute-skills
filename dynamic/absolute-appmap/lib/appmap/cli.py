@@ -11,7 +11,7 @@ from pathlib import Path
 from appmap import __version__
 
 COMMANDS = ["init", "auth", "crawl", "probe", "approvals", "build", "status", "query"]
-IMPLEMENTED = {"init", "auth", "crawl", "probe", "approvals", "status"}
+IMPLEMENTED = {"init", "auth", "crawl", "probe", "approvals", "build", "status"}
 
 log = logging.getLogger("appmap.cli")
 
@@ -79,6 +79,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="list: print pending items as JSON lines; write: refresh "
                         "approvals.yaml (keeps decisions, rules and notes); apply: load the "
                         "decisions and rules from approvals.yaml")
+    p = sub.add_parser("build", help="derive flows and value links; write appmap.json, "
+                                     "APP-MAP.md, SCHEMA.md and the names.yaml stub")
+    p.add_argument("--run", required=True, help="run directory")
+    p.add_argument("--names", help="names.yaml with flow names/descriptions and form purposes "
+                                   "(the run directory's names.yaml is always applied)")
     p = sub.add_parser("status", help="progress counts, coverage gaps and the next step")
     p.add_argument("--run", required=True, help="run directory")
     p.add_argument("--gaps", action="store_true",
@@ -449,6 +454,44 @@ def cmd_approvals(args) -> int:
     return 0
 
 
+def cmd_build(args) -> int:
+    from appmap.build import build_map
+    from appmap.crawl import make_redactor
+    from appmap.store import Store
+
+    try:
+        rd, cfg, meta = _open_run(args.run)
+        names = [Path(args.names)] if args.names else []
+        for p in names:
+            if not p.is_file():
+                raise FileNotFoundError(f"names file not found: {p}")
+        store = Store(rd.db_path)
+    except Exception as e:
+        emit_status("build", ok=False, status="error", errors=[str(e)])
+        return 1
+    run = _q(rd.root)
+    handler = _attach_log(rd, make_redactor(cfg))
+    try:
+        store.init_schema()
+        counts = build_map(store, rd, names)
+        pending = store.conn.execute(
+            "SELECT count(*) FROM approvals WHERE decision='pending'").fetchone()[0]
+        _write_meta(rd, cfg, meta, "complete")
+        log.info("build: %s", counts)
+    except Exception as e:
+        log.exception("build failed")
+        emit_status("build", ok=False, status="error", errors=[str(e)])
+        return 1
+    finally:
+        store.close()
+        _detach_log(handler)
+    nxt = None if args.names else \
+        f"appmap build --run {run} --names {_q(rd.root / 'names.yaml')}"
+    emit_status("build", ok=True, status="complete", counts=counts, pending_approvals=pending,
+                next=nxt)
+    return 0
+
+
 def _record_activity(rd) -> None:
     """Stamp meta.last_activity_ts so ``status --new-pass`` can tell a pass actually ran."""
     from appmap.gaps import record_activity
@@ -519,7 +562,7 @@ def cmd_status(args) -> int:
 
 
 HANDLERS = {"init": cmd_init, "auth": cmd_auth, "crawl": cmd_crawl, "probe": cmd_probe,
-            "approvals": cmd_approvals, "status": cmd_status}
+            "approvals": cmd_approvals, "build": cmd_build, "status": cmd_status}
 
 
 def main(argv: list[str] | None = None) -> int:
