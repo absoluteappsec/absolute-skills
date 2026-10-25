@@ -34,7 +34,7 @@ from ..frontier import Frontier
 from ..normalize import normalize_path
 from ..recording import STATIC_EXTS, body_shape, record_exchange
 from ..rundir import RunDir
-from ..spa.routes import concrete_url, observed_ids
+from ..spa.routes import concrete_url, created_ids, observed_ids
 from ..store import Store
 from ._common import expired, with_source
 
@@ -509,11 +509,15 @@ def _get_variations(p: _Prober, ep, rep, role: str) -> list[str]:
     path = [s for s in parts.path.split("/") if s]
     if len(idx) == 1 and len(path) == len(segs):
         i = idx[0]
-        ids: list[str] = []
+        # records the role's own writes created come first: they exist only because of
+        # this run, and replaying them links the write to its read (value_links)
+        seen = created_ids(p.store.conn, p.root, role, ep["path_pattern"], 50)
         for r in [role] + [n for n in p.sessions if n != role]:
-            for v in observed_ids(p.store.conn, p.root, r, ep["path_pattern"], 50):
-                if v != path[i] and v not in ids and _REDACTED not in v:
-                    ids.append(v)
+            seen += observed_ids(p.store.conn, p.root, r, ep["path_pattern"], 50)
+        ids: list[str] = []
+        for v in seen:
+            if v != path[i] and v not in ids and _REDACTED not in v:
+                ids.append(v)
         for v in ids[:_MAX_ID_VARIANTS]:
             new_path = "/" + "/".join(v if j == i else s for j, s in enumerate(path))
             out.append(urlunsplit((parts.scheme, parts.netloc, new_path, parts.query, "")))

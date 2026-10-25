@@ -57,11 +57,11 @@ operator runs it in their own terminal:
 2. Tell them: a browser window opens at the login page; log in as `<role>` (complete SSO/MFA);
    when the app shows the logged-in page, return to the terminal and press Enter; then paste you
    the final `APPMAP_STATUS` line.
-4. **Ask the operator to confirm they actually reached the logged-in page before pressing
+3. **Ask the operator to confirm they actually reached the logged-in page before pressing
    Enter.** A manual login is recorded as successful (`auth_ok = 1`) whenever Enter is pressed —
    the CLI cannot verify it — so the operator's confirmation is the only check. If they are unsure,
    repeat the login.
-3. A `form` role blocked by MFA or a CAPTCHA can be logged in the same way once:
+4. A `form` role blocked by MFA or a CAPTCHA can be logged in the same way once:
    `appmap auth --run <run> --role <role> --manual-login`. (Without `--role`, `--manual-login`
    turns every form and manual role into a manual login.)
 

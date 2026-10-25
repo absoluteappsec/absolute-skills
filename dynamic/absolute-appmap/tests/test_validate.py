@@ -177,3 +177,12 @@ def test_validate_catches_marketplace_missing_plugin(tmp_path):
     res = run_validate(_marketplace_layout(tmp_path, "./dynamic/absolute-appmap", name="other"))
     assert res.returncode == 1
     assert "does not list plugin" in res.stdout
+
+
+def test_validate_checks_usage_doc(plugin_copy):
+    (plugin_copy / "docs").mkdir(exist_ok=True)
+    (plugin_copy / "docs" / "usage.md").write_text(
+        "# Usage\n\n```bash\nscripts/appmap explode --run x\n```\n", encoding="utf-8")
+    res = run_validate(plugin_copy)
+    assert res.returncode == 1
+    assert "docs/usage.md" in res.stdout and "explode" in res.stdout

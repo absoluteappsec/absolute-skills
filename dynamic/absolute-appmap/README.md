@@ -82,11 +82,16 @@ $A probe --run "$RUN" --phase active
 $A approvals --run "$RUN" write            # decide items in approvals.yaml, then:
 $A approvals --run "$RUN" apply
 $A crawl --run "$RUN" --approved-only
+$A crawl --run "$RUN"                      # explore what approved actions revealed
 $A status --run "$RUN" --new-pass          # double back: read new_in_prev_pass
 $A status --run "$RUN" --gaps
 $A build --run "$RUN"                      # name flows in names.yaml, build again
 $A query --run "$RUN" role-matrix
 ```
+
+[`docs/usage.md`](docs/usage.md) walks through this sequence in detail: install, configuration
+and credentials, reading `APPMAP_STATUS`, budgets and resuming, approvals, output layout,
+querying and safety notes.
 
 ## Commands
 

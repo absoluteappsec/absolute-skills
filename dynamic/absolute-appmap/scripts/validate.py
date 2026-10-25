@@ -12,7 +12,7 @@ Checks (codereview's, plus appmap-specific ones):
 - SKILL.md body order: ## Purpose -> ## Step N ... -> ## Completion Criteria -> ## Reference Files.
 - Referenced references/*.md files exist (relative to the skill directory, "../<skill>/" allowed).
 - Every `appmap <subcommand>` written as code (inline or fenced) in the agent-facing
-  markdown (skills, commands, AGENTS.md, README.md) is a registered CLI subcommand
+  markdown (skills, commands, AGENTS.md, README.md, docs/usage.md) is a registered CLI subcommand
   (introspected from appmap.cli.build_parser()), and its --flags, query recipes and choice
   values exist.
 - Every scripts/<file> mentioned exists.
@@ -256,7 +256,9 @@ for path in skills:
 agent_md = sorted(set(glob.glob(os.path.join(ROOT, "skills", "**", "*.md"), recursive=True)
                       + glob.glob(os.path.join(ROOT, "commands", "*.md"))
                       + [p for p in (os.path.join(ROOT, "AGENTS.md"),
-                                     os.path.join(ROOT, "README.md")) if os.path.exists(p)]))
+                                     os.path.join(ROOT, "README.md"),
+                                     os.path.join(ROOT, "docs", "usage.md"))
+                         if os.path.exists(p)]))
 SCRIPT = re.compile(r"(?<![\w/.-])scripts/([\w-]+(?:\.\w+)?)")
 for path in agent_md:
     text = read(path)

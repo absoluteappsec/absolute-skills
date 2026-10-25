@@ -457,3 +457,26 @@ async def test_method_override_approval_blocks_post(browser, stub_server, make_c
     assert ("POST", "/projects/3") not in srv.requests
     assert access(rd, "endpoint", "x.method='POST' AND x.path_pattern='/projects/{id}'") == {
         "anonymous": "allowed", "guest": "not_tested"}
+
+
+async def test_replay_uses_ids_created_by_the_role(browser, spa_url, make_cfg, run_dir,
+                                                   tmp_path):
+    """Spec 'API replay': IDs observed in other responses include records the role's own
+    writes created, ahead of list ids (Task 22 e2e: POST /api/items -> GET /api/items/{id})."""
+    cfg = make_cfg(spa_url, roles=spa_roles(spa_url)[:1], limits=FAST)
+    rd = run_dir(tmp_path, cfg)
+    page = json.dumps({"items": [{"id": i, "title": f"Item {i}"} for i in range(1, 11)],
+                       "next_cursor": "10"}).encode()
+    seed(cfg, rd, role="admin", method="GET", url=spa_url + "/api/items?cursor=",
+         resp_body=page, resp_ct="application/json")
+    seed(cfg, rd, role="admin", method="GET", url=spa_url + "/api/items/1",
+         resp_body=b'{"id": 1, "title": "Item 1", "owner": "admin"}',
+         resp_ct="application/json")
+    seed(cfg, rd, role="admin", method="POST", url=spa_url + "/api/items", status=201,
+         req_body=b'{"title": "appmap-x"}', req_ct="application/json",
+         resp_body=b'{"id": 101, "title": "appmap-x", "owner": "admin"}',
+         resp_ct="application/json")
+    await run_active(cfg, rd, budget_minutes=5, browser=browser)
+    urls = {r["url"] for r in q(rd, "SELECT url FROM exchanges WHERE origin='replay' "
+                                    "AND method='GET' AND role='admin'")}
+    assert spa_url + "/api/items/101" in urls, sorted(urls)

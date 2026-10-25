@@ -173,6 +173,36 @@ def observed_ids(conn, root: Path | None, role: str, pattern: str, limit: int) -
     return ids[:limit]
 
 
+def created_ids(conn, root: Path | None, role: str, pattern: str, limit: int) -> list[str]:
+    """``id`` fields of the role's successful non-GET JSON responses (records its own
+    writes created) whose URL mentions the segment before ``pattern``'s one parameter."""
+    segs = [s for s in pattern.strip("/").split("/") if s]
+    idx = [i for i, s in enumerate(segs) if _PARAM_SEG.match(s)]
+    if len(idx) != 1:
+        return []
+    anchor = segs[idx[0] - 1] if idx[0] else None
+    ids: list[str] = []
+    for r in conn.execute("SELECT url, resp_body, resp_body_path, content_type FROM exchanges "
+                          "WHERE role=? AND upper(method) NOT IN ('GET','HEAD','OPTIONS') "
+                          "AND status BETWEEN 200 AND 299 ORDER BY id", (role,)):
+        if len(ids) >= limit:
+            break
+        if "json" not in (r["content_type"] or "").lower():
+            continue
+        if anchor and anchor not in urlsplit(r["url"]).path.split("/"):
+            continue
+        body = r["resp_body"]
+        if not body and root is not None and r["resp_body_path"]:
+            try:
+                body = (root / r["resp_body_path"]).read_text(encoding="utf-8")
+            except OSError:
+                body = None
+        for v in _json_ids(body):
+            if v not in ids:
+                ids.append(v)
+    return ids[:limit]
+
+
 def concrete_url(base_url: str, pattern: str, value: str) -> str:
     """``pattern`` with its parameter segment replaced by ``value``, joined to ``base_url``."""
     path = "/" + "/".join(value if _PARAM_SEG.match(s) else s
