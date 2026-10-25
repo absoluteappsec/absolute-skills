@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import json as _json
 import re
-from urllib.parse import quote, quote_plus, unquote
+from contextlib import contextmanager
+from urllib.parse import quote, quote_plus, unquote, urlsplit
 
 _JWT = re.compile(r"eyJ[\w-]+\.eyJ[\w-]+\.[\w-]*")
 _BEARER = re.compile(r"\bBearer\s+\S+", re.I)
@@ -26,6 +27,7 @@ _HTML_SECRET_NAME = re.compile(r"csrf|xsrf|authenticity|token|secret|api[-_]?key
 _HTML_VALUE = re.compile(r"""(\b(?:value|content)\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s"'>]+)""",
                          re.I)
 MIN_LEARNED_LEN = 8  # shorter runtime values (flags, locales) are too common to scrub
+MIN_SECRET_LEN = 4  # values the crawler typed into password inputs: scrubbed from 4 chars
 _HEADER_CONTAINER_KEYS = {"headers", "request_headers", "response_headers", "req_headers",
                           "resp_headers"}
 
@@ -57,6 +59,10 @@ class Redactor:
             if s:
                 self._variants |= _variants(s)
         self._patterns = [f"(?:{p})" for p in extra_patterns]
+        # (host, path) of a form action -> field names that were <input type=password>
+        # there; while ``scoped`` to that endpoint they redact like a password key.
+        self._pw_fields: dict[tuple[str, str], set[str]] = {}
+        self._scope: tuple[str, str] | None = None
         self._compile()
 
     def _compile(self) -> None:
@@ -81,6 +87,53 @@ class Redactor:
         self._compile()
         return True
 
+    def learn_secret(self, value: str | None) -> bool:
+        """Scrub ``value`` verbatim from now on: a value the crawler typed into an
+        ``<input type=password>`` (whatever the field is named). Unlike ``learn`` there
+        is no plain-word filter; values shorter than ``MIN_SECRET_LEN`` are ignored (too
+        common to scrub from every body; by-name redaction still covers them)."""
+        if not isinstance(value, str) or len(value) < MIN_SECRET_LEN \
+                or "<redacted:" in value:
+            return False
+        if value not in self._variants:
+            self._variants |= _variants(value)
+            self._compile()
+        return True
+
+    @staticmethod
+    def _endpoint(url: str) -> tuple[str, str]:
+        p = urlsplit(url)
+        return p.netloc.lower(), p.path.rstrip("/") or "/"
+
+    def learn_password_field(self, url: str, name: str) -> None:
+        """Field ``name`` of the form submitting to ``url`` is a password input: request
+        bodies/params of that endpoint redact it like a password key (see ``scoped``)."""
+        if name:
+            self._pw_fields.setdefault(self._endpoint(url), set()).add(name)
+
+    def password_fields(self) -> dict[str, list[str]]:
+        """``{"host/path": [names]}`` for persistence across invocations."""
+        return {f"{h}{p}": sorted(n) for (h, p), n in sorted(self._pw_fields.items())}
+
+    def load_password_fields(self, saved: dict) -> None:
+        for key, names in (saved or {}).items():
+            host, _, path = str(key).partition("/")
+            for n in names or []:
+                self._pw_fields.setdefault((host, "/" + path if path else "/"),
+                                           set()).add(str(n))
+
+    @contextmanager
+    def scoped(self, url: str | None):
+        """Redact as for a request to ``url``: password-type field names learned for
+        that endpoint count as password keys. Not re-entrant across awaits: use only
+        around synchronous redaction."""
+        prev = self._scope
+        self._scope = self._endpoint(url) if url else None
+        try:
+            yield self
+        finally:
+            self._scope = prev
+
     def learn_cookies(self, header: str, *, set_cookie: bool = False) -> None:
         """Learn every cookie value of a ``Cookie`` or (newline-joined) ``Set-Cookie``."""
         parts = [line.partition(";")[0] for line in header.split("\n")] if set_cookie \
@@ -97,6 +150,8 @@ class Redactor:
             return "authorization"
         if k in ("cookie", "set-cookie"):
             return "cookie"
+        if self._scope is not None and key in self._pw_fields.get(self._scope, ()):
+            return "password"
         for pat, kind in _KEY_RULES:
             if pat.search(key):
                 return kind

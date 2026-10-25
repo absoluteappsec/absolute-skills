@@ -356,11 +356,19 @@ def redact_text(redactor: Redactor, text: str, content_type: str | None = None) 
 
 
 def record_exchange(store: Store, events: EventLog, redactor: Redactor, rd: RunDir, *,
-                    role: str, origin: str, method: str, url: str, req_headers: dict,
-                    req_body: bytes | None, status: int, resp_headers: dict,
-                    resp_body: bytes | None, duration_ms: float, caused_by: str | None,
-                    known_patterns: list[str], source: str | None = None,
-                    attribute: bool | str = True) -> int:
+                    url: str, **kw) -> int:
+    """Record one exchange (see ``_record_exchange``), redacting with ``url``'s endpoint
+    scope: fields learned as password inputs of that form are redacted by name."""
+    with redactor.scoped(url):
+        return _record_exchange(store, events, redactor, rd, url=url, **kw)
+
+
+def _record_exchange(store: Store, events: EventLog, redactor: Redactor, rd: RunDir, *,
+                     role: str, origin: str, method: str, url: str, req_headers: dict,
+                     req_body: bytes | None, status: int, resp_headers: dict,
+                     resp_body: bytes | None, duration_ms: float, caused_by: str | None,
+                     known_patterns: list[str], source: str | None = None,
+                     attribute: bool | str = True) -> int:
     """``attribute``: False records the exchange without endpoint/response rows; "ok"
     attributes only 2xx responses (guessed paths that 404 leave no map entries);
     "ok_nonhtml" also skips HTML answers (a catch-all SPA serves index.html for every

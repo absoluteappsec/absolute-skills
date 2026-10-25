@@ -42,7 +42,7 @@ Conventions:
 | `approvals.category` | `delete`, `credential_change`, `payment`, `outbound_message`, `deactivate`, `logout`, `data_create` |
 | `approvals.decision` | `pending`, `approve`, `deny`, `skip` |
 | `roles.login_type` | `form`, `manual`, `none`, `storage_state` |
-| `observations.kind` | `server_error`, `rate_limited`, `stack_trace`, `debug_page`, `captcha` |
+| `observations.kind` | `server_error`, `rate_limited`, `stack_trace`, `debug_page`, `captcha`, `access_denied` (a 401 / login page answered while the role's session was confirmed alive) |
 | `value_links.consumer_location` | `path`, `query`, `body`, `header` |
 | `frontier.kind` (internal) | `url`, `action` |
 | `frontier.status` (internal) | `pending`, `done`, `skipped`, `queued_approval`, `failed` |
@@ -356,7 +356,7 @@ Destructive or held actions (mirrored in `approvals.yaml`).
 | `detail` | TEXT | Snippet or status text (redacted) |
 | `url` | TEXT | URL |
 | `role` | TEXT | Role |
-| `event_id` | TEXT | Event id of the `response` |
+| `event_id` | TEXT | Event id of the `response` (`access_denied`: of the `observation` event) |
 
 ### `external_links`
 

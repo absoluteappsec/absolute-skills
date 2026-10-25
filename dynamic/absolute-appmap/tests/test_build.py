@@ -599,11 +599,10 @@ def test_goto_step_carries_page_load_shape(ssr_run, tmp_path):
     store = Store(root / "appmap.sqlite")
     try:
         derive_flows(store)
-        pre = json.loads(_rows(store, "SELECT preconditions FROM flows WHERE role='admin'")[0]
-                         ["preconditions"])
-        goto = pre["steps"][0]
-        assert goto["type"] == "goto" and goto["method"] == "GET"
-        assert (goto["path_pattern"], goto["status"]) == ("/projects/new", 200)
+        gotos = [json.loads(r["preconditions"])["steps"][0]
+                 for r in _rows(store, "SELECT preconditions FROM flows WHERE role='admin'")]
+        assert all(g["type"] == "goto" and g["method"] == "GET" for g in gotos)
+        assert ("/projects/new", 200) in {(g["path_pattern"], g["status"]) for g in gotos}
     finally:
         store.close()
 

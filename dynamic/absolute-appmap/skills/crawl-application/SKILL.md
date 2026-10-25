@@ -37,6 +37,14 @@ app yourself to "help" the crawler.
 - The crawl never prompts for a manual login. If a `manual` role's session is lost mid-crawl (or
   any role's re-login fails), that role stops with `auth_failed` and its pending items kept;
   re-authenticate it with the operator (`authenticate-roles`), then rerun the crawl.
+- A 401 or a login-looking page is only a *candidate* session loss: many apps answer 401 (or
+  redirect to login) when a logged-in user opens a resource they do not own. The crawler
+  confirms with a known-authenticated probe (the role's post-login landing page, or a page
+  that answered only with a session); if the session is alive the page is recorded as a normal
+  state with an `access_denied` observation and no re-login. Only a confirmed loss re-logs
+  in; if the same URL still answers 401 after a successful re-login, it is recorded as denied
+  too, not counted toward the stop. The probe replay (`probe-endpoints`) does the same and
+  records such answers as `forbidden` in the role access matrix.
 
 ---
 
@@ -50,7 +58,7 @@ Read the `APPMAP_STATUS` line after every invocation:
 | `done` | The frontier is exhausted for the selected roles. Go to Step 4 |
 | `limit_reached` | `limits.max_runtime_minutes` total crawl time is used up. Stop crawling this run; this is a double-back stop condition. Tell the operator (they may raise the limit in the config) |
 | `paused_circuit` | **Stop.** The target returned too many 429/5xx responses. Tell the operator, quote `errors`, suggest lowering `max_requests_per_second`, and wait for their go-ahead before rerunning |
-| `auth_failed` | A role could not log in, or its session was lost and the re-login failed (wrong/changed password, expired manual session). That role stopped; its pending items are kept and nothing was marked failed. Run `next` (`appmap auth --run <run> --role R`; for a manual role the operator logs in by hand) via `authenticate-roles`, then rerun the crawl. Never retry the login in a loop yourself (account lockout) |
+| `auth_failed` | A role could not log in, or its session was confirmed lost (a liveness probe, not just a 401) and the re-login failed or kept being lost (wrong/changed password, expired manual session). That role stopped; its pending items are kept and nothing was marked failed. Run `next` (`appmap auth --run <run> --role R`; for a manual role the operator logs in by hand) via `authenticate-roles`, then rerun the crawl. Never retry the login in a loop yourself (account lockout) |
 | `error` | Read `errors` (and the tail of `<run>/crawl.log`). Fix the cause (missing session, config problem) before rerunning |
 
 Also read every time: `counts` (`states`, `transitions`, `forms`, `exchanges`,

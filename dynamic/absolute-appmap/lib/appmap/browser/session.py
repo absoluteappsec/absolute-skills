@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from playwright.async_api import Browser, BrowserContext, Page
 
@@ -35,6 +36,9 @@ class RoleSession:
     recorder: TrafficRecorder | None = None
     rd: RunDir | None = None
     origin: str = ""
+    # Where the last successful login landed (a page that needs the session): the first
+    # liveness probe when a 401 or login redirect may only mean "not yours".
+    landing_url: str | None = None
 
 
 def _origin(url: str) -> str:
@@ -57,6 +61,8 @@ def _spec_state_path(cfg: RunConfig, role: Role) -> Path | None:
     p = Path(raw).expanduser()
     return p if p.is_absolute() else cfg.source_path.parent / p
 
+
+_LANDING_KEY = "appmap_landing_url"  # extra key in the saved state file (not Playwright's)
 
 _SESSION_STORAGE_INIT = """(entries) => {
   if (!entries) return;
@@ -93,8 +99,10 @@ async def open_role_session(browser: Browser, cfg: RunConfig, rd: RunDir, role: 
             script=f"({_SESSION_STORAGE_INIT})(location.origin === {json.dumps(origin)} ? "
                    f"{json.dumps(session_storage)} : null)")
     await recorder.attach(context, role.name)
+    landing = state.get(_LANDING_KEY)
     return RoleSession(role, context, recorder.auth_headers[role.name], session_storage,
-                       recorder=recorder, rd=rd, origin=origin)
+                       recorder=recorder, rd=rd, origin=origin,
+                       landing_url=landing if isinstance(landing, str) else None)
 
 
 # -- state persistence -------------------------------------------------------
@@ -109,6 +117,8 @@ async def _save_state(sess: RoleSession, page: Page) -> Path:
     if o == sess.origin:
         sess.session_storage.update(snap)
     state["session_storage"] = {o: snap}
+    if sess.landing_url:
+        state[_LANDING_KEY] = sess.landing_url
     path = state_path(sess.rd, sess.role.name)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -232,6 +242,12 @@ async def login(sess: RoleSession, cfg: RunConfig, events: EventLog, *,
             await rec.drain()
             rec.origin_by_role.pop(role.name, None)
     if ok and page is not None:
+        landed = page.url
+        login_url = _login_url(cfg, role)
+        if landed.startswith(("http://", "https://")) and not (
+                _path(landed) == _path(login_url)
+                and urlsplit(landed).netloc == urlsplit(login_url).netloc):
+            sess.landing_url = landed
         await _save_state(sess, page)
     if page is not None:
         await page.close()
@@ -270,6 +286,70 @@ async def is_session_lost(sess: RoleSession, page: Page, last_status: int | None
             return loginish or not await _visible(page, spec.success_selector)
         return True
     return loginish
+
+
+_LOGIN_PATH = re.compile(r"log_?in|sign_?in|sign-in|log-in|auth", re.I)
+_LOGOUT_PATH = re.compile(r"log_?out|log-out|sign_?out|sign-out", re.I)
+
+
+def _lands_on_login(location: str, base_url: str, login_url: str | None) -> bool:
+    target = urljoin(base_url, location)
+    if login_url:
+        return _path(target) == _path(login_url)
+    return bool(_LOGIN_PATH.search(urlsplit(target).path or ""))
+
+
+def auth_probe_urls(sess: RoleSession, store, login_url: str | None, *,
+                    exclude: str | None = None, prefer_evidence: bool = False,
+                    limit: int = 2) -> list[str]:
+    """URLs that answer only with a live session, for confirming a *candidate* session
+    loss (a 401 or a login-looking page may just mean "not yours"): the role's
+    post-login landing URL, and GETs this role got 2xx for on endpoints that also
+    answered 401 or a redirect to login (evidence the endpoint needs a session).
+    ``prefer_evidence`` puts the latter first (direct requests: an SPA shell answers 200
+    either way). Empty when nothing is known: the caller then treats the loss as real."""
+    def usable(url: str | None) -> bool:
+        return bool(url) and url.startswith(("http://", "https://")) \
+            and "redacted" not in url and not _LOGOUT_PATH.search(urlsplit(url).path) \
+            and not (login_url and _path(url) == _path(login_url)) \
+            and not (exclude and url.split("#")[0] == exclude.split("#")[0])
+
+    evidence: list[str] = []
+    if store is not None:
+        gated: set[int] = set()
+        try:
+            for row in store.conn.execute(
+                    "SELECT endpoint_id, url, status, resp_headers FROM exchanges "
+                    "WHERE endpoint_id IS NOT NULL AND (status=401 OR status BETWEEN 300 "
+                    "AND 399) ORDER BY id DESC LIMIT 500"):
+                if row["status"] == 401:
+                    gated.add(row["endpoint_id"])
+                    continue
+                try:
+                    hdrs = json.loads(row["resp_headers"] or "{}")
+                except ValueError:
+                    hdrs = {}
+                loc = next((v for k, v in hdrs.items() if k.lower() == "location"), None) \
+                    if isinstance(hdrs, dict) else None
+                if isinstance(loc, str) and _lands_on_login(loc, row["url"], login_url):
+                    gated.add(row["endpoint_id"])
+            if gated:
+                marks = ",".join("?" * len(gated))
+                for (url,) in store.conn.execute(
+                        f"SELECT url FROM exchanges WHERE role=? AND upper(method)='GET' "
+                        f"AND status BETWEEN 200 AND 299 AND endpoint_id IN ({marks}) "
+                        f"ORDER BY id DESC LIMIT 50", (sess.role.name, *gated)):
+                    if usable(url) and url not in evidence:
+                        evidence.append(url)
+        except Exception:  # a probe list is best effort
+            evidence = []
+    landing = [sess.landing_url] if usable(sess.landing_url) else []
+    ordered = evidence + landing if prefer_evidence else landing + evidence
+    out: list[str] = []
+    for u in ordered:
+        if u not in out:
+            out.append(u)
+    return out[:limit]
 
 
 async def ensure_authenticated(sess: RoleSession, page: Page, cfg: RunConfig,

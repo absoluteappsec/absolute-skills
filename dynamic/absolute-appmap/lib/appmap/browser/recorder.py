@@ -406,7 +406,11 @@ class TrafficRecorder:
     def _redacted_har(self, path: Path) -> dict:
         har = json.loads(path.read_text(encoding="utf-8"))
         for entry in har.get("log", {}).get("entries", []):
-            self._redact_bodies(entry)
+            req = entry.get("request") if isinstance(entry, dict) else None
+            with self.redactor.scoped(req.get("url") if isinstance(req, dict) else None):
+                self._redact_bodies(entry)
+                if isinstance(req, dict):  # postData.params / queryString by endpoint
+                    entry["request"] = self.redactor.json(req)
         return self.redactor.json(har)
 
     @staticmethod

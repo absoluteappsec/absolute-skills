@@ -31,7 +31,7 @@ __all__ = ["derive_flows", "derive_value_links", "derive_preconditions", "emit_n
 # Crawl-internal tables: never exported, documented as internal in SCHEMA.md.
 INTERNAL_TABLES = ("frontier", "frontier_links")
 _INTERNAL_META_PREFIXES = ("approval_failed:", "approval_inflight:", "pass_")
-_INTERNAL_META_KEYS = {"pass", "last_activity_ts", "probe_active"}
+_INTERNAL_META_KEYS = {"pass", "last_activity_ts", "probe_active", "redact_password_fields"}
 
 # TEXT columns holding json.dumps values; decoded in appmap.json.
 JSON_COLUMNS = {

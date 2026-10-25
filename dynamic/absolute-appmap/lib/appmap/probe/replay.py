@@ -25,8 +25,8 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from playwright.async_api import Browser, async_playwright
 
 from ..approvals import ApprovalQueue, PendingAction
-from ..browser.session import (MAX_RELOGINS, RoleSession, is_session_lost, login,
-                               open_role_session, state_path)
+from ..browser.session import (MAX_RELOGINS, RoleSession, auth_probe_urls, is_session_lost,
+                               login, open_role_session, state_path)
 from ..config import RunConfig
 from ..destructive import ActionDescriptor, Flag, classify
 from ..direct import DirectClient
@@ -238,6 +238,7 @@ class _Sent:
     final_url: str
     shape: Any
     exchange_id: int | None
+    denied: bool = False  # 401/login redirect while the session was confirmed alive
 
 
 @dataclass
@@ -384,6 +385,33 @@ class _Prober:
         return sent.status == 401 or (_is_login_url(sent.final_url, self.login_url)
                                       and not _is_login_url(req.url, self.login_url))
 
+    async def _session_alive(self, role: str, req: _Req) -> bool | None:
+        """Confirm a candidate loss with a GET that needs the session (``auth_probe_urls``,
+        sent as origin ``login``: auth bookkeeping, never a representative). True: alive
+        (the 401 meant "not yours"); False: lost; None: nothing to probe with."""
+        sess = self.sessions[role]
+        urls = auth_probe_urls(sess, self.store, self.login_url, exclude=req.url,
+                               prefer_evidence=True)
+        for url in urls:
+            sent = await self._fetch(role, _Req("GET", url), "login", None)
+            if sent is None:
+                continue
+            alive = not (sent.status == 401 or _is_login_url(sent.final_url, self.login_url))
+            log.info("[%s] session liveness probe %s: %s", role, url,
+                     "alive" if alive else "lost")
+            return alive
+        return None
+
+    def _denied(self, role: str, sent: _Sent, req: _Req) -> _Sent:
+        sent.denied = True
+        if self.client.events is not None:
+            ev = self.client.events.emit("observation", role=role, kind="access_denied",
+                                         url=req.url, status=sent.status,
+                                         detail="denied with a live session")
+            self.store.add_observation("access_denied", "denied with a live session",
+                                       req.url, role, ev.id)
+        return sent
+
     async def _relogin(self, role: str) -> bool:
         sess, events = self.sessions[role], self.client.events
         if sess.recorder is None or events is None or sess.role.login.type == "manual" \
@@ -404,10 +432,20 @@ class _Prober:
         """Send ``req`` as ``role``; on an apparent session loss re-login once and retry.
         If the retry is redirected to login again, the redirect is the real answer."""
         sent = await self._fetch(role, req, origin, client)
-        if sent is not None and self._lost(role, sent, req) and await self._relogin(role):
-            sent = await self._fetch(role, req, origin, client)
-            if sent is not None and self._lost(role, sent, req):
+        if sent is None or not self._lost(role, sent, req):
+            return sent
+        # A 401 / login redirect is only a candidate loss: "not yours" answers 401 too.
+        alive = await self._session_alive(role, req)
+        if alive:
+            return self._denied(role, sent, req)
+        if not await self._relogin(role):
+            return sent
+        sent = await self._fetch(role, req, origin, client)
+        if sent is not None and self._lost(role, sent, req):
+            if alive is None:  # nothing to probe with: the redirect is the real answer
                 self.genuine_redirects.add(role)
+            elif await self._session_alive(role, req):
+                return self._denied(role, sent, req)  # re-logged in, still denied
         return sent
 
     async def send_once(self, role: str, req: _Req, origin: str, *, enqueue: bool = True,
@@ -787,6 +825,7 @@ class _Matrix:
                 else:
                     sent = await p.fetch(role, req, "cross_role")
                     self.cache[key] = (("error", None) if sent is None else (
+                        "forbidden" if sent.denied else
                         classify_outcome(base_status, base_shape, sent.status, sent.final_url,
                                          sent.shape, login, requested_url=req.url),
                         sent.exchange_id))

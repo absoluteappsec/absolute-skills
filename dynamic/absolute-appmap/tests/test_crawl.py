@@ -76,7 +76,8 @@ async def test_ssr_crawl_admin_and_alice(browser, ssr_url, make_cfg, run_dir, tm
     # list sampling: of 25 linked projects only `cap` are visited per role (+1: the project
     # the create form redirected to)
     n = q1(rd, "select count(*) from frontier where role='admin' and kind='url' "
-               "and url like '%/projects/%' and url not like '%/new'")
+               "and url like '%/projects/%' and url not like '%/new' "
+               "and url not like '%/private'")
     assert n <= FAST["max_states_per_route_pattern"] + 1
     assert stats.queued_approvals == q1(rd, "select count(*) from approvals where decision='pending'")
     assert rd.approvals_path.exists()
@@ -425,3 +426,86 @@ def test_cli_crawl_auth_failed_next(monkeypatch, ssr_url, make_cfg, tmp_path, ca
     assert not st["ok"] and st["status"] == "auth_failed"
     assert st["next"] == (f"appmap auth --run {shlex.quote(str(run))} --role sso "
                           "--manual-login")
+
+
+def _events(rd):
+    return [json.loads(line) for line in rd.events_path.read_text().splitlines()]
+
+
+async def test_forbidden_401_is_not_session_loss(browser, ssr_url, make_cfg, run_dir, tmp_path):
+    """Field fix 2: a logged-in user opening a resource they do not own gets 401 (as VTM
+    does). The session is confirmed alive with a known-authenticated probe, so the 401 is
+    recorded as an access-denied page, not a lost session: no re-login, no auth_failed."""
+    cfg = make_cfg(ssr_url, limits=FAST)
+    rd = run_dir(tmp_path, cfg)
+    stats = await run_crawl(cfg, rd, roles=["alice"], budget_minutes=5, browser=browser)
+    assert stats.status == "done", stats.warnings
+    assert stats.auth_failed == []
+    n401 = q1(rd, "select count(*) from exchanges where role='alice' and status=401 "
+                  "and url like '%/private'")
+    assert n401 >= 2
+    assert q1(rd, "select count(*) from frontier where role='alice' and url like '%/private' "
+                  "and status='done'") >= 2
+    events = _events(rd)
+    assert sum(1 for e in events if e["type"] == "login") <= 2  # initial + at most one
+    assert not [e for e in events if e["type"] == "session_lost"]
+    denied = [e for e in events if e["type"] == "observation"
+              and e["data"].get("kind") == "access_denied"]
+    assert len(denied) >= 2 and all(e["data"].get("status") == 401 for e in denied)
+    assert q1(rd, "select count(*) from observations where kind='access_denied' "
+                  "and role='alice'") >= 2
+
+
+async def test_forbidden_401_then_genuine_expiry_still_relogins(browser, ssr_url, make_cfg,
+                                                                run_dir, tmp_path):
+    """Genuine expiry (/__expire) after 401 pages still re-logs in and the crawl goes on."""
+    cfg = make_cfg(ssr_url, limits=FAST)
+    rd = run_dir(tmp_path, cfg)
+
+    async def expire_after_private():
+        while True:
+            await asyncio.sleep(0.01)
+            try:
+                if q1(rd, "select count(*) from exchanges where status=401") >= 1:
+                    break
+            except Exception:
+                continue
+        await asyncio.to_thread(urllib.request.urlopen, urllib.request.Request(
+            ssr_url + "/__expire", method="POST", data=b""))
+
+    t = asyncio.ensure_future(expire_after_private())
+    stats = await run_crawl(cfg, rd, roles=["alice"], budget_minutes=5, browser=browser)
+    await t
+    assert stats.status == "done", stats.warnings
+    events = _events(rd)
+    assert [e for e in events if e["type"] == "session_lost"]
+    assert sum(1 for e in events if e["type"] == "login" and e["data"].get("ok")) >= 2
+
+
+async def test_password_type_field_values_never_stored(browser, ssr_url, make_cfg, run_dir,
+                                                       tmp_path):
+    """Field fix 2: an <input type=password> whose name does not look like a password
+    (VTM's ``ssn``; here ``pin``) is redacted everywhere: the value the crawler typed is
+    learned as a literal secret before submitting. A type=text ``ssn`` is customer data
+    and kept."""
+    cfg = make_cfg(ssr_url, limits=FAST)
+    rd = run_dir(tmp_path, cfg)
+    stats = await run_crawl(cfg, rd, roles=["admin"], budget_minutes=5, browser=browser)
+    assert stats.status == "done", stats.warnings
+    pins = json.loads(urllib.request.urlopen(ssr_url + "/__pins").read())
+    assert pins, "the crawler never submitted the PIN form"
+    from urllib.parse import quote, quote_plus
+    needles = set()
+    for pin in pins:
+        needles |= {pin, quote(pin, safe=""), quote_plus(pin), json.dumps(pin)[1:-1]}
+    needles = {n.encode() for n in needles if n}
+    for f in rd.root.rglob("*"):
+        if f.is_file():
+            data = f.read_bytes()
+            assert not any(n in data for n in needles), f
+    posts = q(rd, "select req_body, req_body_path from exchanges where method='POST' "
+                  "and url like '%/account/pin'")
+    assert posts
+    body = posts[0]["req_body"] or (rd.root / posts[0]["req_body_path"]).read_text()
+    assert "pin=%3Credacted%3Apassword%3E" in body or "pin=<redacted:password>" in body
+    assert re.search(r"ssn=appmap", body)  # type=text ssn: customer data, kept

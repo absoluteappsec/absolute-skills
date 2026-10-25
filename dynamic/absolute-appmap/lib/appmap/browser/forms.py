@@ -437,8 +437,13 @@ async def _submit_without_button(page: Page, form: FormInfo) -> None:
 
 async def fill_and_submit(page: Page, form: FormInfo, gen: "DataGen", *, max_retries: int,
                           settle_ms: int,
-                          exchange_ids_since: Callable[[], list[int]] | None = None) -> SubmitResult:
-    """Fill ``form`` and submit; on validation failure retry (up to ``max_retries`` times) with hints."""
+                          exchange_ids_since: Callable[[], list[int]] | None = None,
+                          learn_secret: Callable[[str], object] | None = None) -> SubmitResult:
+    """Fill ``form`` and submit; on validation failure retry (up to ``max_retries`` times) with hints.
+
+    ``learn_secret`` receives every value typed into an ``<input type=password>`` (any
+    field name) before it is typed, so the run's redactor scrubs it from every stored
+    copy of the traffic it causes."""
     messages: dict[str, list[str]] = {}
     hints: dict[str, str] = {}
     baseline = set((await _inspect(page, form))["all"])
@@ -454,6 +459,8 @@ async def fill_and_submit(page: Page, form: FormInfo, gen: "DataGen", *, max_ret
         filled = 0
         for f in form.fields:
             value = gen.value_for(f, attempt, hints.get(f.name))
+            if learn_secret is not None and f.type == "password" and value not in (None, ""):
+                learn_secret(str(value))
             ok = await _fill_field(page, f, value)
             filled += ok
             if ok and f.name:

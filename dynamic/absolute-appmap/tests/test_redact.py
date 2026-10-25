@@ -148,3 +148,31 @@ def test_learned_runtime_values_scrubbed_everywhere():
     assert "6f1d2c3b4a59" not in out and "AAAA1111CCCC" not in out
     assert out.endswith("dark en 1")
     assert "6f1d2c3b4a59" not in json.dumps(r.json({"note": "token=6f1d2c3b4a59"}))
+
+
+def test_learn_secret_scrubs_short_plain_values_typed_into_password_inputs():
+    r = Redactor([], [])
+    assert not r.learn("Saturday")  # plain word: runtime learn ignores it
+    assert r.learn_secret("Saturday")  # but a value typed into a password input is scrubbed
+    assert r.learn_secret("4821")
+    assert not r.learn_secret("123")  # too short to scrub everywhere
+    out = r.text("<p>Saved pin 4821 on Saturday</p>")
+    assert "4821" not in out and "Saturday" not in out
+
+
+def test_password_field_names_redacted_only_for_their_endpoint():
+    r = Redactor([], [])
+    r.learn_password_field("http://h/register/?next=/", "ssn")
+    with r.scoped("http://h/register"):
+        assert r.form({"ssn": "123-45-6789", "name": "bob"}) == {
+            "ssn": "<redacted:password>", "name": "bob"}
+        assert r.url("http://h/register?ssn=123-45-6789") == \
+            "http://h/register?ssn=<redacted:password>"
+    with r.scoped("http://h/profile"):  # a type=text ssn elsewhere is customer data
+        assert r.form({"ssn": "123-45-6789"}) == {"ssn": "123-45-6789"}
+    assert r.form({"ssn": "123-45-6789"}) == {"ssn": "123-45-6789"}  # unscoped
+    saved = r.password_fields()
+    r2 = Redactor([], [])
+    r2.load_password_fields(saved)
+    with r2.scoped("http://h/register/"):
+        assert r2.key_kind("ssn") == "password"

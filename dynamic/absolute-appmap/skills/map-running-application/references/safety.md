@@ -94,6 +94,13 @@ executed twice.
   csrf/token/secret/password, and every value the session actually used (cookie values,
   `Authorization` and CSRF header values seen at runtime or saved by `appmap auth`, 8+ chars)
   wherever it appears verbatim. Add app-specific secret formats with `redact_patterns`.
+- `<input type="password">` fields are secrets whatever they are named (an app may make
+  `ssn` or `pin` a password input): every value the crawler types into one is learned as a
+  literal secret *before* the form is submitted (4+ chars) and scrubbed from every stored
+  copy — inline bodies, `bodies/` files, HAR, events, params examples, multipart parts and
+  urlencoded bodies — and the field's name is redacted like a password key in requests to
+  that form's endpoint (names are remembered across invocations in the run's metadata). The
+  same name in a `type="text"` field elsewhere is customer data and kept.
 - Login-only (`login_allow_hosts`, external IdP) and static-only (`static_allow_hosts`, CDN)
   hosts are never recorded as exchanges or endpoints; their traffic is only in the redacted HAR.
 - Saved sessions (cookies + web storage) live in

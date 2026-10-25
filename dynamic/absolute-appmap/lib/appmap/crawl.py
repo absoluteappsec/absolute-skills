@@ -28,8 +28,8 @@ from .browser.fingerprint import SKELETON_JS, dom_fingerprint, state_id
 from .browser.forms import FormInfo, discover_forms, fill_and_submit
 from .browser.locators import resolve
 from .browser.recorder import TrafficRecorder
-from .browser.session import (MAX_RELOGINS, RoleSession, is_session_lost, login,
-                              open_role_session, state_path)
+from .browser.session import (MAX_RELOGINS, RoleSession, auth_probe_urls, is_session_lost,
+                              login, open_role_session, state_path)
 from .browser.settle import install, wait_settled
 from .config import Role, RunConfig
 from .datagen import DataGen
@@ -723,10 +723,12 @@ class Crawler:
                     await asyncio.sleep(0.05)
                     await wait_settled(page, self.limits.quiet_window_ms)
                 else:
+                    self._learn_password_fields(page.url, form)
                     result = await fill_and_submit(
                         page, form, self.gen, max_retries=0,
                         settle_ms=self.limits.quiet_window_ms,
-                        exchange_ids_since=lambda: self._ids_since(mark, role))
+                        exchange_ids_since=lambda: self._ids_since(mark, role),
+                        learn_secret=self.redactor.learn_secret)
             except CircuitOpen:
                 error = "circuit breaker tripped during the action"
             except Exception as exc:
@@ -897,9 +899,72 @@ class Crawler:
         return ok
 
     async def _check_lost(self, sess: RoleSession, page: Page) -> None:
+        """A 401 or a login-looking page is only a *candidate* loss (field fix 2: apps
+        answer 401 to a logged-in user opening a resource they do not own). Confirmed
+        with a known-authenticated probe: a live session makes it an access-denied page
+        (recorded as a normal state, no re-login); only a dead one raises ``_Lost``."""
         last = self.recorder.last_status.get(sess.role.name)
-        if await is_session_lost(sess, page, last, sess.role.login.url):
-            raise _Lost()
+        if not await is_session_lost(sess, page, last, sess.role.login.url):
+            return
+        if await self._session_alive(sess, page.url):
+            self._record_denied(sess.role.name, page.url, last)
+            return
+        raise _Lost()
+
+    async def _session_alive(self, sess: RoleSession, current: str) -> bool:
+        """Load a page that needs the session (``auth_probe_urls``) in a separate tab:
+        alive unless it answers 401 or shows/redirects to the login form. Nothing to
+        probe, or the probe fails: not alive (the old behaviour: re-login)."""
+        role = sess.role.name
+        urls = auth_probe_urls(sess, self.store, sess.role.login.url, exclude=current)
+        if not urls:
+            return False
+        saved_guard, saved_last = self._guard, self._last_guard.get(role)
+        prev_origin = self.recorder.origin_by_role.get(role)
+        probe: Page | None = None
+        try:
+            probe = await self._open_page(sess)
+            self.recorder.origin_by_role[role] = "login"  # auth bookkeeping, not the map
+            for url in urls:
+                self._arm_guard(role, "load", [{"type": "goto", "url": self._safe_url(url)}])
+                try:
+                    resp = await probe.goto(url, wait_until="load")
+                except Exception:
+                    continue
+                try:
+                    await wait_settled(probe, self.limits.quiet_window_ms)
+                except Exception:
+                    pass
+                alive = not await is_session_lost(sess, probe, resp.status if resp else None,
+                                                  sess.role.login.url)
+                log.info("[%s] session liveness probe %s: %s", role, self.redactor.url(url),
+                         "alive" if alive else "lost")
+                return alive
+            return False
+        except Exception as exc:
+            log.warning("[%s] session liveness probe failed: %s", role, exc)
+            return False
+        finally:
+            if probe is not None and not probe.is_closed():
+                await probe.close()
+            await self.recorder.drain()
+            if prev_origin is None:
+                self.recorder.origin_by_role.pop(role, None)
+            else:
+                self.recorder.origin_by_role[role] = prev_origin
+            self._guard = saved_guard
+            if saved_last is not None:
+                self._last_guard[role] = saved_last
+            self.recorder.last_status[role] = None  # the item's own 401 was handled
+
+    def _record_denied(self, role: str, url: str, status: int | None) -> None:
+        safe = self.redactor.url(url)
+        detail = f"HTTP {status} with a live session" if status == 401 else \
+            "login page shown with a live session"
+        ev = self.events.emit("observation", role=role, kind="access_denied", url=safe,
+                              status=status, detail=detail)
+        self.store.add_observation("access_denied", detail, safe, role, ev.id)
+        log.info("[%s] access denied (session alive): %s %s", role, status, safe)
 
     async def _do_url(self, sess: RoleSession, page: Page, item: FrontierItem) -> str:
         role, url = sess.role.name, item.url
@@ -967,10 +1032,12 @@ class Crawler:
                 return "queued_approval"
             ev = self.events.emit("submit", role=role, label=form.label, method=form.method,
                                   action=form.action, url=self.redactor.url(page.url))
+            self._learn_password_fields(page.url, form)
             result = await fill_and_submit(
                 page, form, self.gen, max_retries=self.limits.max_form_retries,
                 settle_ms=self.limits.quiet_window_ms,
-                exchange_ids_since=lambda: self._ids_since(mark, role))
+                exchange_ids_since=lambda: self._ids_since(mark, role),
+                learn_secret=self.redactor.learn_secret)
             locs = form.submit_locators or next(
                 (f.locators for f in reversed(form.fields) if f.locators), [])
             label = form.label
@@ -1340,6 +1407,7 @@ class Crawler:
     def _push_form(self, role: str, st: _State, parent: list[dict], form: FormInfo,
                    depth: int) -> None:
         form_id = self._record_form(st.id, form)
+        self._learn_password_fields(st.url, form)
         if self._is_login_form(role, form):
             return  # never re-authenticate (or switch identity) through a crawled login form
         step = {"type": "submit", "form_label": form.label,
@@ -1428,6 +1496,21 @@ class Crawler:
             self.store.add_locator(ls, l["strategy"], self.redactor.text(l["value"]),
                                    l.get("rank", 0))
         return ls
+
+    def _learn_password_fields(self, page_url: str, form: FormInfo) -> None:
+        """Field fix 2: ``<input type=password>`` names (VTM's ``ssn``) redact like a
+        password key in requests to the form's endpoint, whatever they are called.
+        Persisted (names only) so later invocations and HAR finalization know them."""
+        names = [f.name for f in form.fields if f.type == "password" and f.name]
+        if not names:
+            return
+        target = urljoin(page_url, form.action) if form.action else page_url
+        before = self.redactor.password_fields()
+        for n in names:
+            self.redactor.learn_password_field(target, n)
+        after = self.redactor.password_fields()
+        if after != before:
+            self.store.set_meta("redact_password_fields", json.dumps(after))
 
     def _record_form(self, state: str, form: FormInfo) -> int:
         sub = self._locset(form.submit_locators) if form.submit_locators else None
@@ -1543,6 +1626,11 @@ def build_runtime(cfg: RunConfig, rd: RunDir) -> Runtime:
     _learn_saved_sessions(redactor, cfg, rd)
     store = Store(rd.db_path)
     store.init_schema()
+    try:
+        redactor.load_password_fields(
+            json.loads(store.get_meta("redact_password_fields") or "{}"))
+    except ValueError:
+        pass
     events = EventLog(rd.events_path, redactor)
     lim = cfg.limits
     gate = RequestGate(ScopeGuard(cfg.scope),

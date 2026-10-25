@@ -24,6 +24,7 @@ def create_app() -> Flask:
         state["next_id"] = 26
         state["sessions"] = {}
         state["passwords"] = {u: v["password"] for u, v in USERS.items()}
+        state["pins"] = []
 
     reset()
 
@@ -31,7 +32,8 @@ def create_app() -> Flask:
         admin_link = '<a href="/admin">Admin</a> ' if user and USERS[user]["role"] == "admin" else ""
         nav = ('<a href="/">Home</a> <a href="/projects">Projects</a> <a href="/about">About</a> '
                + admin_link
-               + ('<a href="/account/password">Account</a> <a href="/logout">Logout</a>'
+               + ('<a href="/account/password">Account</a> <a href="/account/pin">PIN</a> '
+                  '<a href="/logout">Logout</a>'
                   if user else '<a href="/login">Login</a>'))
         csrf = getattr(request, "csrf", None)
         meta = f'<meta name="csrf-token" content="{csrf}">' if csrf else ""
@@ -156,7 +158,16 @@ def create_app() -> Flask:
                     f"<p>Visibility: {p['visibility']}</p><p>Due: {escape(p['due'])}</p>"
                     f"<form method='post' action='/projects/{pid}/delete' "
                     "onsubmit=\"return confirm('Are you sure?')\">"
-                    "<button type='submit'>Delete</button></form>", request.user)
+                    "<button type='submit'>Delete</button></form>"
+                    f"<a href='/projects/{pid}/private'>Private notes</a>", request.user)
+
+    @app.get("/projects/<int:pid>/private")
+    def project_private(pid):
+        if (r := need_login()):
+            return r
+        if request.user == "alice":  # logged in, but not the owner: 401 (as some apps do)
+            return page("Unauthorized", "<p>Not your project</p>", request.user, status=401)
+        return page("Private notes", f"<p>Notes for project {pid}</p>", request.user)
 
     @app.post("/projects/<int:pid>/delete")
     def project_delete(pid):
@@ -199,6 +210,26 @@ def create_app() -> Flask:
                     "<label>New <input type='password' name='new'></label>"
                     "<label>Confirm <input type='password' name='confirm'></label>"
                     "<button type='submit'>Change</button></form>", request.user)
+
+    @app.route("/account/pin", methods=["GET", "POST"])
+    def account_pin():
+        if (r := need_login()):
+            return r
+        msg = ""
+        if request.method == "POST":
+            state["pins"].append(request.form.get("pin", ""))
+            # echoes the submitted values in text (a careless app)
+            msg = (f"<p>Saved pin {escape(request.form.get('pin', ''))} for SSN "
+                   f"{escape(request.form.get('ssn', ''))}</p>")
+        return page("Security PIN", msg + "<form method='post' action='/account/pin'>"
+                    "<label>SSN <input type='text' name='ssn'></label>"
+                    "<label>PIN <input type='password' name='pin'></label>"
+                    "<label>Confirm PIN <input type='password' name='pin_confirm'></label>"
+                    "<button type='submit'>Save</button></form>", request.user)
+
+    @app.get("/__pins")
+    def _pins():
+        return jsonify(state["pins"])
 
     @app.get("/about")
     def about():

@@ -176,6 +176,56 @@ async def test_expired_session_relogin(browser, ssr_url, make_cfg, run_dir, tmp_
     assert any(e["type"] == "session_lost" and e.get("role") == "alice" for e in events)
 
 
+async def test_forbidden_401_with_live_session_is_not_a_loss(browser, ssr_url, make_cfg,
+                                                              run_dir, tmp_path):
+    """Field fix 2: alice gets 401 for a project she does not own. Her session is
+    confirmed alive (a known-authenticated probe), so the 401 is ``forbidden``: no
+    session_lost, no re-login, and her loss detection still works afterwards."""
+    from appmap.cli import _auth
+
+    cfg = make_cfg(ssr_url, limits=FAST, discovery={"api_replay": False})
+    rd = run_dir(tmp_path, cfg)
+    for pid in (1, 2, 3):
+        seed(cfg, rd, role="admin", method="GET", url=f"{ssr_url}/projects/{pid}/private",
+             resp_body=b"<html><h1>Private notes</h1></html>")
+    assert all((await _auth(cfg, rd, cfg.roles, headed=False)).values())
+    await run_active(cfg, rd, budget_minutes=5, browser=browser)
+    got = access(rd, "endpoint", "x.method='GET' AND x.path_pattern='/projects/{id}/private'")
+    assert got["admin"] == "allowed" and got["alice"] == "forbidden"
+    assert got["anonymous"] == "redirect_login"
+    events = [json.loads(line) for line in rd.events_path.read_text().splitlines()]
+    assert not [e for e in events if e["type"] == "session_lost" and e.get("role") == "alice"]
+    assert sum(1 for e in events if e["type"] == "login" and e.get("role") == "alice") == 1
+    assert [e for e in events if e["type"] == "observation" and e.get("role") == "alice"
+            and e["data"].get("kind") == "access_denied"]
+
+
+async def test_expired_session_relogin_after_forbidden(browser, ssr_url, make_cfg, run_dir,
+                                                       tmp_path):
+    """Genuine expiry is still confirmed lost by the probe: re-login, then the item's
+    real answer (403 for alice on /admin)."""
+    from appmap.cli import _auth
+
+    cfg = make_cfg(ssr_url, limits=FAST, discovery={"api_replay": False})
+    rd = run_dir(tmp_path, cfg)
+    seed(cfg, rd, role="admin", method="GET", url=ssr_url + "/admin",
+         resp_body=b"<html><h1>Admin</h1></html>")
+    seed(cfg, rd, role="admin", method="GET", url=ssr_url + "/projects/1/private",
+         resp_body=b"<html><h1>Private notes</h1></html>")
+    assert all((await _auth(cfg, rd, cfg.roles, headed=False)).values())
+    urllib.request.urlopen(urllib.request.Request(ssr_url + "/__expire", method="POST",
+                                                  data=b"")).read()
+    await run_active(cfg, rd, budget_minutes=5, browser=browser)
+    assert access(rd, "endpoint", "x.method='GET' AND x.path_pattern='/admin'")["alice"] \
+        == "forbidden"
+    assert access(rd, "endpoint", "x.method='GET' AND "
+                  "x.path_pattern='/projects/{id}/private'")["alice"] == "forbidden"
+    events = [json.loads(line) for line in rd.events_path.read_text().splitlines()]
+    assert any(e["type"] == "session_lost" and e.get("role") == "alice" for e in events)
+    assert sum(1 for e in events if e["type"] == "login" and e.get("role") == "alice"
+               and e["data"].get("ok")) == 2
+
+
 async def test_cross_role_put_not_held_delete_held(browser, spa_url, make_cfg, run_dir,
                                                    tmp_path):
     cfg = make_cfg(spa_url, roles=spa_roles(spa_url), limits=FAST)
