@@ -5,6 +5,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 
@@ -41,6 +42,28 @@ def _key(role, action_path, label, predicted_request) -> str:
                        pr.get("url") or ""], sort_keys=True)
 
 
+def _target_key(role, label, action_path, predicted_request) -> str | None:
+    """Field fix 3: the request an item acts on (with its label), for de-duplicating
+    re-queued items (the same list control re-found at another position after the list
+    shifted). Non-GET predicted
+    requests, and GETs that are the action itself (a link's href, a goto, a request
+    step); never a GET that is merely the page a control sits on."""
+    pr = predicted_request or {}
+    method, url = str(pr.get("method") or "").upper(), pr.get("url")
+    if not method or not url:
+        return None
+    if method == "GET":
+        last = (action_path or [{}])[-1] if action_path else {}
+        own = (last.get("type") in ("goto", "request")
+               or (last.get("type") == "click" and last.get("href") == url))
+        if not own:
+            return None
+    p = urlsplit(url)
+    norm = urlunsplit((p.scheme.lower(), p.netloc.lower(), p.path.rstrip("/") or "/",
+                       p.query, ""))
+    return json.dumps([role, label or "", method, norm])
+
+
 def _request_url(predicted_request, action_path) -> str:
     if predicted_request and predicted_request.get("url"):
         return predicted_request["url"]
@@ -69,10 +92,13 @@ class ApprovalQueue:
 
     def enqueue(self, pa: PendingAction) -> str:
         want = _key(pa.role, pa.action_path, pa.label, pa.predicted_request)
+        target = _target_key(pa.role, pa.label, pa.action_path, pa.predicted_request)
         n = 0
         for r in self._rows():
-            if _key(r["role"], _loads(r["action_path"]) or [], r["label"],
-                    _loads(r["predicted_request"])) == want:
+            path, pred = _loads(r["action_path"]) or [], _loads(r["predicted_request"])
+            if _key(r["role"], path, r["label"], pred) == want or (
+                    target is not None
+                    and _target_key(r["role"], r["label"], path, pred) == target):
                 if pa.created_by_run and not r["created_by_run"]:
                     self.store.upsert_approval(r["id"], created_by_run=True)
                 pa.id = r["id"]
@@ -182,6 +208,10 @@ class ApprovalQueue:
                 decided_in_items.add(id_)
                 if current[id_]["decision"] != d:
                     self.store.upsert_approval(id_, decision=d, decided_by="user")
+                    if d == "approve" and current[id_]["decision"] == "pending":
+                        # re-approved by the human after a 'target moved' failure
+                        self.store.conn.execute("DELETE FROM meta WHERE key=?",
+                                                (_FAILED_KEY + id_,))
                     changed += 1
             elif d == "pending":
                 if current[id_]["decision"] != "pending":
@@ -198,9 +228,10 @@ class ApprovalQueue:
                 self.warnings.append(f"rule #{n} skipped: {err}")
             else:
                 rules.append(rule)
+        failed = self.failures()
         for id_, r in current.items():
-            if id_ in decided_in_items or r["decision"] != "pending":
-                continue
+            if id_ in decided_in_items or r["decision"] != "pending" or id_ in failed:
+                continue  # a failed item (target moved) waits for the human
             pa = self._to_pa(r)
             for rule in rules:
                 if self._rule_matches(rule["match"], pa):
@@ -233,6 +264,14 @@ class ApprovalQueue:
         """Items whose final action started but whose run never recorded the outcome."""
         return {r["key"][len(_INFLIGHT_KEY):]: r["value"] for r in self.store.conn.execute(
             "SELECT key, value FROM meta WHERE key LIKE ?", (_INFLIGHT_KEY + "%",))}
+
+    def needs_reapproval(self, id: str, reason: str) -> None:
+        """Field fix 3: the approved target moved / its predicted request was not seen.
+        Not executed; back to ``pending`` (also in approvals.yaml) with the reason. Rules
+        never re-decide it: only the human setting ``approve`` again retries it."""
+        self.unmark_started(id)
+        self.mark_failed(id, reason)
+        self.set_decision(id, "pending", decided_by="appmap")
 
     def mark_failed(self, id: str, reason: str) -> None:
         """Record why an approved item could not be (fully) executed."""

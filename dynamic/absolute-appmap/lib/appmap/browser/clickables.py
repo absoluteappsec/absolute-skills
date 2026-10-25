@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from playwright.async_api import Page
 
 from ..destructive import ActionDescriptor, classify
-from .locators import LOCATOR_JS, _locator, rank_locators
+import json
+
+from .locators import ANCHOR_JS, LOCATOR_JS, _locator, rank_locators
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +31,7 @@ class Clickable:
 
 _COLLECT_JS = """() => {
   const locate = (%(locator)s);
+  const anchorOf = (%(anchor)s);
   const ROLES = new Set(%(roles)s);
   const SKIPTAG = new Set(['HTML', 'BODY', 'HEAD', 'SCRIPT', 'STYLE', 'META', 'LINK', 'SVG', 'PATH']);
   const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
@@ -57,10 +60,11 @@ _COLLECT_JS = """() => {
       || norm(el.getAttribute('title')) || (el.tagName === 'INPUT' ? norm(el.value) : '');
     els.push(el);
     list.push({reason, tag: el.tagName.toLowerCase(), role, label, raw,
-               href: el.tagName === 'A' ? el.getAttribute('href') : null});
+               href: el.tagName === 'A' ? el.getAttribute('href') : null,
+               anchor: /:nth-of-type\\(/.test(raw.css) ? anchorOf(el) : null});
   }
   return {items: list, truncated};
-}""" % {"locator": LOCATOR_JS, "roles": '["button","link","tab","menuitem","option"]', "cap": MAX_CANDIDATES}
+}""" % {"locator": LOCATOR_JS, "anchor": ANCHOR_JS, "roles": '["button","link","tab","menuitem","option"]', "cap": MAX_CANDIDATES}
 
 
 async def _listener_indexes(page: Page, indexes: list[int]) -> set[int]:
@@ -127,6 +131,12 @@ async def enumerate_clickables(page: Page) -> list[Clickable]:
         if key in seen:
             continue
         seen.add(key)
+        a = c.get("anchor")
+        if a and (a.get("attr") or a.get("href") or a.get("row")) \
+                and all(l["strategy"] in ("css", "xpath") for l in locs):
+            # Only positional locators: pin the row it acts on (field fix 3).
+            locs.append({"strategy": "anchor", "value": json.dumps(a, sort_keys=True),
+                         "rank": len(locs)})
         out.append(Clickable(locs, c["tag"], c["role"] or None, c["label"], c["href"], reason))
     return out
 

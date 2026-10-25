@@ -26,7 +26,7 @@ from .approvals import ApprovalQueue, PendingAction
 from .browser.clickables import Clickable, enumerate_clickables, expand_reveals
 from .browser.fingerprint import SKELETON_JS, dom_fingerprint, state_id
 from .browser.forms import FormInfo, discover_forms, fill_and_submit
-from .browser.locators import resolve
+from .browser.locators import anchor_of, resolve
 from .browser.recorder import TrafficRecorder
 from .browser.session import (MAX_RELOGINS, RoleSession, auth_probe_urls, blocked_message,
                               is_session_lost, login, login_blocked, open_role_session,
@@ -58,6 +58,7 @@ ACTION_TIMEOUT_MS = 5000
 _NTH = re.compile(r":nth-of-type\(\d+\)")
 _SKIP_CLICK_TAGS = {"select", "textarea", "option", "label"}
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+_NOT_OBSERVED = "target moved/predicted request not observed"
 _MAX_VALUES_TRIED = 20  # per field, most recent kept
 
 # Every <form>: xpath (same algorithm as LOCATOR_JS), effective method, action, confirm hint.
@@ -122,6 +123,10 @@ class _Lost(Exception):
 
 class _Fail(Exception):
     """A step of an item could not be performed (unresolvable locator, navigation error)."""
+
+
+class _Moved(_Fail):
+    """An approved action's target is no longer where it was (field fix 3)."""
 
 
 class _NotRunnable(Exception):
@@ -529,6 +534,17 @@ class Crawler:
             out.append((aid, reason))
         return out
 
+    def _approval_moved(self, a: PendingAction, reason: str, *,
+                        started: bool = False) -> tuple[str, str]:
+        """Field fix 3: the approved target moved (list shifted, row gone) or its predicted
+        request was not observed. Not executed; back to pending until the human
+        approves it again (rules do not re-approve it)."""
+        self.queue.needs_reapproval(a.id, reason)
+        self.events.emit("error", role=a.role, approval_id=a.id,
+                         message=f"approved action not executed: {reason}; back to pending "
+                                 "(re-approve to retry)")
+        return "failed", f"{reason}; not executed, back to pending (re-approve to retry)"
+
     def _approval_failed(self, a: PendingAction, reason: str) -> tuple[str, str]:
         """An approved item that could not be executed (nothing destructive was sent)."""
         self.queue.mark_failed(a.id, reason)
@@ -718,11 +734,13 @@ class Crawler:
         form = loc = None
         try:  # locate the control before anything is let through
             if step["type"] == "click":
-                loc = await self._resolve(page, step["locators"])
+                loc = await self._resolve(page, step["locators"], strict=True)
             elif step["type"] == "submit":
                 form = await self._find_form(page, step)
                 if form is None:
                     raise _Fail(f"form {step.get('form_label')!r} not found after restore")
+        except _Moved as exc:
+            return self._approval_moved(a, str(exc))
         except _Fail as exc:
             return self._approval_failed(a, str(exc))
         pred = a.predicted_request or {}
@@ -778,10 +796,23 @@ class Crawler:
                     self.recorder.origin_by_role.pop(role, None)
             finished = True
         finally:
-            self._finish_approval(a, role, (ev or started).id, mode, label, mark, error,
-                                  not finished,
-                                  allowed_requests=[f"{m} {u}" for m, u in allowed],
-                                  blocked_requests=[f"{m} {u}" for _f, m, u in hits])
+            # Field fix 3: a predicted write that never went out (blocked as another
+            # request, or nothing sent) means the control no longer acts on that target.
+            moved = finished and error is None and match is not None and not allowed
+            if moved:
+                self.events.emit("approval_executed", role=role, caused_by=(ev or started).id,
+                                 approval_id=a.id, category=a.category, label=label,
+                                 mode=mode, exchange_ids=self._ids_since(mark, role),
+                                 outcome="not_observed", error=_NOT_OBSERVED,
+                                 allowed_requests=[],
+                                 blocked_requests=[f"{m} {u}" for _f, m, u in hits])
+            else:
+                self._finish_approval(a, role, (ev or started).id, mode, label, mark, error,
+                                      not finished,
+                                      allowed_requests=[f"{m} {u}" for m, u in allowed],
+                                      blocked_requests=[f"{m} {u}" for _f, m, u in hits])
+        if moved:
+            return self._approval_moved(a, _NOT_OBSERVED, started=True)
         if error:
             return "failed", f"approved action: {error}"
         await self._after_approved(sess, page, step, src, ev.id, label,
@@ -1257,15 +1288,17 @@ class Crawler:
             else:
                 raise _Fail(f"cannot replay a {step['type']!r} step while restoring state")
 
-    async def _resolve(self, page: Page, locators: list[dict]):
-        loc = await resolve(page, locators)
+    async def _resolve(self, page: Page, locators: list[dict], *, strict: bool = False):
+        loc = await resolve(page, locators, strict=strict)
         if loc is None:  # control may sit behind a collapsed menu/tab
             try:
                 await expand_reveals(page, self.cfg.profile)
             except Exception:
                 pass
-            loc = await resolve(page, locators)
+            loc = await resolve(page, locators, strict=strict)
         if loc is None:
+            if strict and anchor_of(locators) is not None:
+                raise _Moved("target moved: the anchored row/control is no longer on the page")
             raise _Fail("locator did not resolve to exactly one element")
         return loc
 
@@ -1273,6 +1306,12 @@ class Crawler:
         forms = await discover_forms(page)
         want = _xpath(step.get("locators") or [])
         label = step.get("form_label", "")
+        action = step.get("action")
+        if action:  # a row's form posts to its own record: never another row's form
+            same = [f for f in forms if f.label == label and f.action
+                    and self._safe_url(urljoin(page.url, f.action)) == action]
+            if same:
+                forms = same
         for f in forms:
             if f.label == label and want and _xpath(f.submit_locators) == want:
                 return f
@@ -1397,7 +1436,11 @@ class Crawler:
             if groups[sig] >= self.cap:  # list/card sampling
                 continue
             groups[sig] += 1
-            href = urljoin(page.url, c.href) if c.href else None
+            raw_href = (c.href or "").strip()
+            # An in-page anchor (#..., javascript:) does not request its page: no href,
+            # so it neither predicts a GET of the page nor classifies by its URL.
+            href = urljoin(page.url, raw_href) if raw_href and not raw_href.startswith("#") \
+                and urlsplit(urljoin(page.url, raw_href)).scheme in ("http", "https") else None
             step = {"type": "click", "locators": self._safe_locs(c.locators), "label": c.label}
             if href:
                 step["href"] = self._safe_url(href)
@@ -1543,6 +1586,8 @@ class Crawler:
         return [{**l, "value": self.redactor.text(l["value"])} for l in locs]
 
     def _locset(self, locs: list[dict]) -> int:
+        # the content anchor lives in action paths only (not a selector strategy)
+        locs = [l for l in locs if l.get("strategy") != "anchor"]
         ls = self.store.add_locator_set(locs[0]["strategy"] if locs else None)
         for l in locs:
             self.store.add_locator(ls, l["strategy"], self.redactor.text(l["value"]),
