@@ -8,12 +8,14 @@ init -> auth -> probe --phase passive -> crawl (while in_progress) -> probe --ph
 -> approvals write -> (human decisions in approvals.yaml) -> approvals apply
 -> crawl --approved-only -> crawl -> status --new-pass -> status --gaps -> build
 """
+import base64
 import json
 import os
 import re
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -29,6 +31,9 @@ BUDGET = "1"          # minutes per crawl/probe invocation; loop until not in_pr
 MAX_RERUNS = 12
 LIMITS = {"max_requests_per_second": 200, "quiet_window_ms": 150,
           "max_states_per_route_pattern": 3}
+
+
+_NOISE = re.compile(r"Warning|Traceback|Error", re.I)
 
 
 # -- instrumented fixture servers ----------------------------------------------------
@@ -63,6 +68,7 @@ class Instrumented:
         self.server = StubServer(self.app)
         self.url = self.server.url
 
+
     def stop(self):
         self.server.stop()
 
@@ -70,8 +76,9 @@ class Instrumented:
 # -- running the CLI like an agent ---------------------------------------------------
 class Agent:
     def __init__(self, cache: Path):
+        # "default" shows every warning once (incl. DeprecationWarning) so none hides
         self.env = {**os.environ, **FIXTURE_ENV, "XDG_CACHE_HOME": str(cache),
-                    "PYTHONWARNINGS": "ignore"}
+                    "PYTHONWARNINGS": "default"}
         self.statuses: list[dict] = []
 
     def run(self, *args: str, expect_ok: bool = True) -> tuple[dict, list[str]]:
@@ -82,6 +89,8 @@ class Agent:
             f"appmap {' '.join(args)}: no status line\nstdout:{proc.stdout}\n"
             f"stderr:{proc.stderr[-3000:]}")
         st = json.loads(lines[-1].removeprefix("APPMAP_STATUS "))
+        noisy = [ln for ln in proc.stderr.splitlines() if _NOISE.search(ln)]
+        assert not noisy, f"appmap {' '.join(args)} wrote warnings/errors:\n{proc.stderr}"
         assert set(st) == {"command", "ok", "status", "counts", "pending_approvals",
                            "errors", "next"}
         self.statuses.append(st)
@@ -160,10 +169,12 @@ def workflow(server: Instrumented, tmp: Path, roles: list[dict], created_sql: st
 
     st, _ = agent.run("auth", "--run", r)
     assert st["status"] == "authenticated", st
-    agent.until_done("probe", "--run", r, "--phase", "passive", "--budget-minutes", BUDGET)
+    st = agent.until_done("probe", "--run", r, "--phase", "passive", "--budget-minutes", BUDGET)
+    assert st["status"] == "done", st
     st = agent.until_done("crawl", "--run", r, "--budget-minutes", BUDGET)
     assert st["status"] == "done", st
-    agent.until_done("probe", "--run", r, "--phase", "active", "--budget-minutes", BUDGET)
+    st = agent.until_done("probe", "--run", r, "--phase", "active", "--budget-minutes", BUDGET)
+    assert st["status"] == "done", st
 
     st, _ = agent.run("approvals", "--run", r, "write")
     assert st["status"] == "written"
@@ -192,19 +203,71 @@ def workflow(server: Instrumented, tmp: Path, roles: list[dict], created_sql: st
 
 
 # -- shared checks -------------------------------------------------------------------
+def _b64_forms(secret: bytes) -> set[bytes]:
+    """Base64 (standard and URL-safe, padded or not) of ``secret`` as it would appear
+    inside a longer encoded blob at any of the three byte alignments."""
+    out = set()
+    for k in range(3):
+        enc = base64.b64encode(b"\0" * k + secret).rstrip(b"=")
+        tail = 1 if (k + len(secret)) % 3 else 0   # last char also encodes the next byte
+        core = enc[(0, 2, 3)[k]:len(enc) - tail]  # skip chars that encode the prefix
+        out |= {core, core.translate(bytes.maketrans(b"+/", b"-_"))}
+    out |= {base64.b64encode(secret), base64.urlsafe_b64encode(secret)}
+    return out
+
+
+def _har_decoded(data: bytes) -> bytes:
+    """Base64-encoded HAR bodies (``content.encoding == "base64"``), decoded."""
+    out = []
+    for e in json.loads(data)["log"]["entries"]:
+        for part in (e.get("response", {}).get("content", {}), e.get("request", {})
+                     .get("postData", {})):
+            if part.get("encoding") == "base64" and part.get("text"):
+                out.append(base64.b64decode(part["text"] + "=" * (-len(part["text"]) % 4)))
+    return b"\n".join(out)
+
+
 def assert_no_secrets(run: Path, secrets: set[str]) -> None:
-    """Review Focus 3: no password, raw sid cookie or JWT anywhere in the run directory."""
-    needles = {s for s in set(PASSWORDS) | secrets if s}
-    assert len(needles) > len(PASSWORDS), "no session secret was captured from the fixture"
+    """Review Focus 3: no password, raw sid cookie or JWT anywhere in the run directory —
+    neither verbatim nor base64-encoded, and not inside base64 HAR bodies."""
+    raw = {s.encode() for s in set(PASSWORDS) | secrets if s}
+    assert len(raw) > len(PASSWORDS), "no session secret was captured from the fixture"
+    needles = {n: n for n in raw}
+    for n in raw:
+        for form in _b64_forms(n):
+            needles[form] = n
     hits = []
     files = [p for p in run.rglob("*") if p.is_file()]
-    assert any(p.name.endswith(".har") for p in files)
+    assert any(p.suffix == ".har" for p in files)
     for p in files:
         data = p.read_bytes()
-        for n in needles:
-            if n.encode() in data:
-                hits.append(f"{p.relative_to(run)}: {n[:12]}...")
+        if p.suffix == ".har":
+            data += b"\n" + _har_decoded(data)
+        for form, n in needles.items():
+            if form in data:
+                hits.append(f"{p.relative_to(run)}: {n[:12]!r}... as {form[:16]!r}")
     assert not hits, hits
+
+
+def test_secret_scan_catches_encoded_secrets(tmp_path):
+    """The scanner itself: verbatim, base64/urlsafe at any alignment, and base64 HAR bodies."""
+    sid = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+    har = {"log": {"entries": [{"request": {}, "response": {"content": {
+        "encoding": "base64",
+        "text": base64.b64encode(b'{"pw": "' + PASSWORDS[0].encode() + b'"}').decode()}}}]}}
+    cases = {
+        "traffic/x.har": json.dumps(har).encode(),
+        "a.txt": b"zz" + base64.urlsafe_b64encode(b"xy" + sid.encode() + b"q").rstrip(b"="),
+        "b.txt": PASSWORDS[1].encode(),
+    }
+    for name, data in cases.items():
+        run = tmp_path / name.replace("/", "_")
+        (run / "traffic").mkdir(parents=True)
+        (run / "traffic" / "clean.har").write_text('{"log": {"entries": []}}')
+        (run / name).parent.mkdir(parents=True, exist_ok=True)
+        (run / name).write_bytes(data)
+        with pytest.raises(AssertionError, match=re.escape(name)):
+            assert_no_secrets(run, {sid})
 
 
 def assert_hosts_in_scope(run: Path) -> None:
@@ -286,9 +349,17 @@ def test_ssr_approvals_held_and_executed_only_when_approved(ssr):
     assert any(r["category"] == "delete" and r["decision"] == "pending" for r in rows), rows
 
 
+def assert_no_fixture_controls(server: Instrumented) -> None:
+    """The workflow never hit the fixtures' test controls. The test itself makes no setup
+    calls (each module starts a fresh app instance), so every logged request is the CLI's."""
+    assert not [e for e in server.log if e["path"] in ("/__reset", "/__expire")], [
+        e for e in server.log if e["path"].startswith("/__")]
+
+
 def test_ssr_no_secrets_and_scope(ssr):
     assert_no_secrets(ssr["run"], ssr["server"].secrets)
     assert_hosts_in_scope(ssr["run"])
+    assert_no_fixture_controls(ssr["server"])
 
 
 # -- SPA -----------------------------------------------------------------------------
@@ -337,31 +408,53 @@ def test_spa_routes_endpoints_links_locators(spa):
 
 def test_spa_delete_held_then_executed_only_if_approved(spa):
     run, log = spa["run"], spa["server"].log
-    rows = q(run, "SELECT id, category, label, decision, executed_event, predicted_request "
-                  "FROM approvals")
+    rows = q(run, "SELECT id, category, label, decision, executed_event, action_path, "
+                  "predicted_request FROM approvals")
     assert any(r["category"] == "logout" and r["decision"] == "deny" for r in rows), rows
     assert any(r["category"] == "delete" and r["label"] == "Delete" for r in rows), rows
     approved = [r for r in rows if r["decision"] == "approve"]
-    deletes = [json.loads(e["body"]) for e in log
-               if e["method"] == "POST" and e["path"] == "/graphql" and "DeleteItem" in e["body"]]
-    if approved:
-        assert all(r["category"] == "delete" for r in approved), approved
-    # DeleteItem was only ever sent for items this run created (ids above the 100 seeded)
-    assert all((d.get("variables") or {}).get("id", 0) > 100 for d in deletes), deletes
-    assert len(deletes) <= len([r for r in approved if r["executed_event"]]), (deletes, approved)
+    assert all(r["category"] == "delete" for r in approved), approved
+
+    def item_id(r) -> int | None:  # the item an approved Delete acts on
+        m = re.search(r"/items/(\d+)", f"{r['action_path']} {r['predicted_request'] or ''}")
+        return int(m.group(1)) if m else None
+
+    executed_ids = {item_id(r) for r in approved if r["executed_event"]} - {None}
+    sent = [(json.loads(e["body"]).get("variables") or {}).get("id") for e in log
+            if e["method"] == "POST" and e["path"] == "/graphql" and "DeleteItem" in e["body"]]
+    # every DeleteItem the server saw targets an approved, executed item (subset check)
+    assert set(sent) <= executed_ids, (sent, executed_ids)
+    assert all(i > 100 for i in executed_ids), executed_ids  # 1..100 are seeded
     assert not [e for e in log if e["method"] == "DELETE"]
 
 
 def test_spa_no_secrets_and_scope(spa):
     assert_no_secrets(spa["run"], spa["server"].secrets)
     assert_hosts_in_scope(spa["run"])
+    assert_no_fixture_controls(spa["server"])
 
 
 # -- the wrapper ---------------------------------------------------------------------
+_OFFLINE = re.compile(r"Could not resolve|Temporary failure in name resolution|"
+                      r"Name or service not known|nodename nor servname|Network is unreachable|"
+                      r"Connection (refused|reset)|NewConnectionError|"
+                      r"No matching distribution found", re.I)
+
+
 def test_wrapper_version():
-    """R3 smoke test: scripts/appmap builds (or reuses) the cached venv and runs."""
+    """R3 smoke test of scripts/appmap. With the cached venv present it must answer quickly;
+    building it (network, minutes) only runs when APPMAP_E2E_WRAPPER is set."""
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    venv = cache / "absolute-appmap" / "0.1.0" / "venv" / "bin" / "appmap"
+    installed = venv.exists()
+    if not installed and not os.environ.get("APPMAP_E2E_WRAPPER"):
+        pytest.skip(f"{venv} missing; set APPMAP_E2E_WRAPPER=1 to test the full install")
+    t0 = time.monotonic()
     proc = subprocess.run([str(PLUGIN / "scripts" / "appmap"), "--version"],
-                          capture_output=True, text=True, timeout=900)
-    if proc.returncode != 0:
-        pytest.skip(f"wrapper setup unavailable (offline?): {proc.stderr[-500:]}")
+                          capture_output=True, text=True, timeout=60 if installed else 900)
+    if proc.returncode != 0 and not installed and _OFFLINE.search(proc.stderr):
+        pytest.skip(f"offline, cannot install: {proc.stderr[-300:]}")
+    assert proc.returncode == 0, proc.stderr[-2000:]
     assert proc.stdout.strip() == "appmap 0.1.0"
+    if installed:
+        assert time.monotonic() - t0 < 20

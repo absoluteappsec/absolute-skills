@@ -134,26 +134,17 @@ def _json_ids(body: str | None) -> list[str]:
             and not isinstance(o.get("id"), bool) and re.fullmatch(r"[\w.~-]+", str(o["id"]))]
 
 
-def observed_ids(conn, root: Path | None, role: str, pattern: str, limit: int) -> list[str]:
-    """IDs a role has seen for a one-parameter ``pattern``: URL segments of exchanges that
-    already match it first, then ``id`` fields of the role's JSON responses whose URL
-    mentions the segment before the parameter. Empty if the pattern has no single parameter."""
+def _param_index(pattern: str) -> tuple[list[str], int | None]:
+    """Segments of ``pattern`` and the index of its single parameter (None if not one)."""
     segs = [s for s in pattern.strip("/").split("/") if s]
     idx = [i for i, s in enumerate(segs) if _PARAM_SEG.match(s)]
-    if len(idx) != 1:
-        return []
-    i = idx[0]
-    ids: list[str] = []
-    rows = conn.execute("SELECT url, resp_body, resp_body_path, content_type FROM exchanges "
-                        "WHERE role=? AND upper(method)='GET' AND status BETWEEN 200 AND 299 "
-                        "ORDER BY id", (role,)).fetchall()
-    for r in rows:  # ids in URLs that already match the pattern
-        path = [s for s in urlsplit(r["url"]).path.strip("/").split("/") if s]
-        if len(path) == len(segs) and all(
-                j == i or path[j] == segs[j] for j in range(len(segs))):
-            if path[i] not in ids and not path[i].startswith("{"):
-                ids.append(path[i])
-    anchor = segs[i - 1] if i else None
+    return segs, (idx[0] if len(idx) == 1 else None)
+
+
+def _json_ids_near(rows, root: Path | None, anchor: str | None, ids: list[str],
+                   limit: int) -> list[str]:
+    """Append (to ``ids``) the ``id`` fields of JSON responses in ``rows`` whose URL path
+    contains ``anchor``; bodies stored on disk are read from ``root``."""
     for r in rows:
         if len(ids) >= limit:
             break
@@ -173,34 +164,37 @@ def observed_ids(conn, root: Path | None, role: str, pattern: str, limit: int) -
     return ids[:limit]
 
 
+_ROWS = ("SELECT url, resp_body, resp_body_path, content_type FROM exchanges "
+         "WHERE role=? AND status BETWEEN 200 AND 299 AND ")
+
+
+def observed_ids(conn, root: Path | None, role: str, pattern: str, limit: int) -> list[str]:
+    """IDs a role has seen for a one-parameter ``pattern``: URL segments of exchanges that
+    already match it first, then ``id`` fields of the role's JSON responses whose URL
+    mentions the segment before the parameter. Empty if the pattern has no single parameter."""
+    segs, i = _param_index(pattern)
+    if i is None:
+        return []
+    ids: list[str] = []
+    rows = conn.execute(_ROWS + "upper(method)='GET' ORDER BY id", (role,)).fetchall()
+    for r in rows:  # ids in URLs that already match the pattern
+        path = [s for s in urlsplit(r["url"]).path.strip("/").split("/") if s]
+        if len(path) == len(segs) and all(
+                j == i or path[j] == segs[j] for j in range(len(segs))):
+            if path[i] not in ids and not path[i].startswith("{"):
+                ids.append(path[i])
+    return _json_ids_near(rows, root, segs[i - 1] if i else None, ids, limit)
+
+
 def created_ids(conn, root: Path | None, role: str, pattern: str, limit: int) -> list[str]:
     """``id`` fields of the role's successful non-GET JSON responses (records its own
     writes created) whose URL mentions the segment before ``pattern``'s one parameter."""
-    segs = [s for s in pattern.strip("/").split("/") if s]
-    idx = [i for i, s in enumerate(segs) if _PARAM_SEG.match(s)]
-    if len(idx) != 1:
+    segs, i = _param_index(pattern)
+    if i is None:
         return []
-    anchor = segs[idx[0] - 1] if idx[0] else None
-    ids: list[str] = []
-    for r in conn.execute("SELECT url, resp_body, resp_body_path, content_type FROM exchanges "
-                          "WHERE role=? AND upper(method) NOT IN ('GET','HEAD','OPTIONS') "
-                          "AND status BETWEEN 200 AND 299 ORDER BY id", (role,)):
-        if len(ids) >= limit:
-            break
-        if "json" not in (r["content_type"] or "").lower():
-            continue
-        if anchor and anchor not in urlsplit(r["url"]).path.split("/"):
-            continue
-        body = r["resp_body"]
-        if not body and root is not None and r["resp_body_path"]:
-            try:
-                body = (root / r["resp_body_path"]).read_text(encoding="utf-8")
-            except OSError:
-                body = None
-        for v in _json_ids(body):
-            if v not in ids:
-                ids.append(v)
-    return ids[:limit]
+    rows = conn.execute(_ROWS + "upper(method) NOT IN ('GET','HEAD','OPTIONS') ORDER BY id",
+                        (role,))
+    return _json_ids_near(rows, root, segs[i - 1] if i else None, [], limit)
 
 
 def concrete_url(base_url: str, pattern: str, value: str) -> str:
