@@ -853,14 +853,45 @@ def _ctx_forms(store: Store) -> dict:
     return {"rows": shown, "more": more}
 
 
-def marker_variants(store: Store, marker: str) -> set[str]:
-    """The marker plus the truncations the data generator produced in THIS run: from the
-    ``maxlength`` constraints and length hints in validation messages the run recorded
-    (same arithmetic as datagen: plain, email, url and password fields)."""
+_FIELD_OFFSETS = {"text": 0, "email": 13, "url": 21}  # datagen: "@example.test", "https://example.test/"
+_NO_MARKER_TYPES = {"number", "range", "date", "datetime-local", "month", "time", "week",
+                    "color", "checkbox", "radio", "select", "select-one", "select-multiple",
+                    "file", "tel", "hidden", "submit", "button", "image", "reset"}
+
+
+def _field_kind(ftype: str | None, name: str | None) -> str | None:
+    """How datagen fills a field with the marker (None: it never does)."""
+    t, ident = (ftype or "text").lower(), (name or "").lower()
+    if t == "email" or re.search(r"e-?mail", ident):
+        return "email"
+    if t == "url" or re.search(r"\burl\b|website", ident):
+        return "url"
+    if t == "password":
+        return "password"
+    if t in _NO_MARKER_TYPES or re.search(r"phone|mobile|tel\b", ident):
+        return None
+    return "text"
+
+
+def marker_variants(store: Store, marker: str, run_id: str | None = None) -> set[str]:
+    """The marker plus the truncations the data generator produced in THIS run.
+
+    Per recorded field: the room from its ``maxlength`` or the length hints in its
+    validation messages, minus datagen's offset for that field kind (email, url, password
+    tail, plain text). A truncation is used only while it still holds the run-specific
+    part: the text before the run id plus at least the 8 date digits of the run id."""
     from appmap.datagen import _PASSWORD_TAIL, hint_from_validation
 
-    rooms: set[int] = set()
-    for cons, msgs in store.conn.execute("SELECT constraints, validation_messages FROM fields"):
+    run_id = run_id or _run_meta(store).get("run_id") or ""
+    at = marker.find(run_id) if run_id else -1
+    min_len = at + 8 if at >= 0 else len(marker)
+    out = {marker}
+    for ftype, name, cons, msgs in store.conn.execute(
+            "SELECT type, name, constraints, validation_messages FROM fields"):
+        kind = _field_kind(ftype, name)
+        if kind is None:
+            continue
+        rooms: set[int] = set()
         ml = (_loads(cons, {}) or {}).get("maxlength")
         if isinstance(ml, int) and not isinstance(ml, bool):
             rooms.add(ml)
@@ -870,17 +901,30 @@ def marker_variants(store: Store, marker: str) -> set[str]:
                 rooms.add(int(h[4:]))
             elif h and h.startswith("len:"):
                 rooms.add(int(h[4:].split("-")[1]))
-    out = {marker}
-    for room in rooms:
-        for n in (room, room - 13, room - 21, room - len(_PASSWORD_TAIL)):
-            if 1 <= n < len(marker):
+        off = len(_PASSWORD_TAIL) if kind == "password" else _FIELD_OFFSETS[kind]
+        for room in rooms:
+            n = room - off
+            if min_len <= n < len(marker):
                 out.add(marker[:n])
     return out
 
 
+def _value_forms(token: str) -> set[str]:
+    """A body/query token as datagen may have built it: the email local part and the
+    password with its fixed tail removed are compared too."""
+    from appmap.datagen import _PASSWORD_TAIL
+
+    forms = {token, token.split("@", 1)[0]}
+    for tail in (_PASSWORD_TAIL, _PASSWORD_TAIL.rstrip("!")):
+        if token.endswith(tail):
+            forms.add(token[: -len(tail)])
+    return forms
+
+
 def _ctx_records(store: Store) -> dict:
-    """Successful (2xx/3xx) writes whose URL or body (inline or bodies/ file) carries the
-    marker, or exactly one of this run's own truncations of it as a whole token."""
+    """Successful (2xx/3xx) writes whose query string or body (inline or bodies/ file)
+    carries the marker, or one of this run's own truncations of it as a whole value.
+    URL host and path are never matched."""
     marker = run_marker(store)
     if not marker:
         return {"rows": [], "more": 0, "variants": []}
@@ -893,8 +937,9 @@ def _ctx_records(store: Store) -> dict:
         WHERE upper(x.method) NOT IN ('GET','HEAD','OPTIONS') AND x.status BETWEEN 200 AND 399
         ORDER BY x.id"""):
         text = unquote_plus(" ".join(filter(None, (
-            x["url"], _body_text(store, x["req_body"], x["req_body_path"])))))
-        if marker not in text and not (short and short & set(_TOKEN.findall(text))):
+            urlsplit(x["url"] or "").query, _body_text(store, x["req_body"], x["req_body_path"])))))
+        if marker not in text and not (short and any(
+                short & _value_forms(t) for t in _TOKEN.findall(text))):
             continue
         hdrs = _loads(x["resp_headers"], {}) or {}
         x["location"] = next((v for k, v in hdrs.items() if str(k).lower() == "location"), None)

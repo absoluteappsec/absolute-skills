@@ -175,9 +175,10 @@ def test_app_map_sections_present(ssr_run, tmp_path, capsys):
     assert "Handling notice" not in md  # staging run
     assert "/projects/{id}" in md and "admin: Create @ /projects/new" in md
     assert "POST /projects/new" in md
-    # the created project carries (a prefix of) the run marker
+    # the SSR name field only had room for "appmap-20261" (no full run date): such a
+    # truncation is not run-specific, so the created project is not claimed
     created = md.split("## Records created by this run", 1)[1].split("## Where", 1)[0]
-    assert "/projects/new" in created
+    assert "No records identifiably created by this run." in created
     for secret in ("admin-pw-Fx1", "alice-pw-Fx2"):
         assert secret not in md
         assert secret not in (root / "appmap.json").read_text()
@@ -657,30 +658,70 @@ def test_apply_names_ignores_unhashable_entries(tmp_path):
         store.close()
 
 
-def test_records_use_this_runs_truncations_only(tmp_path):
+def _record_ids(store, root) -> set[int]:
+    md = render_app_map(store, open_run_dir(root))
+    rec = md.split("## Records created by this run", 1)[1].split("## Where", 1)[0]
+    return {int(line.split("|")[1]) for line in rec.splitlines()
+            if line.startswith("| ") and line.split("|")[1].strip().isdigit()}
+
+
+MARKER = "appmap-20261024-120000"
+
+
+def test_records_match_this_runs_truncations_per_field_kind(tmp_path):
+    from appmap.build import marker_variants
+
     store, root = _synthetic(tmp_path)
     try:
-        b = "https://example.test"
-        marker = "appmap-20261024-120000"
+        b, m = "https://example.test", MARKER
         fid = store.add_form(None, method="POST")
         store.add_field(fid, "name", "text", "input",
-                        validation_messages=["Name must be at most 12 characters"])
-        ours = _x(store, "u", "POST", f"{b}/projects", status=302,
-                  req_body=f"name={marker[:12]}&x=1")
-        _x(store, "u", "POST", f"{b}/projects", status=302,
-           req_body="name=appmap-2026")  # another run's (or a shorter) prefix: not ours
-        _x(store, "u", "POST", f"{b}/projects", status=422, req_body=f"name={marker}")
+                        validation_messages=["Name must be at most 16 characters"])
+        store.add_field(fid, "email", "email", "input", constraints={"maxlength": 30})
+        store.add_field(fid, "pw", "password", "input", constraints={"maxlength": 22})
+        store.add_field(fid, "site", "url", "input", constraints={"maxlength": 38})
+        assert marker_variants(store, m) == {m, m[:16], m[:17]}
+        text = _x(store, "u", "POST", f"{b}/projects", status=302, req_body=f"name={m[:16]}")
+        email = _x(store, "u", "POST", f"{b}/invite", status=201,
+                   req_body=f"email={m[:17]}%40example.test")
+        pw = _x(store, "u", "POST", f"{b}/pw", status=201, req_body=f"pw={m[:17]}-Aa1%21")
+        url = _x(store, "u", "POST", f"{b}/site", status=201,
+                 req_body=f"site=https%3A%2F%2Fexample.test%2F{m[:17]}")
+        query = _x(store, "u", "POST", f"{b}/tags?label={m}", status=201)
         bodies = root / "bodies"
         bodies.mkdir()
         big = store.add_exchange(None, "u", "ui", method="PUT", url=f"{b}/docs/1", status=200,
                                  req_body_path="bodies/9.req.json")
-        (bodies / "9.req.json").write_text(json.dumps({"title": marker, "pad": "x" * 10}))
-        pct = _x(store, "u", "POST", f"{b}/q", status=201, req_body="name=appmap%25_20261024")
-        md = render_app_map(store, open_run_dir(root))
-        rec = md.split("## Records created by this run", 1)[1].split("## Where", 1)[0]
-        ids = {int(line.split("|")[1]) for line in rec.splitlines()
-               if line.startswith("| ") and line.split("|")[1].strip().isdigit()}
-        assert ids == {ours, big} and pct not in ids
-        assert f"`{marker[:12]}`" in rec
+        (bodies / "9.req.json").write_text(json.dumps({"title": m, "pad": "x" * 10}))
+        # not ours: other prefixes, failed status, marker only in the URL path
+        _x(store, "u", "POST", f"{b}/projects", status=302, req_body="name=appmap-2026")
+        _x(store, "u", "POST", f"{b}/projects", status=422, req_body=f"name={m}")
+        _x(store, "u", "POST", f"{b}/q", status=201, req_body="name=appmap%25_20261024")
+        _x(store, "u", "POST", f"{b}/items/{m}/rename", status=200, req_body="x=1")
+        assert _record_ids(store, root) == {text, email, pw, url, query, big}
+    finally:
+        store.close()
+
+
+def test_records_ignore_short_truncations_and_url_paths(tmp_path):
+    from appmap.build import marker_variants
+
+    store, root = _synthetic(tmp_path)
+    try:
+        b, m = "https://example.test", MARKER
+        fid = store.add_form(None, method="POST")
+        # reviewer repro: rooms too small to keep the run date in the value
+        store.add_field(fid, "title", "text", "input", constraints={"maxlength": 14})
+        store.add_field(fid, "email", "email", "input", constraints={"maxlength": 25})
+        store.add_field(fid, "pw", "password", "input", constraints={"maxlength": 16})
+        store.add_field(fid, "site", "url", "input", constraints={"maxlength": 30})
+        store.add_field(fid, "age", "number", "input", constraints={"maxlength": 18})
+        assert marker_variants(store, m) == {m}  # "app", "appmap-2026", ... never used
+        _x(store, "u", "POST", f"{b}/app/settings", status=200, req_body="theme=dark")
+        _x(store, "u", "POST", f"{b}/invite", status=201,
+           req_body=f"email={m[:12]}%40example.test")
+        _x(store, "u", "POST", f"{b}/pw", status=201, req_body=f"pw={m[:11]}-Aa1%21")
+        _x(store, "u", "POST", f"{b}/t", status=201, req_body=f"title={m[:14]}")
+        assert _record_ids(store, root) == set()
     finally:
         store.close()

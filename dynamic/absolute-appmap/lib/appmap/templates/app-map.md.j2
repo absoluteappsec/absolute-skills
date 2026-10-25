@@ -219,8 +219,8 @@ No observations.
 ## Records created by this run
 
 {% if records.rows %}
-Successful (2xx/3xx) state-changing requests whose URL or body carries the run marker
-`{{ records.marker }}`{% if records.variants %} or one of this run's truncations of it ({% for v in records.variants %}`{{ v }}`{% if not loop.last %}, {% endif %}{% endfor %}; fields too short for the whole marker){% endif %}. Use them for post-run cleanup.
+Successful (2xx/3xx) state-changing requests whose query string or body carries the run marker
+`{{ records.marker }}`{% if records.variants %} or one of this run's truncations of it ({% for v in records.variants %}`{{ v }}`{% if not loop.last %}, {% endif %}{% endfor %}; fields too short for the whole marker){% endif %}. Truncations shorter than the marker prefix plus the run date are not used, so such records are not listed. Use them for post-run cleanup.
 
 | Exchange | Role | Request | Status | Location |
 |---|---|---|---|---|
