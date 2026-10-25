@@ -134,7 +134,8 @@ def login_endpoint_ids(store: Store, cfg: RunConfig) -> set[int]:
 def _approvals(store: Store) -> list[tuple[str, str, str, str]]:
     """(METHOD, host, path, text) of every approval with a predicted request URL."""
     out = []
-    for row in store.conn.execute("SELECT label, action_path, predicted_request FROM approvals"):
+    for row in store.conn.execute("SELECT label, category, action_path, predicted_request "
+                                  "FROM approvals"):
         try:
             pr = json.loads(row["predicted_request"]) if row["predicted_request"] else {}
         except ValueError:
@@ -145,11 +146,15 @@ def _approvals(store: Store) -> list[tuple[str, str, str, str]]:
         parts = urlsplit(url)
         method = (pr.get("method") or "GET").upper()
         text = f"{row['label'] or ''} {row['action_path'] or ''}"
-        out.append((method, parts.netloc.lower(), parts.path or "/", text))
         try:
             steps = json.loads(row["action_path"]) if row["action_path"] else []
         except ValueError:
             steps = []
+        if method == "GET" and (row["category"] == "logout" or _predicts_own_page(steps, url)):
+            # Field fix 3: an in-page control's "GET" was just its own page (a logout is
+            # never replayed anyway: classify holds a logout URL itself).
+            continue
+        out.append((method, parts.netloc.lower(), parts.path or "/", text))
         if method not in ("GET", "POST") and any(
                 isinstance(st, dict) and st.get("type") == "submit" for st in steps or []):
             # a form's hidden _method override (Rails/Laravel): the wire request is a POST
@@ -157,12 +162,41 @@ def _approvals(store: Store) -> list[tuple[str, str, str, str]]:
     return out
 
 
+def _predicts_own_page(steps, url: str) -> bool:
+    """An approval recorded before field fix 3 for an in-page control (``href="#"``, e.g.
+    a LOG OUT or "Remove" widget) predicted a GET of the very page it sat on: that GET is
+    not the action and must not block replaying the page."""
+    if not isinstance(steps, list) or len(steps) < 2:
+        return False
+    last = steps[-1] if isinstance(steps[-1], dict) else {}
+    if last.get("type") != "click":
+        return False
+    page = next((s.get("url") for s in reversed(steps[:-1])
+                 if isinstance(s, dict) and s.get("type") == "goto"), None)
+    key = lambda u: (urlsplit(u or "").netloc.lower(),  # noqa: E731
+                     urlsplit(u or "").path.rstrip("/") or "/", urlsplit(u or "").query)
+    return page is not None and key(page) == key(url) and \
+        all(isinstance(s, dict) and s.get("type") == "goto" for s in steps[:-1])
+
+
+_AUTO_PARAMS = {"{id}", "{uuid}", "{hash}"}
+
+
+def _ids_fit(path: str, pattern: str) -> bool:
+    """Field fix 3: an auto-named parameter (``{id}``) only stands for an id-like segment,
+    so ``/t/11/project_delete`` is not an instance of ``/t/{id}/{id}``."""
+    own = [s for s in normalize_path(path).strip("/").split("/") if s]
+    pat = [s for s in pattern.strip("/").split("/") if s]
+    return len(own) != len(pat) or all(
+        p not in _AUTO_PARAMS or o.startswith("{") for o, p in zip(own, pat))
+
+
 def _approval_matches(approvals, method: str, host: str, pattern: str,
                       graphql_op: str = "", graphql_type: str | None = None) -> bool:
     for a_method, a_host, a_path, text in approvals:
         if a_method != method.upper() or a_host != host:
             continue
-        if normalize_path(a_path, [pattern]) != pattern:
+        if normalize_path(a_path, [pattern]) != pattern or not _ids_fit(a_path, pattern):
             continue
         # A GraphQL URL hosts many operations: block the named one, and every
         # non-query operation when the approval does not say which one it was.
@@ -173,12 +207,15 @@ def _approval_matches(approvals, method: str, host: str, pattern: str,
 
 
 def approval_blocked_ids(store: Store) -> set[int]:
-    """Endpoints never replayed (ruling R20): captured with origin ``approved``, or
-    referenced by any approval row (whatever its decision). Replay re-classifies by
+    """Endpoints never replayed (ruling R20): written by an approved action (non-GET,
+    origin ``approved``), or referenced by any approval row (whatever its decision). Replay re-classifies by
     method/URL/body only and would lose the crawl's label/confirm/context signals."""
+    # Field fix 3: only the writes an approved action sent; the pages and assets loaded
+    # around it are ordinary GETs (an approved action's own GET target is blocked through
+    # its approval row below).
     ids = {eid for (eid,) in store.conn.execute(
         "SELECT DISTINCT endpoint_id FROM exchanges WHERE origin='approved' "
-        "AND endpoint_id IS NOT NULL")}
+        "AND endpoint_id IS NOT NULL AND upper(method) NOT IN ('GET','HEAD','OPTIONS')")}
     approvals = _approvals(store)
     if approvals:
         for ep in store.conn.execute("SELECT * FROM endpoints"):

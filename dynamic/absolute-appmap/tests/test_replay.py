@@ -597,3 +597,74 @@ async def test_replay_uses_ids_created_by_the_role(browser, spa_url, make_cfg, r
     urls = {r["url"] for r in q(rd, "SELECT url FROM exchanges WHERE origin='replay' "
                                     "AND method='GET' AND role='admin'")}
     assert spa_url + "/api/items/101" in urls, sorted(urls)
+
+
+async def test_pages_around_approved_actions_still_replayed(browser, ssr_url, make_cfg,
+                                                            run_dir, tmp_path):
+    """Field fix 3 (VTM): pages loaded around an approved action (origin 'approved') and
+    the page an in-page control sat on (an old '#'-href approval predicting a GET of its own
+    page) do not block cross-role replay: anonymous gets redirect_login, not not_tested.
+    The approved action's own GET target stays blocked."""
+    cfg = make_cfg(ssr_url, limits=FAST)
+    rd = run_dir(tmp_path, cfg)
+    host = ssr_url.split("//")[1]
+    seed(cfg, rd, role="admin", method="GET", url=ssr_url + "/admin",
+         resp_body=b"<html><h1>Admin</h1></html>")
+    seed(cfg, rd, role="admin", method="GET", url=ssr_url + "/admin/reports",
+         resp_body=b"<html><h1>Reports</h1></html>")
+    seed(cfg, rd, role="admin", method="GET", url=ssr_url + "/admin/reports",
+         resp_body=b"<html><h1>Reports</h1></html>", origin="approved")
+    seed(cfg, rd, role="admin", method="GET", url=ssr_url + "/projects/3/private",
+         resp_body=b"<html></html>", origin="approved")
+    store = Store(rd.db_path)
+    try:
+        for p in ("/admin", "/admin/reports", "/projects/{id}/private"):
+            store.upsert_route(p, host, "page")
+        # LOG OUT link with href="#": its approval predicted a GET of /admin itself
+        store.upsert_approval(
+            "ap-0001", role="admin", category="logout", label="LOG OUT", decision="skip",
+            action_path=[{"type": "goto", "url": ssr_url + "/admin"},
+                         {"type": "click", "label": "LOG OUT", "href": ssr_url + "/admin",
+                          "locators": []}],
+            predicted_request={"method": "GET", "url": ssr_url + "/admin"})
+        # a GET delete that was approved and executed: its target stays blocked
+        store.upsert_approval(
+            "ap-0002", role="admin", category="delete", label="Purge", decision="approve",
+            executed_event="ev-1",
+            action_path=[{"type": "goto", "url": ssr_url + "/projects/3/private"}],
+            predicted_request={"method": "GET", "url": ssr_url + "/projects/3/private"})
+    finally:
+        store.close()
+    await run_active(cfg, rd, budget_minutes=5, browser=browser)
+    assert access(rd, "route", "x.pattern='/admin'") == {
+        "admin": "allowed", "alice": "forbidden", "anonymous": "redirect_login"}
+    assert access(rd, "route", "x.pattern='/admin/reports'")["anonymous"] == "redirect_login"
+    got = access(rd, "route", "x.pattern='/projects/{id}/private'")
+    assert got["anonymous"] == "not_tested" and got["alice"] == "not_tested"
+
+
+def test_approval_blocking_ignores_logout_gets_and_non_id_segments(tmp_path):
+    from appmap.probe.replay import approval_blocked_ids
+
+    store = Store(tmp_path / "a.sqlite")
+    store.init_schema()
+    try:
+        b = "https://h"
+        dash = store.upsert_endpoint("GET", "h", "/taskManager/dashboard", "page")
+        pair = store.upsert_endpoint("GET", "h", "/taskManager/{id}/{id}", "page")
+        delete = store.upsert_endpoint("GET", "h", "/taskManager/{id}/project_delete", "page")
+        # LOG OUT link whose path started elsewhere (redirected): predicted the dashboard
+        store.upsert_approval("ap-1", role="u", category="logout", label="LOG OUT",
+                              action_path=[{"type": "goto", "url": b + "/"},
+                                           {"type": "click", "href": b + "/taskManager/dashboard/"}],
+                              predicted_request={"method": "GET",
+                                                 "url": b + "/taskManager/dashboard/"})
+        store.upsert_approval("ap-2", role="u", category="delete", label="Delete",
+                              action_path=[{"type": "goto", "url": b + "/taskManager/11/project_delete/"}],
+                              predicted_request={"method": "GET",
+                                                 "url": b + "/taskManager/11/project_delete/"})
+        blocked = approval_blocked_ids(store)
+        assert delete in blocked
+        assert dash not in blocked and pair not in blocked
+    finally:
+        store.close()

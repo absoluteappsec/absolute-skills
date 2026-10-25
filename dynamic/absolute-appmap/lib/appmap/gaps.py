@@ -8,8 +8,11 @@ so crawl and probe need not write any per-pass data.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from urllib.parse import urljoin, urlsplit
 
 from appmap.store import Store
 
@@ -27,12 +30,48 @@ class Gaps:
     unexplored_actions: list[dict] = field(default_factory=list)
     pending_approvals: list[dict] = field(default_factory=list)
     denied_approvals: list[dict] = field(default_factory=list)
+    # Informational, not a gap (field fix 3): routes whose only answer was a redirect to
+    # another (non-login) page, e.g. '/' -> '/dashboard/'.
+    reached_via_redirect: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     def summary(self) -> dict[str, int]:
-        return {k: len(v) for k, v in self.to_dict().items()}
+        return {k: len(v) for k, v in self.to_dict().items() if k != "reached_via_redirect"}
+
+
+_LOGIN_PATH = re.compile(r"(?:^|/)(?:log-?in|sign[-_]?in|signin)(?:/|$|\.)", re.I)
+
+
+def _login_paths(store: Store) -> set[str]:
+    """Paths of the configured roles' login pages (run.json next to the database)."""
+    try:
+        meta = json.loads((Path(store.db_path).parent / "run.json").read_text("utf-8"))
+    except (OSError, ValueError, TypeError):
+        return set()
+    out = set()
+    for r in ((meta.get("config") or {}).get("roles") or []):
+        url = ((r or {}).get("login") or {}).get("url") if isinstance(r, dict) else None
+        if isinstance(url, str) and url:
+            out.add(urlsplit(url).path.rstrip("/") or "/")
+    return out
+
+
+def _redirect_target(row, login_paths: set[str]) -> str | None:
+    """Where a 3xx exchange pointed, unless that is the login page (not 'reached')."""
+    try:
+        hdrs = json.loads(row["resp_headers"] or "{}")
+    except ValueError:
+        return None
+    loc = next((v for k, v in hdrs.items() if str(k).lower() == "location"), None) \
+        if isinstance(hdrs, dict) else None
+    if not isinstance(loc, str) or not loc:
+        return None
+    path = urlsplit(urljoin(row["url"] or "", loc)).path
+    if _LOGIN_PATH.search(path) or (path.rstrip("/") or "/") in login_paths:
+        return None
+    return loc
 
 
 def _marks(items) -> str:
@@ -64,12 +103,26 @@ def compute_gaps(store: Store) -> Gaps:
         d.pop("succeeded")
         g.unsuccessful_forms.append(d)
     # Routes never reached: no allowed access and no state on that pattern.
+    login_paths = None
     for r in q("""SELECT r.id, r.pattern, r.host, r.kind FROM routes r
                   WHERE NOT EXISTS (SELECT 1 FROM role_access a WHERE a.item_kind='route'
                                     AND a.item_id=r.id AND a.outcome='allowed')
                     AND NOT EXISTS (SELECT 1 FROM states s WHERE s.route_pattern=r.pattern)
                   ORDER BY r.id"""):
-        g.unreached_routes.append(dict(r))
+        if login_paths is None:
+            login_paths = _login_paths(store)
+        # Field fix 3: a route that answered with a redirect to another page was reached
+        # (the browser just landed on the target's state).
+        target = next((t for x in q(f"""
+            SELECT x.url, x.resp_headers FROM exchanges x JOIN endpoints e ON e.id=x.endpoint_id
+            WHERE e.host=? AND e.path_pattern=? AND upper(x.method)='GET'
+              AND x.status BETWEEN 300 AND 399 AND x.origin IN ({ex}) ORDER BY x.id""",
+            (r["host"], r["pattern"], *EXERCISED_ORIGINS))
+            if (t := _redirect_target(x, login_paths))), None)
+        if target is not None:
+            g.reached_via_redirect.append({**dict(r), "location": target})
+        else:
+            g.unreached_routes.append(dict(r))
     prefix = "approval_failed:"
     failures = {r["key"][len(prefix):]: r["value"] for r in q(
         "SELECT key, value FROM meta WHERE key LIKE ?", (prefix + "%",))}

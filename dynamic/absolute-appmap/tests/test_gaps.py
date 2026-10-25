@@ -136,3 +136,27 @@ def test_approved_pending_listed(tmp_path):
     s.upsert_approval("a1", role="admin", label="Do", decision="approve")
     a = compute_gaps(s).unexplored_actions
     assert a[0]["status"] == "approved_pending" and a[0]["id"] == "a1"
+
+
+def test_redirect_only_routes_are_reached_via_redirect(tmp_path):
+    """Field fix 3 (VTM): '/' and '/taskManager' only ever redirected (to the dashboard)
+    and have no state of their own: reached, not gaps. A route that only redirected to
+    the login page stays unreached."""
+    s = _store(tmp_path)
+    for p in ("/", "/taskManager", "/admin/only"):
+        s.upsert_route(p, "h", "page")
+    root = s.upsert_endpoint("GET", "h", "/", "page")
+    s.add_exchange(root, "anonymous", "ui", method="GET", url="http://h/", status=302,
+                   resp_headers={"Location": "/login/?next=/"})
+    s.add_exchange(root, "user", "cross_role", method="GET", url="http://h/", status=302,
+                   resp_headers={"Location": "/taskManager/"})
+    tm = s.upsert_endpoint("GET", "h", "/taskManager", "page")
+    s.add_exchange(tm, "user", "ui", method="GET", url="http://h/taskManager", status=301,
+                   resp_headers={"location": "http://h/taskManager/"})
+    adm = s.upsert_endpoint("GET", "h", "/admin/only", "page")
+    s.add_exchange(adm, "anonymous", "ui", method="GET", url="http://h/admin/only",
+                   status=302, resp_headers={"Location": "/login/?next=/admin/only"})
+    g = compute_gaps(s)
+    assert [r["pattern"] for r in g.unreached_routes] == ["/admin/only"]
+    assert sorted(r["pattern"] for r in g.reached_via_redirect) == ["/", "/taskManager"]
+    assert "reached_via_redirect" not in g.summary()  # informational, not a gap
