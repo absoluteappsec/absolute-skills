@@ -41,6 +41,9 @@ from .normalize import normalize_path
 from .redact import Redactor
 from .rundir import RunDir
 from .scope import ScopeGuard
+from .spa.detect import detect_spa
+from .spa.routes import (DRAIN_NAV_JS, HISTORY_PATCH_JS, concrete_url, extract_routes,
+                         observed_ids)
 from .store import Store
 from .throttle import CircuitBreaker, CircuitOpen, RateLimiter
 
@@ -140,6 +143,8 @@ class Crawler:
             "SELECT pattern FROM routes WHERE kind='spa_route'")]
         self._url_patterns: dict[str, Counter] = {}
         self._installed: set = set()
+        self._spa_seeded: set[str] = set()   # roles whose SPA routes were queued
+        self._spa_warnings: list[str] = []
         self._confirm_seen = False
         self._approved_mode = False  # set while executing approved actions (Task 17)
         # Network guard attribution: the action (or page load) requests are charged to.
@@ -175,6 +180,7 @@ class Crawler:
         if status == "done" and any(self.frontier.pending_count(r) for r in roles):
             status = "in_progress"
         stats = self.stats(status)
+        stats.warnings += self._spa_warnings
         log.info("crawl stopped: status=%s states=%d transitions=%d pending_approvals=%d",
                  status, stats.states, stats.transitions, stats.queued_approvals)
         return stats
@@ -212,6 +218,8 @@ class Crawler:
                 self.frontier.mark(item.id, outcome)
                 log.info("[%s] item %d %s %s -> %s", role, item.id, item.kind,
                          item.url or self._describe(item.action_path[-1:]), outcome)
+                if role not in self._spa_seeded and not page.is_closed():
+                    await self._seed_spa(page, role)
         finally:
             if page is not None and not page.is_closed():
                 await page.close()
@@ -235,6 +243,8 @@ class Crawler:
             # the role context: all pages, popups and workers, during and between actions.
             await sess.context.route(
                 "**/*", lambda route, request: self._guard_route(route, request, role))
+            if self.cfg.spa != "off":
+                await sess.context.add_init_script(HISTORY_PATCH_JS)
             page = await self.recorder.new_page(sess.context)
             await install(page)
         else:
@@ -418,6 +428,7 @@ class Crawler:
         await self._check_lost(sess, page)
         src = await self._record_state(page, role, visit=False)
         before = canon_url(page.url)
+        await self._drain_nav(page)
         self._confirm_seen = False
         mark = self._exchange_mark()
         result = None
@@ -466,9 +477,13 @@ class Crawler:
             step["mutating"] = True
             self.frontier.set_action_path(item.id, path)
         await self._check_lost(sess, page)
+        navs = await self._drain_nav(page)
         dst = await self._record_state(page, role)
+        # A client route change always yields a transition, whether or not the DOM
+        # fingerprint changed (the state id also covers the URL's route pattern).
         self.store.add_transition(src.id, dst.id, role, step["type"], label,
                                   self._locset(locs), ev.id, ids)
+        self._push_nav_urls(role, navs, page.url, item.depth)
         if result is not None:
             self._update_form(step.get("form_id"), result.success,
                               result.validation_messages, ids)
@@ -492,6 +507,72 @@ class Crawler:
         # A submit or write-issuing click that stayed on its URL is not expanded:
         # restoring its children would repeat the write.
         return "done"
+
+    # -- SPA routes ---------------------------------------------------------------
+    def _spa_patterns(self) -> set[str]:
+        return {r[0] for r in self.store.conn.execute(
+            "SELECT pattern FROM routes WHERE kind='spa_route'")}
+
+    async def _drain_nav(self, page: Page) -> list[dict]:
+        """Client route changes (pushState/replaceState/hashchange/popstate) since last read."""
+        try:
+            return await page.evaluate(DRAIN_NAV_JS)
+        except Exception:
+            return []
+
+    def _push_nav_urls(self, role: str, navs: list[dict], current: str, depth: int) -> None:
+        """In-scope URLs the app navigated through during an action become url items."""
+        for n in navs:
+            url = n.get("url") or ""
+            if not url.startswith(("http://", "https://")) or not self.gate.scope.allows(url) \
+                    or canon_url(url) == canon_url(current):
+                continue
+            self.frontier.push(role, "url", url=self._safe_url(url), depth=depth + 1,
+                               priority=PRIORITY["url"], source="ui")
+
+    async def _seed_spa(self, page: Page, role: str) -> None:
+        """After a role's first loaded page: detect the SPA, record its router's routes and
+        queue each concrete one for this role."""
+        if self.cfg.spa == "off" or not page.url.startswith(("http://", "https://")):
+            return
+        self._spa_seeded.add(role)
+        info = await detect_spa(page)
+        if not (info["has_router"] or self.cfg.spa == "on"):
+            return
+
+        async def fetch_text(url: str) -> str | None:
+            try:
+                return await page.evaluate(
+                    "u => fetch(u).then(r => r.ok ? r.text() : null)", url)
+            except Exception:
+                return None
+
+        routes = await extract_routes(page, page.url, fetch_text)
+        host = urlsplit(page.url).netloc.lower()
+        log.info("[%s] SPA %s: %d routes", role, info["framework"], len(routes))
+        for r in routes:
+            rid = self.store.upsert_route(r.pattern, host, "spa_route")
+            self.store.upsert_source("route", rid, r.source)
+            if r.pattern not in self.known:
+                self.known.append(r.pattern)
+            if r.pattern not in self.recorder.known_patterns:
+                self.recorder.known_patterns.append(r.pattern)
+            if "{" in r.pattern:
+                ids = observed_ids(self.store.conn, Path(self.rd.root), role, r.pattern,
+                                   self.cap)
+                if not ids:
+                    msg = (f"spa route {r.pattern}: no observed ids for role {role}; "
+                           "recorded, not queued")
+                    log.info(msg)
+                    self._spa_warnings.append(msg)
+                    continue
+                urls = [concrete_url(page.url, r.pattern, i) for i in ids]
+            else:
+                urls = [concrete_url(page.url, r.pattern, "")]
+            for url in urls:
+                if self.gate.scope.allows(url):
+                    self.frontier.push(role, "url", url=self._safe_url(url), depth=0,
+                                       priority=PRIORITY["url"], source="spa_router")
 
     # -- restore -------------------------------------------------------------
     async def _goto(self, page: Page, url: str) -> None:
@@ -573,6 +654,8 @@ class Crawler:
                                 screenshot=shot, dom_snapshot=dom)
         rid = self.store.upsert_route(pattern, urlsplit(url).netloc.lower(), "page")
         self.store.upsert_source("route", rid, "ui")
+        if pattern in self._spa_patterns():
+            self.store.upsert_source("route", rid, "spa_router")
         return st
 
     async def _artifacts(self, page: Page, sid: str) -> tuple[str | None, str | None]:
