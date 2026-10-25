@@ -11,12 +11,14 @@ Turn crawl findings into context: a readable briefing someone new to the applica
 
 1. **Evidence or silence.** Every factual statement comes from the crawl notes (a page, form, API call, header, banner…). If you're inferring, say so ("likely", "appears to"). If you can't tell, put it under "Could not determine".
 2. **Descriptive only.** Describe what is there. Don't call anything outdated, vulnerable, insecure or risky — later tools do analysis.
-3. **No secrets, careful with people.** Never copy passwords, tokens or cookie values. Don't list real users' names/emails from production data; the run's own test accounts are fine.
+3. **No secrets, careful with people.** Never copy passwords, tokens or cookie values — field and cookie *names* are fine, *values* are not. Don't list real users' names/emails; give counts and field names instead. The run's own test accounts may be named. Describe sensitive-looking features neutrally and factually (e.g. "the ping page passes its input to a shell", "the profile edit form opens for any user id") — no labels like vulnerable or insecure.
 4. **No new requests.** Work from the crawl output. If something important is missing, list it and suggest re-crawling.
 
 ## Step 1 — Gather the input
 
 Read `SITE-MAP.md` (from `crawl-site`). If the user has an `absolute-appmap` run directory instead, read its `APP-MAP.md` (and, if helpful, query `appmap.sqlite` read-only, e.g. `sqlite3 -readonly appmap.sqlite`), plus its `APP-PROFILE.md` if `appmap profile` was run. If neither exists, tell the user to crawl first (`crawl-site` or `absolute-appmap`).
+
+If several sources exist, use the newest as the main one, cite the others for gaps (mark which source each fact came from), and record any disagreements under Environments. Before calling a version unknown, check the raw evidence saved with the crawl (response bodies, headers, JSON captures, error pages) for banners and version strings.
 
 ## Step 2 — Work out the technology
 
@@ -46,7 +48,7 @@ Common tells: cookie names (`csrftoken`/`sessionid` Django, `JSESSIONID` Java, `
 
 ```
 # Application profile: <app>
-Crawled <date> · <environment(s)> · roles: …
+Crawled <date> · <environment(s)> · roles: … · sources: …
 
 ## Purpose
 ## Main features            (feature · what it does · roles · entry point)
