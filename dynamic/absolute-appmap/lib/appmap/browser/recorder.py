@@ -44,7 +44,8 @@ class TrafficRecorder:
         self.last_status: dict[str, int | None] = {}
         self._pending: set[asyncio.Task] = set()
         self._gate_tasks: dict[Page, asyncio.Task] = {}
-        self._orphans: list[tuple[float, str]] = []  # aborted frameless navigations
+        self._orphans: dict[str, list[tuple[float, str]]] = {}  # per role/context
+        self._routed_marks: dict[tuple[str, str], list[float]] = {}
         self._roles: dict[BrowserContext, str] = {}
         self._safe: set[Page] = set()        # armed before any request could start
         self._quarantine: set[Page] = set()  # unarmed pages whose requests are refused
@@ -62,6 +63,36 @@ class TrafficRecorder:
         for page in context.pages:
             self._watch_page(page, role)
 
+    async def _cdp_allows(self, ev: dict, role: str) -> bool:
+        """Every paused request gets scope + deny checks. Chromium restarts cross-origin
+        redirected fetch/XHR as a fresh request (no redirectedRequestId, no route call), so
+        the limiter/breaker apply to anything the route handler did not already admit."""
+        req = ev["request"]
+        url, method = req["url"], req["method"]
+        if urlsplit(url).scheme not in ("http", "https"):
+            return True  # data:, blob:, about: never reach the network
+        found_on = req.get("headers", {}).get("Referer", "")
+        if not self.gate.scope.allows(url):
+            await self.gate.admit(method, url, role=role, found_on=found_on)  # records link
+            return False
+        if not ev.get("redirectedRequestId") and await self._routed(method, url):
+            return True
+        if ev.get("resourceType") in _CDP_STATIC_TYPES:
+            return True
+        return await self.gate.admit(method, url, role=role, found_on=found_on)
+
+    async def _routed(self, method: str, url: str) -> bool:
+        """Did the route handler already see (and admit) this request? Consumes the mark."""
+        for _ in range(15):
+            now = time.monotonic()
+            marks = [t for t in self._routed_marks.get((method, url), []) if now - t < 5.0]
+            if marks:
+                marks.pop(0)
+                self._routed_marks[(method, url)] = marks
+                return True
+            await asyncio.sleep(0.01)
+        return False
+
     # -- redirect hops (CDP) -------------------------------------------------
     # Chromium follows redirects internally without re-running Playwright route handlers,
     # so hops 2+ would bypass scope/deny/limiter/breaker. A CDP Fetch session per page sees
@@ -71,22 +102,15 @@ class TrafficRecorder:
 
         async def on_paused(ev: dict) -> None:
             rid = ev["requestId"]
+            req = ev["request"]
+            url = req["url"]
             try:
-                if not ev.get("redirectedRequestId"):
-                    await session.send("Fetch.continueRequest", {"requestId": rid})
-                    return
-                req = ev["request"]
-                url = req["url"]
-                if ev.get("resourceType") in _CDP_STATIC_TYPES and self.gate.scope.allows(url):
-                    ok = True
-                else:
-                    ok = await self.gate.admit(req["method"], url, role=role,
-                                               found_on=req.get("headers", {}).get("Referer", ""))
+                ok = await self._cdp_allows(ev, role)
             except CircuitOpen as exc:
-                self.events.emit("error", role=role, message=str(exc), url=ev["request"]["url"])
+                self.events.emit("error", role=role, message=str(exc), url=url)
                 ok = False
             except Exception as exc:  # fail closed
-                self.events.emit("error", role=role, message=f"redirect gate failed: {exc}")
+                self.events.emit("error", role=role, message=f"request gate failed: {exc}")
                 ok = False
             try:
                 if ok:
@@ -137,6 +161,7 @@ class TrafficRecorder:
 
     async def _route(self, route: Route, request: Request, role: str) -> None:
         url = request.url
+        self._routed_marks.setdefault((request.method, url), []).append(time.monotonic())
         # Fetch interception only applies to requests that start after Fetch.enable, so a
         # request already in flight on a page that was not armed up front (popup, or a page
         # from plain context.new_page()) could follow a redirect chain out of scope. Fail
@@ -147,7 +172,7 @@ class TrafficRecorder:
             # No page to arm yet (new window's first request): refuse it, and replay it on
             # the popup once its page appears and is armed (see _adopt_orphan).
             if request.is_navigation_request() and request.method == "GET":
-                self._orphans.append((time.monotonic(), url))
+                self._orphans.setdefault(role, []).append((time.monotonic(), url))
             await route.abort()
             return
         if page not in self._safe:
@@ -185,8 +210,8 @@ class TrafficRecorder:
                 return
         except Exception:
             return
-        while self._orphans:
-            ts, url = self._orphans.pop(0)
+        while self._orphans.get(role):
+            ts, url = self._orphans[role].pop(0)
             if time.monotonic() - ts < 5.0:
                 self._quarantine.add(page)
                 await self._replay_navigation(page, armed, url, role)
@@ -272,7 +297,7 @@ class TrafficRecorder:
             self._quarantine.discard(page)
 
         page.on("close", closed)
-        if self._orphans:
+        if self._orphans.get(role):
             self._spawn(self._adopt_orphan(page, task, role))
         page.on("websocket", lambda ws: self._on_websocket(ws, role))
         return task

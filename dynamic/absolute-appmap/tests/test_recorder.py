@@ -294,3 +294,55 @@ async def test_finalize_har_survives_malformed_base64(make_cfg, run_dir, tmp_pat
     assert texts[0] == "<redacted:undecodable>"
     assert "admin-pw-Fx1" not in texts[1]
     assert not list(rd.traffic_dir.glob("*.tmp"))
+
+
+async def _armed_chain_page(browser, stub_server, make_cfg, run_dir, tmp_path, extra=None):
+    ext, ext_url, srv = _chain_servers(stub_server)
+    cfg = make_cfg(srv.url, roles=[{"name": "anonymous", "login": {"type": "none"}}])
+    h = Harness(cfg, run_dir(tmp_path, cfg))
+    sess = await h.open(browser, "anonymous")
+    return ext, ext_url, srv, h, sess
+
+
+async def test_fetch_multi_hop_cross_origin_redirect_blocked(browser, stub_server, make_cfg,
+                                                             run_dir, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    ext, ext_url, srv, h, sess = await _armed_chain_page(
+        browser, stub_server, make_cfg, run_dir, tmp_path)
+    page = await h.recorder.new_page(sess.context)
+    await page.route(srv.url + "/blank", lambda r: r.fulfill(body="x", content_type="text/html"))
+    await page.goto(srv.url + "/blank")
+    res = await page.evaluate("(u) => fetch(u).then(r => r.status, () => 'blocked')", srv.url + "/a")
+    assert res == "blocked"
+    xhr = await page.evaluate("""(u) => new Promise(res => {
+        const x = new XMLHttpRequest(); x.open('GET', u);
+        x.onload = () => res('ok'); x.onerror = () => res('blocked'); x.send(); })""",
+                              srv.url + "/a")
+    assert xhr == "blocked"
+    await h.recorder.drain()
+    assert ext.requests == []
+    assert [r["url"] for r in rows(h, "SELECT url FROM external_links")] == [ext_url]
+    await sess.context.close()
+
+
+async def test_opener_driven_popup_fetch_blocked(browser, stub_server, make_cfg, run_dir,
+                                                 tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    ext, ext_url, srv = _chain_servers(stub_server)
+    srv2 = stub_server({
+        "/a": lambda r: Response(status=302, headers={"Location": "/b"}),
+        "/b": lambda r: Response(status=302, headers={"Location": ext_url}),
+        "/q": lambda r: Response(
+            "<script>let w=window.open('');let n=0;"
+            "let t=setInterval(()=>{try{w.fetch(location.origin+'/a')}catch(e){};"
+            "if(++n>300)clearInterval(t)},0);"
+            "setTimeout(()=>{w.location='/a'},50)</script>", mimetype="text/html")})
+    cfg = make_cfg(srv2.url, roles=[{"name": "anonymous", "login": {"type": "none"}}])
+    h = Harness(cfg, run_dir(tmp_path, cfg))
+    sess = await h.open(browser, "anonymous")
+    page = await h.recorder.new_page(sess.context)
+    await page.goto(srv2.url + "/q")
+    await page.wait_for_timeout(1500)
+    await h.recorder.drain()
+    assert ext.requests == []
+    await sess.context.close()
