@@ -764,3 +764,39 @@ def test_records_skip_login_traffic_and_cap(tmp_path):
         assert not any(u in rec for u in (f"{b}/users/sign_in", f"{b}/logout", f"{b}/session"))
     finally:
         store.close()
+
+
+def test_value_links_from_redirect_location_ssr(ssr_run, tmp_path):
+    """I6: in an SSR app the created id travels in the redirect, not in JSON: the create
+    POST's Location (or the URL its redirect landed on) is a producer."""
+    root = _copy(ssr_run, tmp_path)
+    store = Store(root / "appmap.sqlite")
+    try:
+        assert derive_value_links(store) > 0
+        links = _rows(store, """SELECT v.*, p.method AS pm, p.url AS purl, c.url AS curl
+                                FROM value_links v
+                                JOIN exchanges p ON p.id=v.producer_exchange_id
+                                JOIN exchanges c ON c.id=v.consumer_exchange_id""")
+        hit = [l for l in links if l["pm"] == "POST" and l["purl"].endswith("/projects/new")]
+        assert hit, links
+        assert hit[0]["producer_json_path"].startswith("$location")
+        assert "/projects/" in hit[0]["curl"]
+    finally:
+        store.close()
+
+
+def test_value_link_from_location_header_synthetic(tmp_path):
+    store, _root = _synthetic(tmp_path)
+    try:
+        b = "https://example.test"
+        p = store.add_exchange(None, "u", "ui", method="POST", url=f"{b}/orders", status=302,
+                               resp_headers={"Location": "/orders/58213?tab=summary"},
+                               content_type="text/html")
+        c = _x(store, "u", "POST", f"{b}/orders/58213/cancel")
+        derive_value_links(store)
+        got = [(l["producer_exchange_id"], l["producer_json_path"], l["consumer_exchange_id"],
+                l["consumer_location"]) for l in _rows(store, "SELECT * FROM value_links")]
+        assert (p, "$location.path[1]", c, "path") in got
+    finally:
+        store.close()
+

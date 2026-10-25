@@ -225,7 +225,7 @@ async def probe_bundles(client: DirectClient, api, cfg, store: Store, frontier: 
         if expired(deadline):
             counts["timed_out"] = 1
             return None
-        got = await with_source(client, source, attribute="ok").request(
+        got = await with_source(client, source, attribute="ok_nonhtml").request(
             api, "GET", url, role=role, origin=origin, static=True)
         counts["requests"] += 1
         if got is None or got[0] != 200:

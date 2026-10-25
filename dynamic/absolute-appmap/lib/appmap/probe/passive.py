@@ -109,11 +109,13 @@ async def probe_passive(client: DirectClient, api, cfg, store: Store, frontier: 
         if expired(deadline):
             counts["timed_out"] = 1
             return None
-        got = await with_source(client, source).request(api, "GET", url, role=role,
-                                                         origin="passive")
+        got = await with_source(client, source, attribute="ok_nonhtml").request(
+            api, "GET", url, role=role, origin="passive")
         counts["requests"] += 1
         if got is None or got[0] != 200:
             return None
+        if "html" in (got[1].headers.get("content-type") or "").lower():
+            return None  # a catch-all SPA's index.html, not the document asked for
         return await got[1].text()
 
     for base in base_origins(cfg):

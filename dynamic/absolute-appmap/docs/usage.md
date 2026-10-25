@@ -215,23 +215,26 @@ held; cross-role replays of POST/PUT/PATCH are not.
      decision: approve
      note: 'operator: approve - project 26 was created by this run'
    - id: ap-0001
+     created_by_run: true
      role: admin
      category: logout
      label: Logout
      decision: deny
      note: 'operator: deny'
    rules:
-   - match: {category: delete, url_contains: appmap-20261024-120000}
+   - match: {category: delete, created_by_run: true}
      decision: approve
    ```
 
-   Rules match on `category`, `role`, `url_contains` and `label_contains` (all must match); the
-   first matching rule wins and never overrides an existing decision. A rule also approves
-   matching items queued **later** in the run without showing them to you. A rule on the run
-   marker only matches when the marker appears in the URL or label (for example slug URLs);
-   records addressed by numeric id need per-item decisions — check whether the id was returned
-   by one of the run's own writes (the "Records created by this run" section of `APP-MAP.md`
-   after a build, or the `exchanges` table).
+   Rules match on `category`, `role`, `url_contains`, `label_contains` and `created_by_run`
+   (all must match); the first matching rule wins and never overrides an existing decision. A
+   rule also approves matching items queued **later** in the run without showing them to you.
+   `created_by_run: true` marks actions found on the page of a record the crawl itself just
+   created (a successful create that landed on the record's URL), so it works for numeric ids;
+   a rule on the run marker (`url_contains: appmap-<run_id>`) only matches slug URLs or labels
+   carrying the marker. Other records need per-item decisions — check whether the id was
+   returned by one of the run's own writes (the "Records created by this run" section of
+   `APP-MAP.md` after a build, or the `exchanges` table).
 3. `$A approvals --run "$RUN" apply` loads the decisions (`counts.changed`); problems with the
    file are reported in `errors` (`approvals.yaml: rule #2 skipped: …`).
 4. `$A crawl --run "$RUN" --approved-only` replays each approved action and lets only that

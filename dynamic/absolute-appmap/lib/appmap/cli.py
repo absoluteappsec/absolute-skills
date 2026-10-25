@@ -472,7 +472,8 @@ def cmd_approvals(args) -> int:
                     "id": r["id"], "role": r["role"], "category": r["category"],
                     "label": r["label"], "reasons": json.loads(r["reasons"] or "[]"),
                     "predicted_request": json.loads(r["predicted_request"] or "null"),
-                    "state_id": r["state_id"]}), flush=True)
+                    "state_id": r["state_id"],
+                    "created_by_run": bool(r["created_by_run"])}), flush=True)
         else:
             # Decisions edited in approvals.yaml are folded in before it is rewritten, so
             # neither ``write`` nor ``apply`` loses (or later revokes) a decision.

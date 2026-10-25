@@ -15,7 +15,9 @@ forms. These rules keep that safe. The CLI enforces most of them mechanically; t
   the operator's confirmation.
 - If the operator cannot confirm, or the target looks like a third party's system, stop.
 - Scope is enforced on browser **and** direct requests. Out-of-scope URLs are recorded in
-  `external_links` but never requested. Do not widen `allow_hosts`/`allow_path_prefixes` or remove
+  `external_links` but never requested. `scope.login_allow_hosts` (an external identity
+  provider) is admitted only for login-flow pages and `scope.static_allow_hosts` (a CDN) only for
+  static subresources; neither is ever crawled, probed or replayed. Do not widen `allow_hosts`/`allow_path_prefixes` or remove
   `deny_patterns` mid-run without the operator.
 - Never send requests to the target outside the CLI (no ad-hoc scripts, no driving a browser
   yourself). The one exception is the light preflight in `configure-crawl` (a single fetch of each
@@ -23,7 +25,12 @@ forms. These rules keep that safe. The CLI enforces most of them mechanically; t
 
 ## Throttling and the circuit breaker
 
-- Every request passes one rate limiter (`max_requests_per_second` + `jitter_seconds`).
+- Every request passes one rate limiter (`max_requests_per_second` + `jitter_seconds`), with
+  one exception: static subresources the browser loads (images, stylesheets, scripts, fonts,
+  media) of in-scope hosts and of `static_allow_hosts` skip the limiter, **in every profile
+  including production** (scope and `deny_patterns` still apply; in-scope ones still count for the
+  circuit breaker). A page with many assets therefore sends a short burst above
+  `max_requests_per_second`; tell the operator if the target is fragile.
 - The circuit breaker watches the last `breaker_window` responses; when the share of 429/5xx
   reaches `breaker_threshold` it trips and the command reports `status: "paused_circuit"`.
 - **(you)** On `paused_circuit`: stop. Tell the operator the target is returning errors or rate
@@ -38,12 +45,26 @@ forms. These rules keep that safe. The CLI enforces most of them mechanically; t
 - 1 request/second ceiling, at least 0.5 s jitter, concurrency 1, stricter breaker (20%).
 - Every state-changing action (form submit, POST/PUT/PATCH from the UI or replay) is held for
   approval as `data_create`, in addition to the destructive categories.
-- Forced browsing is refused (config error).
+- Forced browsing is refused (config error). Where it is allowed (staging), its wordlist asks
+  for paths such as `/.env`, `/.git/config` and backup files: anything the server returns is
+  stored like every other response, so a run directory can then hold the target's own secrets
+  (config files, keys) in clear — redaction only knows credential *shapes*. Treat such run
+  directories as secret material and tell the operator which wordlist paths answered.
 - **(you)** Get an explicit, separate confirmation from the operator before using `production`,
   and tell them the run directory will hold real customer data.
 
+## One command at a time
+
+`auth`, `crawl`, `probe`, `approvals` and `build` take an exclusive lock on `<run>/.lock`; a
+second one on the same run directory stops at once with `status: "locked"` (nothing done). An
+approved action is re-read from the database right before it is let through, so it is never
+executed twice.
+
 ## Destructive-action approval
 
+- A 307/308 redirect re-sends the same write to its target. The direct client never follows
+  one for a non-GET request (the 3xx is recorded); in the browser each such hop is classified
+  like any other request (held → aborted and queued).
 - Held categories: `delete` (incl. any HTTP DELETE and any action that opens a `confirm()`
   dialog), `credential_change`, `payment`, `outbound_message`, `deactivate`, `logout`, and
   `data_create` (production). Held actions are queued; the crawl continues elsewhere.
@@ -66,7 +87,13 @@ forms. These rules keep that safe. The CLI enforces most of them mechanically; t
 - Redaction is on everywhere (SQLite, JSON, HAR, events, DOM snapshots, logs): passwords,
   `Authorization` headers, session cookies, bearer/JWT tokens, API keys, CSRF tokens and the
   configured roles' passwords (wherever they appear) are replaced by shape-preserving placeholders such as
-  `<redacted:jwt>`. Add app-specific secret formats with `redact_patterns`.
+  `<redacted:jwt>`. Opaque tokens are covered too: form-urlencoded and query parameters by name
+  (`authenticity_token`, `csrf…`), HTML hidden inputs and `<meta>` tags named like
+  csrf/token/secret/password, and every value the session actually used (cookie values,
+  `Authorization` and CSRF header values seen at runtime or saved by `appmap auth`, 8+ chars)
+  wherever it appears verbatim. Add app-specific secret formats with `redact_patterns`.
+- Login-only (`login_allow_hosts`, external IdP) and static-only (`static_allow_hosts`, CDN)
+  hosts are never recorded as exchanges or endpoints; their traffic is only in the redacted HAR.
 - Saved sessions (cookies + web storage) live in
   `~/.cache/absolute-appmap/sessions/<run_id>/<role>.json` (mode 0600), never in the run
   directory. Delete that folder when the engagement ends.

@@ -235,7 +235,7 @@ The form's label is the `form_label` of the action-path step that targets it
 | `constraints` | TEXT JSON | `{"required", "pattern", "min", "max", "maxlength"}` (present keys only) |
 | `options` | TEXT JSON | Option values for selects/radios |
 | `locator_set_id` | INTEGER | → `locator_sets.id` |
-| `values_tried` | TEXT JSON | Values the crawler filled (may be NULL) |
+| `values_tried` | TEXT JSON | Values the crawler filled into this field, distinct, oldest first, at most 20 (password fields: `<redacted:password>`; file fields: the file name). NULL until a submission of the form was attempted |
 | `validation_messages` | TEXT JSON | Validation messages seen for this field |
 
 ### `flows`
@@ -286,8 +286,9 @@ Click and submit steps replay through their transition's `locator_set_id`.
 
 ### `value_links`
 
-Value provenance, rebuilt by `appmap build`: a leaf of a JSON response (`producer`) later sent
-by the same role (`consumer`). Only ints ≥ 2 and strings of 4–256 characters are traced;
+Value provenance, rebuilt by `appmap build`: a leaf of a JSON response, or a path segment /
+query value of a redirect's `Location` header (`producer`), later sent by the same role
+(`consumer`). Only ints ≥ 2 and strings of 4–256 characters are traced;
 booleans, common words, redacted placeholders, the run marker, values the role already sent
 before (or in) the producing request, and values present in more than half of the role's
 requests are not. Only a value's first producer is linked.
@@ -296,7 +297,7 @@ requests are not. Only a value's first producer is linked.
 |---|---|---|
 | `id` | INTEGER PK | |
 | `producer_exchange_id` | INTEGER | → `exchanges.id` whose response contained the value |
-| `producer_json_path` | TEXT | JSONPath in that response, e.g. `$.id`, `$.data.items[3].id`, `$["odd key"]` |
+| `producer_json_path` | TEXT | JSONPath in that response, e.g. `$.id`, `$.data.items[3].id`, `$["odd key"]`; for a redirect, `$location.path[i]` (i-th path segment, from 0) or `$location.query.<name>` |
 | `consumer_exchange_id` | INTEGER | → later `exchanges.id` that sent it |
 | `consumer_location` | TEXT | `path` (a whole path segment), `query`, `body`, `header` |
 | `value_hash` | TEXT | First 16 hex chars of SHA-256 of the value (the value itself is not stored) |
@@ -344,6 +345,7 @@ Destructive or held actions (mirrored in `approvals.yaml`).
 | `decision` | TEXT | See vocabulary |
 | `decided_by` | TEXT | `user`, `rule`, `appmap` |
 | `executed_event` | TEXT | Event id of `approval_executed` (its `data.exchange_ids` lists the requests sent) once performed |
+| `created_by_run` | INTEGER | 1 when the action was found on the page of a record this crawl just created (a successful submit that landed on that record's URL), else 0. Rule match key `created_by_run: true` in `approvals.yaml`. Added in schema 1.0.x; older databases gain it (default 0) on open |
 
 ### `observations`
 

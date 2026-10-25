@@ -44,6 +44,9 @@ async def test_ssr_crawl_admin_and_alice(browser, ssr_url, make_cfg, run_dir, tm
     assert {"/", "/projects", "/projects/{id}", "/projects/new", "/admin",
             "/account/password"} <= pages
     assert q1(rd, "select count(*) from approvals where category='delete'") >= 1  # project delete held
+    # I8: the delete of a project this crawl created is tagged for a created_by_run rule
+    assert q1(rd, "select count(*) from approvals where category='delete' "
+                  "and created_by_run=1") >= 1
     assert q1(rd, "select count(*) from approvals where category='logout'") >= 1
     assert q1(rd, "select count(*) from approvals where category='credential_change'") >= 1
     assert q1(rd, "select count(*) from exchanges where url like '%/delete%'") == 0  # never executed
@@ -57,6 +60,13 @@ async def test_ssr_crawl_admin_and_alice(browser, ssr_url, make_cfg, run_dir, tm
     assert any(json.loads(t["exchange_ids"] or "[]") for t in subs)
     assert q1(rd, "select count(*) from forms where succeeded=1") >= 1
     assert q1(rd, "select count(*) from fields") >= 3
+    # I7: the values filled are kept per field (passwords redacted)
+    tried = q(rd, "select fi.name, fi.type, fi.values_tried from fields fi where "
+                  "fi.values_tried is not null")
+    names = {r["name"]: json.loads(r["values_tried"]) for r in tried}
+    assert any(isinstance(v, str) and "appmap-" in v for v in names.get("name", []))
+    assert all(json.loads(r["values_tried"]) == ["<redacted:password>"]
+               for r in tried if r["type"] == "password")
     # artifacts written for states, DOM redacted of password values
     st = q(rd, "select * from states where screenshot is not null")
     assert st and all((rd.root / s["screenshot"]).exists() for s in st)

@@ -62,6 +62,8 @@ class SubmitResult:
     validation_messages: dict[str, list[str]]
     exchange_ids: list[int]
     to_url: str
+    # per field name, the values filled on each attempt (password values redacted)
+    values_tried: dict[str, list] = field(default_factory=dict)
 
 
 _DISCOVER_JS = """() => {
@@ -441,16 +443,24 @@ async def fill_and_submit(page: Page, form: FormInfo, gen: "DataGen", *, max_ret
     hints: dict[str, str] = {}
     baseline = set((await _inspect(page, form))["all"])
     success, attempts = False, 0
+    tried: dict[str, list] = {}
 
     def finish() -> SubmitResult:
         ids = exchange_ids_since() if exchange_ids_since else []
-        return SubmitResult(success, attempts, messages, ids, page.url)
+        return SubmitResult(success, attempts, messages, ids, page.url, tried)
 
     for attempt in range(1, max_retries + 2):
         attempts = attempt
         filled = 0
         for f in form.fields:
-            filled += await _fill_field(page, f, gen.value_for(f, attempt, hints.get(f.name)))
+            value = gen.value_for(f, attempt, hints.get(f.name))
+            ok = await _fill_field(page, f, value)
+            filled += ok
+            if ok and f.name:
+                shown = "<redacted:password>" if f.type == "password" else (
+                    Path(value).name if f.widget == "file" else value)
+                if shown not in tried.setdefault(f.name, []):
+                    tried[f.name].append(shown)
         if form.fields and not filled:
             _merge(messages, "", ["no form fields could be located"])
             break

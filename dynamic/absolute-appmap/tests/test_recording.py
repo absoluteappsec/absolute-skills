@@ -189,3 +189,12 @@ def test_source_explicit_default_and_unknown(env):
     rec(url="http://t.test/openapi.json", origin="schema")
     assert sorted(r["source"] for r in rows(store, "SELECT source FROM sources")) == [
         "graphql", "openapi", "robots"]
+
+
+def test_form_urlencoded_request_body_redacted_by_name():
+    """I10: a CSRF token posted in a form body is redacted by its parameter name."""
+    from appmap.recording import redact_text
+    from appmap.redact import Redactor
+    out = redact_text(Redactor([], []), "authenticity_token=wDlCmkO01QF_Dg&name=appmap-1",
+                      "application/x-www-form-urlencoded")
+    assert "wDlCmkO01QF_Dg" not in out and "name=appmap-1" in out

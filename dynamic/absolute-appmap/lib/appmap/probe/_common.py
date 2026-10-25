@@ -11,7 +11,8 @@ from ..direct import DirectClient
 def with_source(client: DirectClient, source: str, attribute: bool | str = "ok") -> DirectClient:
     """A client whose recorded exchanges carry ``source`` (origin stays ``passive``).
 
-    ``attribute`` as in ``record_exchange``: guesses attribute only 2xx responses."""
+    ``attribute`` as in ``record_exchange``: guesses attribute only 2xx responses
+    ("ok_nonhtml": and never an HTML page, i.e. a catch-all SPA's index.html)."""
     return DirectClient(client.gate, functools.partial(client.rec, source=source,
                                                        attribute=attribute), client.events)
 

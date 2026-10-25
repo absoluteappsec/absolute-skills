@@ -124,3 +124,30 @@ async def test_spa_routes_seeded_per_role(browser, spa_url, make_cfg, run_dir, t
         assert q("select 1 from states where role='admin' and route_pattern='/admin'")
     finally:
         store.close()
+
+
+def test_spa_fill_cap_is_per_run_not_per_invocation(make_cfg, run_dir, tmp_path):
+    """I9: each crawl invocation used to sample another max_states_per_route_pattern ids for
+    a parameterized SPA route; the cap now counts what earlier invocations queued."""
+    from appmap.crawl import Crawler, build_runtime, make_datagen
+    from appmap.spa.routes import SpaRoute
+    base = "http://example.test"
+    cfg = make_cfg(base, roles=[{"name": "anonymous", "login": {"type": "none"}}],
+                   limits={"max_states_per_route_pattern": 3})
+    rd = run_dir(tmp_path, cfg)
+    rt = build_runtime(cfg, rd)
+    for i in range(2, 12):
+        rt.store.add_exchange(None, "anonymous", "ui", method="GET", url=f"{base}/items/{i}",
+                              status=200, content_type="text/html")
+    pushed = []
+    for _invocation in range(3):
+        c = Crawler(cfg, rd, rt.store, rt.events, rt.gate, rt.queue, rt.recorder, {},
+                    make_datagen(cfg, rd))
+        c._spa_routes["anonymous"] = [SpaRoute("/items/{id}", "vue_router")]
+        c._spa_base["anonymous"] = base + "/"
+        c.known.append("/items/{id}")
+        pushed.append(c._fill_spa("anonymous"))
+    n = rt.store.conn.execute("SELECT count(*) FROM frontier WHERE source='spa_router' "
+                              "AND url LIKE ?", (base + "/items/%",)).fetchone()[0]
+    rt.store.close()
+    assert pushed == [3, 0, 0] and n == 3

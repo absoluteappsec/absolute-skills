@@ -160,3 +160,24 @@ def test_probe_with_saved_cookie_session_never_persists_cookie(ssr_url, make_cfg
     db = sqlite3.connect(next(run.glob("*.sqlite")))
     assert db.execute("select count(*) from exchanges where role='alice' and origin='passive'"
                       ).fetchone()[0] > 0
+
+
+async def test_catch_all_spa_guesses_not_attributed(api, stub_server, make_cfg, run_dir,
+                                                    tmp_path):
+    """I5: an SPA that answers every path with index.html must not turn guessed probe URLs
+    (robots, sitemap, well-known, manifest, OpenAPI paths) into endpoints."""
+    from werkzeug.wrappers import Request, Response
+
+    @Request.application
+    def catch_all(request):
+        return Response("<!doctype html><title>SPA</title><div id=app></div>",
+                        mimetype="text/html")
+    srv = stub_server(catch_all)
+    cfg = make_cfg(srv.url, roles=[{"name": "anonymous", "login": {"type": "none"}}])
+    rd = run_dir(tmp_path, cfg)
+    rt, client = _client(cfg, rd)
+    await probe_passive(client, api, cfg, rt.store, Frontier(rt.store), "anonymous")
+    await probe_schemas(client, api, cfg, rt.store, "anonymous")
+    assert _rows(rt.store, "SELECT count(*) FROM exchanges")[0][0] > 5  # they were fetched
+    assert _rows(rt.store, "SELECT method, path_pattern FROM endpoints") == []
+    rt.store.close()

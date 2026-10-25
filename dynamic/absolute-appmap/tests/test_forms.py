@@ -72,6 +72,8 @@ async def test_validation_retry_recorded(browser, ssr_url):
         assert res.validation_messages == {"name": ["Name must be at most 12 characters"]}
         assert res.exchange_ids == [7, 8]
         assert marker[:12] in await page.content()
+        # I7: both attempts' values are returned (the second one truncated by the hint)
+        assert len(res.values_tried["name"]) == 2 and res.values_tried["name"][1] == marker[:12]
     finally:
         await ctx.close()
 
@@ -234,3 +236,17 @@ async def test_range_and_color_use_fill(browser):
     vals = await page.evaluate("[document.querySelector('[name=r]').value, document.querySelector('[name=c]').value]")
     await ctx.close()
     assert vals == ["5", "#336699"]
+
+
+async def test_values_tried_redacts_passwords(browser, stub_server):
+    srv = _api_server(stub_server, "<form onsubmit=\"event.preventDefault();fetch('/api',"
+                      "{method:'POST'})\"><input name=title><input type=password name=pin>"
+                      "<button type=submit>Save</button></form>")
+    ctx = await browser.new_context()
+    page = await ctx.new_page()
+    await page.goto(srv.url + "/")
+    form = (await discover_forms(page))[0]
+    res = await fill_and_submit(page, form, DataGen("appmap-r", {}), max_retries=0, settle_ms=200)
+    await ctx.close()
+    assert res.values_tried["pin"] == ["<redacted:password>"]
+    assert res.values_tried["title"] and "<redacted" not in str(res.values_tried["title"])

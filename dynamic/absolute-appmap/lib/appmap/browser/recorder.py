@@ -280,6 +280,11 @@ class TrafficRecorder:
         for name, value in request.headers.items():
             if name == "authorization" or _CSRF.search(name):
                 learned[_canonical_header(name)] = value
+                # opaque tokens are scrubbed verbatim wherever they appear later
+                self.redactor.learn(value.split(" ", 1)[-1] if name == "authorization"
+                                    else value)
+            elif name == "cookie":
+                self.redactor.learn_cookies(value)
 
     async def _record(self, request: Request, role: str) -> None:
         if not self.gate.scope.allows(request.url):
@@ -296,6 +301,9 @@ class TrafficRecorder:
             duration = max(0.0, float(timing.get("responseEnd", 0) or 0))
             status = response.status
             self.gate.observe(status)
+            resp_headers = await response.all_headers()
+            if resp_headers.get("set-cookie"):  # before recording: bodies may echo it
+                self.redactor.learn_cookies(resp_headers["set-cookie"], set_cookie=True)
             if request.resource_type not in STATIC_TYPES:
                 self.last_status[role] = status
             record_exchange(
@@ -303,7 +311,7 @@ class TrafficRecorder:
                 origin=self.origin_by_role.get(role, "ui"), method=request.method,
                 url=request.url, req_headers=await request.all_headers(),
                 req_body=request.post_data_buffer, status=status,
-                resp_headers=await response.all_headers(), resp_body=body,
+                resp_headers=resp_headers, resp_body=body,
                 duration_ms=duration, caused_by=None, known_patterns=self.known_patterns)
         except Exception as exc:  # recording must never break the crawl
             self.events.emit("error", role=role, message=f"record failed: {exc}",
@@ -419,10 +427,7 @@ class TrafficRecorder:
                 text = raw.decode("utf-8")
             except UnicodeDecodeError:
                 return base64.b64encode(redact_bytes(self.redactor, raw)).decode()
-        if "x-www-form-urlencoded" in (mime or ""):
-            text = self.redactor.url("x?" + text)[2:]
-        else:
-            text = redact_text(self.redactor, text)
+        text = redact_text(self.redactor, text, mime)
         return base64.b64encode(text.encode()).decode() if is_b64 else text
 
     def _redact_bodies(self, entry: dict) -> None:

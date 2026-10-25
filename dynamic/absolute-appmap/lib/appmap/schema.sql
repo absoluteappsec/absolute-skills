@@ -88,7 +88,8 @@ CREATE TABLE IF NOT EXISTS approvals (
   id TEXT PRIMARY KEY, role TEXT, state_id TEXT, category TEXT, label TEXT, reasons TEXT,
   action_path TEXT, predicted_request TEXT,
   decision TEXT NOT NULL DEFAULT 'pending' CHECK (decision IN ('pending','approve','deny','skip')),
-  decided_by TEXT, executed_event TEXT);
+  decided_by TEXT, executed_event TEXT,
+  created_by_run INTEGER NOT NULL DEFAULT 0);
 
 CREATE TABLE IF NOT EXISTS observations (
   id INTEGER PRIMARY KEY, kind TEXT, detail TEXT, url TEXT, role TEXT, event_id TEXT);

@@ -33,7 +33,9 @@ def create_app() -> Flask:
                + admin_link
                + ('<a href="/account/password">Account</a> <a href="/logout">Logout</a>'
                   if user else '<a href="/login">Login</a>'))
-        html = (f"<!doctype html><html><head><title>{escape(title)}</title></head><body>"
+        csrf = getattr(request, "csrf", None)
+        meta = f'<meta name="csrf-token" content="{csrf}">' if csrf else ""
+        html = (f"<!doctype html><html><head><title>{escape(title)}</title>{meta}</head><body>"
                 f"<nav>{nav}</nav><h1>{escape(title)}</h1>{body}</body></html>")
         return Response(html, status=status, mimetype="text/html")
 
@@ -52,6 +54,8 @@ def create_app() -> Flask:
     @app.before_request
     def _auth():
         request.user = None if request.path.startswith("/__") else current_user()
+        sess = state["sessions"].get(request.cookies.get("sid")) if request.user else None
+        request.csrf = sess["csrf"] if sess else None  # opaque per-session CSRF token
 
     def need_login(api: bool = False):
         if request.user:
@@ -80,7 +84,8 @@ def create_app() -> Flask:
             u, p = request.form.get("username", ""), request.form.get("password", "")
             if u in USERS and state["passwords"][u] == p:
                 sid = secrets.token_hex(16)
-                state["sessions"][sid] = {"user": u, "count": 0}
+                state["sessions"][sid] = {"user": u, "count": 0,
+                                          "csrf": secrets.token_urlsafe(18)}
                 resp = redirect("/projects")
                 resp.set_cookie("sid", sid, httponly=True)
                 return resp
@@ -115,6 +120,7 @@ def create_app() -> Flask:
         v = values or {}
         return (f"{'<p class=error>' + escape(msg) + '</p>' if msg else ''}"
                 "<form method='post' action='/projects/new'>"
+                f"<input type='hidden' name='authenticity_token' value='{request.csrf or ''}'>"
                 f"<label>Name <input name='name' required pattern=\"[a-z0-9-]{{3,40}}\" "
                 f"value='{escape(v.get('name', ''))}'></label>"
                 "<label>Visibility <select name='visibility'><option value='public'>public</option>"

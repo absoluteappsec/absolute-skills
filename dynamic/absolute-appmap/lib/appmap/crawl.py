@@ -57,6 +57,7 @@ ACTION_TIMEOUT_MS = 5000
 _NTH = re.compile(r":nth-of-type\(\d+\)")
 _SKIP_CLICK_TAGS = {"select", "textarea", "option", "label"}
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+_MAX_VALUES_TRIED = 20  # per field, most recent kept
 
 # Every <form>: xpath (same algorithm as LOCATOR_JS), effective method, action, confirm hint.
 _FORMS_JS = """() => [...document.forms].map(f => {
@@ -156,7 +157,6 @@ class Crawler:
         self._installed: set = set()
         self._spa_routes: dict[str, list] = {}   # role -> router routes (once detected)
         self._spa_base: dict[str, str] = {}      # role -> URL the routes were read from
-        self._spa_filled: set[tuple[str, str]] = set()
         self._spa_skipped: dict[tuple[str, str], str] = {}  # (role, pattern) -> warning
         self._confirm_seen = False
         # While an approved action's final step runs (and only then): which held requests
@@ -172,6 +172,9 @@ class Crawler:
         # completes) and roles stopped because authentication failed (role -> reason).
         self._relogins: dict[str, int] = {}
         self.auth_failed: dict[str, str] = {}
+        # True while the controls of a record this crawl just created are queued: held
+        # actions are tagged created_by_run (usable as an approval rule match key).
+        self._creating = False
 
     # -- driver --------------------------------------------------------------
     async def run(self, roles: list[str], *, budget_minutes: float,
@@ -768,7 +771,7 @@ class Crawler:
                                           self._locset(locs), ev_id, ids)
             if result is not None:
                 self._update_form(step.get("form_id"), result.success,
-                                  result.validation_messages, ids)
+                                  result.validation_messages, ids, result.values_tried)
             self._push_nav_urls(role, navs, page.url, 0)
             # Children are restored from the URL the action left the page on: re-doing the
             # approved action as a restore step is never allowed.
@@ -997,7 +1000,7 @@ class Crawler:
         self._push_nav_urls(role, navs, page.url, item.depth)
         if result is not None:
             self._update_form(step.get("form_id"), result.success,
-                              result.validation_messages, ids)
+                              result.validation_messages, ids, result.values_tried)
         after = canon_url(page.url)
         if after != before:
             # A new URL is a fresh entry point: restore from it instead of re-acting.
@@ -1007,12 +1010,17 @@ class Crawler:
                 self.frontier.mark(self.frontier.id_of(role, "url", url=safe), "done")
             entry = [{"type": "goto", "url": safe}]
             fully = dst.new and not self._saturated(role, dst.pattern)
-            await self._expand(page, role, dst, entry, item.depth)
-            if result is not None and result.success and not fully \
-                    and self._is_resource_url(after):
-                # The crawler just created this record: queue its destructive controls even
-                # though pages like it were seen, so marker-scoped approvals can act on it.
-                await self._push_controls(page, role, dst, entry, item.depth + 1, held_only=True)
+            created = result is not None and result.success and self._is_resource_url(after)
+            self._creating = created
+            try:
+                await self._expand(page, role, dst, entry, item.depth)
+                if created and not fully:
+                    # The crawler just created this record: queue its destructive controls
+                    # even though pages like it were seen, so approvals can act on it.
+                    await self._push_controls(page, role, dst, entry, item.depth + 1,
+                                              held_only=True)
+            finally:
+                self._creating = False
         elif step["type"] == "click" and not mutating:
             await self._expand(page, role, dst, path, item.depth)
         # A submit or write-issuing click that stayed on its URL is not expanded:
@@ -1075,8 +1083,11 @@ class Crawler:
         base, pushed = self._spa_base[role], 0
         for r in self._spa_routes[role]:
             if "{" in r.pattern:
-                if (role, r.pattern) in self._spa_filled:
-                    continue  # sampled once per role and pattern, like list sampling
+                # Sampled like lists: at most ``cap`` concrete URLs per role and pattern over
+                # the whole run (what earlier invocations queued counts).
+                room = self.cap - self._spa_sampled(role, base, r.pattern)
+                if room <= 0:
+                    continue
                 ids = observed_ids(self.store.conn, Path(self.rd.root), role, r.pattern, 1000)
                 if not ids:
                     self._spa_skipped[(role, r.pattern)] = (
@@ -1084,10 +1095,9 @@ class Crawler:
                         "recorded, not queued")
                     continue
                 self._spa_skipped.pop((role, r.pattern), None)
-                self._spa_filled.add((role, r.pattern))
                 urls = [u for u in (concrete_url(base, r.pattern, i) for i in ids)
                         if self.frontier.id_of(role, "url", url=self._safe_url(u)) is None]
-                urls = urls[:self.cap]  # ids the crawl already reached are not repeated
+                urls = urls[:room]  # ids the crawl already reached are not repeated
             else:
                 urls = [concrete_url(base, r.pattern, "")]
             for url in urls:
@@ -1096,6 +1106,13 @@ class Crawler:
                         priority=PRIORITY["url"], source="spa_router"):
                     pushed += 1
         return pushed
+
+    def _spa_sampled(self, role: str, base: str, pattern: str) -> int:
+        """Concrete URLs of ``pattern`` already queued from the router for ``role``."""
+        key = self._url_pattern(concrete_url(base, pattern, "0"))
+        return sum(1 for r in self.store.conn.execute(
+            "SELECT url FROM frontier WHERE role=? AND kind='url' AND source='spa_router'",
+            (role,)) if self._url_pattern(r["url"]) == key)
 
     # -- restore -------------------------------------------------------------
     async def _goto(self, page: Page, url: str) -> None:
@@ -1376,7 +1393,8 @@ class Crawler:
                  path: list[dict], predicted: dict | None) -> str:
         aid = self.queue.enqueue(PendingAction(
             id="", role=role, state_id=state, category=flag.category, label=label,
-            reasons=list(flag.reasons), action_path=path, predicted_request=predicted))
+            reasons=list(flag.reasons), action_path=path, predicted_request=predicted,
+            created_by_run=self._creating))
         self.events.emit("approval_queued", role=role, approval_id=aid, category=flag.category,
                          label=label, reasons=flag.reasons)
         log.info("[%s] held for approval %s (%s): %s", role, aid, flag.category, label)
@@ -1425,7 +1443,8 @@ class Crawler:
         return fid
 
     def _update_form(self, form_id: int | None, success: bool,
-                     messages: dict[str, list[str]], ids: list[int]) -> None:
+                     messages: dict[str, list[str]], ids: list[int],
+                     values: dict[str, list] | None = None) -> None:
         if not form_id:
             return
         conn = self.store.conn
@@ -1438,6 +1457,15 @@ class Crawler:
             ep = row[0] if row else None
         conn.execute("UPDATE forms SET succeeded=?, action_endpoint_id=coalesce(?, action_endpoint_id) "
                      "WHERE id=?", (int(success), ep, form_id))
+        for name, vals in (values or {}).items():
+            row = conn.execute("SELECT id, values_tried FROM fields WHERE form_id=? AND name=?",
+                               (form_id, name)).fetchone()
+            if row is None:
+                continue
+            old = json.loads(row["values_tried"] or "[]")
+            new = old + [v for v in (self.redactor.json(x) for x in vals) if v not in old]
+            conn.execute("UPDATE fields SET values_tried=? WHERE id=?",
+                         (json.dumps(new[-_MAX_VALUES_TRIED:]), row["id"]))
         for name, msgs in messages.items():
             if not name:
                 continue
@@ -1492,8 +1520,27 @@ def make_redactor(cfg: RunConfig) -> Redactor:
     return Redactor(secrets, cfg.redact_patterns)
 
 
+def _learn_saved_sessions(redactor: Redactor, cfg: RunConfig, rd: RunDir) -> None:
+    """Session values saved by ``appmap auth`` (another process): cookie values and
+    token-named storage entries are scrubbed verbatim from this command's output too."""
+    for role in cfg.roles:
+        try:
+            state = json.loads(state_path(rd, role.name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for c in state.get("cookies") or []:
+            if isinstance(c, dict):
+                redactor.learn(c.get("value"))
+        for origin in state.get("origins") or []:
+            for item in (origin.get("localStorage") or []) if isinstance(origin, dict) else []:
+                if isinstance(item, dict) and re.search(r"token|auth|session|jwt|csrf|xsrf",
+                                                        str(item.get("name")), re.I):
+                    redactor.learn(item.get("value"))
+
+
 def build_runtime(cfg: RunConfig, rd: RunDir) -> Runtime:
     redactor = make_redactor(cfg)
+    _learn_saved_sessions(redactor, cfg, rd)
     store = Store(rd.db_path)
     store.init_schema()
     events = EventLog(rd.events_path, redactor)

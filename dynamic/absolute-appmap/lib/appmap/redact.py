@@ -16,6 +16,16 @@ _KEY_RULES = [
     (re.compile(r"pass|pwd", re.I), "password"),
     (re.compile(r"secret|token", re.I), "secret"),
 ]
+# HTML carrying tokens outside headers/JSON: <input type=hidden name=authenticity_token
+# value=...>, <meta name="csrf-token" content="...">, password inputs with a value.
+_HTML_TAG = re.compile(r"<(?:input|meta)\b[^>]*>", re.I)
+_HTML_NAME = re.compile(
+    r"""\b(?:name|id|property|http-equiv)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))""", re.I)
+_HTML_TYPE_PW = re.compile(r"""\btype\s*=\s*["']?password\b""", re.I)
+_HTML_SECRET_NAME = re.compile(r"csrf|xsrf|authenticity|token|secret|api[-_]?key|pass", re.I)
+_HTML_VALUE = re.compile(r"""(\b(?:value|content)\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s"'>]+)""",
+                         re.I)
+MIN_LEARNED_LEN = 8  # shorter runtime values (flags, locales) are too common to scrub
 _HEADER_CONTAINER_KEYS = {"headers", "request_headers", "response_headers", "req_headers",
                           "resp_headers"}
 
@@ -24,18 +34,61 @@ def _ph(kind: str) -> str:
     return f"<redacted:{kind}>"
 
 
+def _variants(s: str) -> set[str]:
+    return {s, quote(s, safe=""), quote(s), quote_plus(s),
+            _json.dumps(s)[1:-1], _json.dumps(s, ensure_ascii=False)[1:-1]}
+
+
+def _html_tag(m: re.Match) -> str:
+    tag = m.group(0)
+    names = [next(g for g in n.groups() if g is not None) for n in _HTML_NAME.finditer(tag)]
+    hit = next((n for n in names if _HTML_SECRET_NAME.search(n)), None)
+    if hit is None and not _HTML_TYPE_PW.search(tag):
+        return tag
+    kind = "csrf" if hit and re.search(r"csrf|xsrf|authenticity", hit, re.I) else (
+        "password" if hit is None or re.search(r"pass", hit, re.I) else "secret")
+    return _HTML_VALUE.sub(lambda v: f'{v.group(1)}"{_ph(kind)}"', tag)
+
+
 class Redactor:
     def __init__(self, secret_values: list[str], extra_patterns: list[str]):
-        # Longest first so a secret containing another is scrubbed whole.
-        variants: set[str] = set()
+        self._variants: set[str] = set()
         for s in secret_values:
             if s:
-                variants |= {s, quote(s, safe=""), quote(s), quote_plus(s),
-                             _json.dumps(s)[1:-1], _json.dumps(s, ensure_ascii=False)[1:-1]}
-        alts = [re.escape(v) for v in sorted(variants, key=len, reverse=True) if v]
-        alts += [f"(?:{p})" for p in extra_patterns]
+                self._variants |= _variants(s)
+        self._patterns = [f"(?:{p})" for p in extra_patterns]
+        self._compile()
+
+    def _compile(self) -> None:
+        # Longest first so a secret containing another is scrubbed whole.
+        alts = [re.escape(v) for v in sorted(self._variants, key=len, reverse=True) if v]
+        alts += self._patterns
         # One pass: placeholders are never rescanned, so short secrets can't corrupt them.
         self._scrub = re.compile("|".join(alts)) if alts else None
+
+    def learn(self, value: str | None) -> bool:
+        """Scrub ``value`` verbatim from now on: session cookie values, Authorization and
+        CSRF header values seen at runtime (opaque tokens no key rule can recognise).
+        Values shorter than ``MIN_LEARNED_LEN``, plain words (no digit, under 20 chars:
+        ``undefined``, ``deleted``) and placeholders are ignored."""
+        if not isinstance(value, str):
+            return False
+        value = value.strip().strip('"')
+        if len(value) < MIN_LEARNED_LEN or "<redacted:" in value or value in self._variants \
+                or (len(value) < 20 and not any(ch.isdigit() for ch in value)):
+            return False
+        self._variants |= _variants(value)
+        self._compile()
+        return True
+
+    def learn_cookies(self, header: str, *, set_cookie: bool = False) -> None:
+        """Learn every cookie value of a ``Cookie`` or (newline-joined) ``Set-Cookie``."""
+        parts = [line.partition(";")[0] for line in header.split("\n")] if set_cookie \
+            else header.split(";")
+        for part in parts:
+            _name, eq, value = part.strip().partition("=")
+            if eq:
+                self.learn(value)
 
     # -- helpers -----------------------------------------------------------
     def _key_kind(self, key: str) -> str | None:
@@ -71,6 +124,8 @@ class Redactor:
         # Literal secrets first; built-in placeholders are inserted afterwards.
         if self._scrub:
             s = self._scrub.sub(_ph("secret"), s)
+        if "<" in s:
+            s = _HTML_TAG.sub(_html_tag, s)
         s = _BEARER.sub(_ph("authorization"), s)
         s = _JWT.sub(_ph("jwt"), s)
         return _URL_USERINFO.sub(lambda m: m.group(1) + _ph("password") + m.group(2), s)

@@ -44,6 +44,7 @@ class Instrumented:
         self.app = _load_app(name)
         self.log: list[dict] = []       # method, path, body (for POST /graphql)
         self.secrets: set[str] = set()  # sid cookie values and bearer tokens handed out
+        self.csrf: set[str] = set()     # per-session CSRF tokens embedded in HTML pages
 
         @self.app.before_request
         def _log():
@@ -58,6 +59,11 @@ class Instrumented:
                 m = re.match(r"sid=([^;]+)", c)
                 if m and m.group(1):
                     self.secrets.add(m.group(1))
+            if (resp.mimetype or "").endswith("html") and not resp.direct_passthrough:
+                for tok in re.findall(r'name="csrf-token" content="([^"]+)"',
+                                      resp.get_data(as_text=True)):
+                    self.csrf.add(tok)
+                    self.secrets.add(tok)
             if request.path == "/api/login" and resp.is_json and resp.status_code == 200:
                 tok = (resp.get_json() or {}).get("token")
                 if tok:
@@ -357,6 +363,7 @@ def assert_no_fixture_controls(server: Instrumented) -> None:
 
 
 def test_ssr_no_secrets_and_scope(ssr):
+    assert ssr["server"].csrf, "the fixture issued no CSRF token"  # I10: opaque HTML tokens
     assert_no_secrets(ssr["run"], ssr["server"].secrets)
     assert_hosts_in_scope(ssr["run"])
     assert_no_fixture_controls(ssr["server"])

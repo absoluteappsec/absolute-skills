@@ -37,6 +37,7 @@ items:
   label: Delete project
   reasons: ["label matches delete keyword 'delete'"]
   predicted_request: {method: POST, url: https://staging.example.com/projects/17/delete}
+  created_by_run: true         # only present when set: found on a record this run created
   decision: pending            # pending | approve | deny | skip
   note: ''                     # free text; kept across rewrites
   execution: executed (ev-000812)   # informational, appears once run or failed
@@ -52,8 +53,8 @@ For every `pending` item, gather context and form a recommendation:
 1. Where it is: `appmap query --run <run> sql "SELECT id, state_id, action_path, predicted_request FROM approvals WHERE id = 'ap-0003'"`;
    the screenshot `<run>/artifacts/<state_id>.png` and DOM `<run>/artifacts/<state_id>.html`.
 2. What it would touch: does the predicted URL or label reference a record **this run created**
-   (contains the run marker `appmap-<run_id>`, or an id returned by one of this run's writes)? Or
-   pre-existing/shared data?
+   (`created_by_run: true`, the run marker `appmap-<run_id>` in it, or an id returned by one of
+   this run's writes)? Or pre-existing/shared data?
 3. Side effects: emails/SMS/invites to real people, payments, external integrations, account
    lockout or deactivation, loss of the role's own access.
 4. Reversibility and environment: staging vs production (`run.json` → `profile`).
@@ -86,11 +87,14 @@ held, **your recommendation and reason** — and ask for a decision per item or 
 
 - Say plainly that unanswered items stay pending (unexercised) and that is acceptable.
 - Logout items: tell them these are never executed even if approved; `skip` is the natural answer.
-- Offer batch rules only as an option, spelled out exactly, e.g. "approve every delete whose URL
-  contains `appmap-20261024-120000`" →
-  `{match: {category: delete, url_contains: appmap-20261024-120000}, decision: approve}`.
-  Match keys are `category`, `role`, `url_contains`, `label_contains` (all must match); the
-  first matching rule wins; rules never change an item that already has a decision.
+- Offer batch rules only as an option, spelled out exactly, e.g. "approve every delete of a
+  record this run created" →
+  `{match: {category: delete, created_by_run: true}, decision: approve}`. Records are usually
+  addressed by numeric ids, so `created_by_run` (set when the crawler queued the action from the
+  page a successful create landed on) is the reliable key; `url_contains: appmap-<run_id>` only
+  matches slug URLs that carry the marker. Match keys are `category`, `role`, `url_contains`,
+  `label_contains` (strings) and `created_by_run` (`true`/`false`); all must match; the first
+  matching rule wins; rules never change an item that already has a decision.
 - **Tell the human explicitly, before they agree to a rule:** a rule also decides matching items
   that are queued **later** in this run — they will be approved (and executed by the next
   `--approved-only` crawl) without being shown individually. Offer per-item decisions instead if

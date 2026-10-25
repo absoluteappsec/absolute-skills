@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import parse_qsl, unquote, unquote_plus, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, unquote_plus, urljoin, urlsplit, urlunsplit
 
 import yaml
 
@@ -209,8 +209,29 @@ def _consumer_tokens(store: Store, row) -> dict[str, set[str]]:
     return toks
 
 
+def _location_leaves(row) -> list[tuple[str, Any]]:
+    """A redirect's ``Location`` as producer leaves (SSR apps hand out a created record's id
+    in the redirect, not in JSON): ``$location.path[i]`` per segment, ``$location.query.k``."""
+    headers = _loads(row["resp_headers"], {}) or {}
+    loc = next((v for k, v in headers.items()
+                if isinstance(k, str) and k.lower() == "location" and isinstance(v, str)), None)
+    if not loc:
+        return []
+    parts = urlsplit(urljoin(row["url"] or "", loc))
+    out: list[tuple[str, Any]] = [(f"$location.path[{i}]", _int_or_str(unquote(seg)))
+                                  for i, seg in enumerate(s for s in parts.path.split("/") if s)]
+    out += [(f"$location.query.{k}", _int_or_str(v))
+            for k, v in parse_qsl(parts.query, keep_blank_values=False)]
+    return out
+
+
+def _int_or_str(v: str) -> Any:
+    return int(v) if v.isdigit() and len(v) < 19 else v
+
+
 def derive_value_links(store: Store, *, marker: str | None = None) -> int:
-    """Rebuild ``value_links``: a JSON response leaf later sent by the same role.
+    """Rebuild ``value_links``: a JSON response leaf (or a segment/parameter of a redirect's
+    ``Location``) later sent by the same role.
 
     A value links only from its first producer, only when the role had not already sent it
     (including in the producer's own request), and never when it is a redacted placeholder,
@@ -220,7 +241,8 @@ def derive_value_links(store: Store, *, marker: str | None = None) -> int:
     marker = marker if marker is not None else run_marker(store)
     rows = store.conn.execute(
         "SELECT id, role, method, url, req_headers, req_body, req_body_path, content_type, "
-        "resp_body, resp_body_path FROM exchanges WHERE role IS NOT NULL ORDER BY id").fetchall()
+        "resp_headers, resp_body, resp_body_path FROM exchanges WHERE role IS NOT NULL "
+        "ORDER BY id").fetchall()
     # inverted index per role: value -> [(exchange id, location)]
     index: dict[str, dict[str, list[tuple[int, str]]]] = defaultdict(lambda: defaultdict(list))
     total: dict[str, int] = defaultdict(int)
@@ -233,17 +255,17 @@ def derive_value_links(store: Store, *, marker: str | None = None) -> int:
     seen: set[tuple[str, str]] = set()
     n = 0
     for r in rows:
-        if "json" not in (r["content_type"] or "").lower():
-            continue
-        text = _body_text(store, r["resp_body"], r["resp_body_path"])
-        try:
-            obj = json.loads(text) if text else None
-        except ValueError:
-            continue
-        if not isinstance(obj, (dict, list)):
-            continue
+        leaves = _location_leaves(r)
+        if "json" in (r["content_type"] or "").lower():
+            text = _body_text(store, r["resp_body"], r["resp_body_path"])
+            try:
+                obj = json.loads(text) if text else None
+            except ValueError:
+                obj = None
+            if isinstance(obj, (dict, list)):
+                leaves += _leaves(obj)
         role, pid = r["role"], r["id"]
-        for jpath, leaf in _leaves(obj):
+        for jpath, leaf in leaves:
             v = _candidate(leaf, marker)
             if v is None or (role, v) in seen:
                 continue

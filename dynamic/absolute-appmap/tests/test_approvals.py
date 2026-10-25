@@ -135,3 +135,43 @@ def test_pending_revokes_and_typos_warn(tmp_path):
     assert q.load_decisions() == 1
     row = q.store.conn.execute("SELECT decision, decided_by FROM approvals WHERE id=?", (a,)).fetchone()
     assert tuple(row) == ("pending", None)
+
+
+def test_created_by_run_rule_matches_numeric_id_records(tmp_path):
+    """I8: records the crawler created are addressed by numeric ids (no marker in the URL);
+    their held actions carry created_by_run, a rule match key."""
+    import sqlite3
+    q = _q(tmp_path)
+    own = _pa(label="Delete", url="http://t/projects/26/delete")
+    own.created_by_run = True
+    mine = q.enqueue(own)
+    other = q.enqueue(_pa(label="Delete", url="http://t/projects/3/delete",
+                          path=[{"op": "click", "label": "other"}]))
+    q.yaml_path.write_text(yaml.safe_dump({"rules": [
+        {"match": {"category": "delete", "created_by_run": True}, "decision": "approve"},
+        {"match": {"created_by_run": "yes"}, "decision": "approve"}]}))
+    q.load_decisions()
+    assert _decision(q, mine) == "approve" and _decision(q, other) == "pending"
+    assert any("created_by_run" in w and "true or false" in w for w in q.warnings)
+    q.write_yaml()
+    items = {i["id"]: i for i in yaml.safe_load(q.yaml_path.read_text())["items"]}
+    assert items[mine]["created_by_run"] is True and "created_by_run" not in items[other]
+    # re-queueing the same action from a created record's page tags the existing row
+    again = _pa(label="Delete", url="http://t/projects/3/delete",
+                path=[{"op": "click", "label": "other"}])
+    again.created_by_run = True
+    assert q.enqueue(again) == other
+    assert q.store.conn.execute("SELECT created_by_run FROM approvals WHERE id=?",
+                                (other,)).fetchone()[0] == 1
+    # an approvals table created before the column existed is migrated
+    db = tmp_path / "old.db"
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE approvals (id TEXT PRIMARY KEY, role TEXT, state_id TEXT, "
+              "category TEXT, label TEXT, reasons TEXT, action_path TEXT, predicted_request TEXT, "
+              "decision TEXT NOT NULL DEFAULT 'pending', decided_by TEXT, executed_event TEXT)")
+    c.commit()
+    c.close()
+    s = Store(db)
+    s.init_schema()
+    assert "created_by_run" in {r[1] for r in s.conn.execute("PRAGMA table_info(approvals)")}
+    s.close()

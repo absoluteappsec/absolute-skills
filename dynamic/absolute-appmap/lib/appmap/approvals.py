@@ -11,7 +11,7 @@ import yaml
 from .store import Store
 
 _DECISIONS = {"approve", "deny", "skip"}
-_MATCH_KEYS = {"category", "role", "url_contains", "label_contains"}
+_MATCH_KEYS = {"category", "role", "url_contains", "label_contains", "created_by_run"}
 _FAILED_KEY = "approval_failed:"  # meta key prefix: why an approved item could not run
 _INFLIGHT_KEY = "approval_inflight:"  # meta key prefix: final action let through, not finished
 
@@ -26,6 +26,9 @@ class PendingAction:
     reasons: list[str] = field(default_factory=list)
     action_path: list[dict] = field(default_factory=list)
     predicted_request: dict | None = None
+    # the action targets a record the crawler created in this run (marker-scoped rules
+    # cannot see numeric ids): rule match key ``created_by_run: true``
+    created_by_run: bool = False
 
 
 def _loads(v):
@@ -61,7 +64,8 @@ class ApprovalQueue:
         return PendingAction(id=r["id"], role=r["role"], state_id=r["state_id"], category=r["category"],
                              label=r["label"] or "", reasons=_loads(r["reasons"]) or [],
                              action_path=_loads(r["action_path"]) or [],
-                             predicted_request=_loads(r["predicted_request"]))
+                             predicted_request=_loads(r["predicted_request"]),
+                             created_by_run=bool(r["created_by_run"]))
 
     def enqueue(self, pa: PendingAction) -> str:
         want = _key(pa.role, pa.action_path, pa.label, pa.predicted_request)
@@ -69,6 +73,9 @@ class ApprovalQueue:
         for r in self._rows():
             if _key(r["role"], _loads(r["action_path"]) or [], r["label"],
                     _loads(r["predicted_request"])) == want:
+                if pa.created_by_run and not r["created_by_run"]:
+                    self.store.upsert_approval(r["id"], created_by_run=True)
+                pa.id = r["id"]
                 return r["id"]
             try:
                 n = max(n, int(r["id"].split("-")[1]))
@@ -77,7 +84,8 @@ class ApprovalQueue:
         id_ = f"ap-{n + 1:04d}"
         self.store.upsert_approval(id_, role=pa.role, state_id=pa.state_id, category=pa.category,
                                    label=pa.label, reasons=pa.reasons, action_path=pa.action_path,
-                                   predicted_request=pa.predicted_request, decision="pending")
+                                   predicted_request=pa.predicted_request, decision="pending",
+                                   created_by_run=pa.created_by_run)
         pa.id = id_
         return id_
 
@@ -97,6 +105,8 @@ class ApprovalQueue:
                     "label": r["label"], "reasons": _loads(r["reasons"]) or [],
                     "predicted_request": _loads(r["predicted_request"]),
                     "decision": r["decision"], "note": notes.get(r["id"]) or ""}
+            if r["created_by_run"]:
+                item["created_by_run"] = True  # informational; ignored when loading
             execution = self._execution(r["executed_event"], failed.get(r["id"]))
             if execution:
                 item["execution"] = execution  # informational; ignored when loading
@@ -134,6 +144,10 @@ class ApprovalQueue:
         for k, v in match.items():
             if k not in _MATCH_KEYS:
                 return f"unknown match key {k!r}"
+            if k == "created_by_run":
+                if not isinstance(v, bool):
+                    return "match key 'created_by_run' must be true or false"
+                continue
             if not isinstance(v, str) or not v.strip():
                 return f"match key {k!r} must be a non-empty string"
         return None
@@ -143,6 +157,8 @@ class ApprovalQueue:
         if "category" in match and match["category"] != pa.category:
             return False
         if "role" in match and match["role"] != pa.role:
+            return False
+        if "created_by_run" in match and match["created_by_run"] != pa.created_by_run:
             return False
         if "url_contains" in match and match["url_contains"].lower() not in _request_url(
                 pa.predicted_request, pa.action_path).lower():

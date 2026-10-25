@@ -214,7 +214,11 @@ def redact_bytes(redactor: Redactor, raw: bytes) -> bytes:
     return redactor.text(raw.decode("latin-1")).encode("latin-1", errors="replace")
 
 
-def redact_text(redactor: Redactor, text: str) -> str:
+def redact_text(redactor: Redactor, text: str, content_type: str | None = None) -> str:
+    """JSON by key, form-urlencoded by parameter name (``authenticity_token=…``), anything
+    else (HTML included: hidden CSRF inputs, meta tokens) as text."""
+    if "x-www-form-urlencoded" in (content_type or "").lower():
+        return redactor.url("x?" + text)[2:]
     obj = _json_or_none(text)
     if isinstance(obj, (dict, list)):
         return json.dumps(redactor.json(obj), ensure_ascii=False)
@@ -228,7 +232,9 @@ def record_exchange(store: Store, events: EventLog, redactor: Redactor, rd: RunD
                     known_patterns: list[str], source: str | None = None,
                     attribute: bool | str = True) -> int:
     """``attribute``: False records the exchange without endpoint/response rows; "ok"
-    attributes only 2xx responses (guessed paths that 404 leave no map entries)."""
+    attributes only 2xx responses (guessed paths that 404 leave no map entries);
+    "ok_nonhtml" also skips HTML answers (a catch-all SPA serves index.html for every
+    guessed robots/sitemap/well-known/OpenAPI/bundle URL)."""
     if source is None:
         if origin not in _SOURCE_BY_ORIGIN:
             raise ValueError(f"origin {origin!r} has no default source; pass source=")
@@ -250,7 +256,10 @@ def record_exchange(store: Store, events: EventLog, redactor: Redactor, rd: RunD
                           duration_ms=duration_ms, size=len(resp_body or b""))
 
     # Endpoint
-    attributed = attribute is True or (attribute == "ok" and 200 <= status < 300)
+    attributed = attribute is True or (attribute in ("ok", "ok_nonhtml")
+                                       and 200 <= status < 300)
+    if attribute == "ok_nonhtml" and _base_ct(resp_ct) in ("text/html", "application/xhtml+xml"):
+        attributed = False
     gql = _graphql(req_text)
     path = parts.path or "/"
     endpoint_id = None
@@ -284,7 +293,7 @@ def record_exchange(store: Store, events: EventLog, redactor: Redactor, rd: RunD
         if text is None:
             files[side] = (redact_bytes(redactor, raw), _ext(ct, False))
             continue
-        safe = redact_text(redactor, text)
+        safe = redact_text(redactor, text, ct)
         if len(safe.encode("utf-8")) <= INLINE_LIMIT:
             inline[side] = safe
         else:

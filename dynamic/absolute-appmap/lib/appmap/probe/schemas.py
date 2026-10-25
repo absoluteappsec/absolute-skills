@@ -159,8 +159,8 @@ async def probe_schemas(client: DirectClient, api, cfg, store: Store, role: str,
     for url in candidates:
         if not alive():
             return counts
-        got = await with_source(client, "openapi").request(api, "GET", url, role=role,
-                                                            origin="passive")
+        got = await with_source(client, "openapi", attribute="ok_nonhtml").request(
+            api, "GET", url, role=role, origin="passive")
         counts["requests"] += 1
         if got is None or got[0] != 200:
             continue

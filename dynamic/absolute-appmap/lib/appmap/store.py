@@ -52,6 +52,7 @@ class Store:
     def init_schema(self) -> None:
         sql = resources.files("appmap").joinpath("schema.sql").read_text(encoding="utf-8")
         self.conn.executescript(sql)
+        self._add_missing_columns()
         existing = self.get_meta("schema_version")
         if existing is None:
             self.set_meta("schema_version", SCHEMA_VERSION)
@@ -59,6 +60,17 @@ class Store:
             raise RuntimeError(
                 f"{self.db_path}: database schema version {existing} is incompatible "
                 f"with supported version {SCHEMA_VERSION} (major version differs)")
+
+    # Additive columns introduced after a database may have been created (schema minor
+    # changes): table -> [(column, declaration)].
+    _ADDED_COLUMNS = {"approvals": [("created_by_run", "INTEGER NOT NULL DEFAULT 0")]}
+
+    def _add_missing_columns(self) -> None:
+        for table, cols in self._ADDED_COLUMNS.items():
+            have = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            for name, decl in cols:
+                if name not in have:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     # -- helpers -----------------------------------------------------------
     def _insert(self, table: str, data: dict[str, Any]) -> int:
@@ -248,11 +260,13 @@ class Store:
                         category: str | None = None, label: str | None = None,
                         reasons: list | None = None, action_path: list | None = None,
                         predicted_request: dict | None = None, decision: str | None = None,
-                        decided_by: str | None = None, executed_event: str | None = None) -> str:
+                        decided_by: str | None = None, executed_event: str | None = None,
+                        created_by_run: bool | None = None) -> str:
         vals = dict(role=role, state_id=state_id, category=category, label=label,
                     reasons=_j(reasons), action_path=_j(action_path),
                     predicted_request=_j(predicted_request), decision=decision,
-                    decided_by=decided_by, executed_event=executed_event)
+                    decided_by=decided_by, executed_event=executed_event,
+                    created_by_run=None if created_by_run is None else int(created_by_run))
         vals = {k: v for k, v in vals.items() if v is not None}
         cols = ["id", *vals]
         sql = f"INSERT INTO approvals({','.join(cols)}) VALUES({','.join('?' * len(cols))}) ON CONFLICT(id) "

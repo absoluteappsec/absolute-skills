@@ -1,3 +1,5 @@
+import json
+
 from appmap.redact import Redactor
 
 JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig_nature-1"
@@ -116,3 +118,33 @@ def test_json_non_str_values_scrubbed():
     out = r.json({"b": b"pw=hunter2", "e": Exception("Bearer abc"), "p": Path("/x/hunter2"), "n": 1})
     assert out == {"b": "pw=<redacted:secret>", "e": "<redacted:authorization>",
                    "p": "/x/<redacted:secret>", "n": 1}
+
+
+def test_html_csrf_inputs_and_meta_redacted():
+    """I10: opaque tokens in HTML (hidden inputs, meta tags) are not under a header or JSON
+    key; they are scrubbed by attribute name, whatever the attribute order."""
+    r = Redactor([], [])
+    html = ('<meta name="csrf-token" content="Zx81kQ0aPq">'
+            "<meta content='Ab12Cd34Ef' name='_xsrf'>"
+            '<input type="hidden" value="tok-91827364" name="authenticity_token">'
+            '<input type=hidden name=api_key value=k-5566778899>'
+            '<input type="password" value="hunter22">'
+            '<meta name="viewport" content="width=device-width">'
+            '<input name="title" value="appmap-1 demo">')
+    out = r.text(html)
+    for secret in ("Zx81kQ0aPq", "Ab12Cd34Ef", "tok-91827364", "k-5566778899", "hunter22"):
+        assert secret not in out
+    assert '<redacted:csrf>' in out and '<redacted:secret>' in out
+    assert 'content="width=device-width"' in out and 'value="appmap-1 demo"' in out
+
+
+def test_learned_runtime_values_scrubbed_everywhere():
+    r = Redactor([], [])
+    assert r.text("session 6f1d2c3b4a59") == "session 6f1d2c3b4a59"
+    r.learn_cookies("sid=6f1d2c3b4a59; theme=dark; lang=en")
+    r.learn_cookies("remember=AAAA1111CCCC; Path=/; HttpOnly\nflag=1", set_cookie=True)
+    assert not r.learn("short") and not r.learn("undefined")
+    out = r.text("ids: 6f1d2c3b4a59 AAAA1111CCCC dark en 1")
+    assert "6f1d2c3b4a59" not in out and "AAAA1111CCCC" not in out
+    assert out.endswith("dark en 1")
+    assert "6f1d2c3b4a59" not in json.dumps(r.json({"note": "token=6f1d2c3b4a59"}))
