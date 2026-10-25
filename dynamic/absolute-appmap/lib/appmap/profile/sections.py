@@ -461,7 +461,8 @@ def environment(run_dir: Path) -> dict:
         "profile": meta.get("profile"),
         "started_at": meta.get("started_at"),
         "tool_version": meta.get("tool_version"),
-        "contains_production_data": bool(meta.get("contains_production_data")),
+        "contains_production_data": bool(meta.get("contains_production_data"))
+        or meta.get("profile") == "production",
     }
 
 

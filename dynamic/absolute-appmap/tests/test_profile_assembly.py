@@ -144,7 +144,8 @@ def test_names_survive_rerun_and_vanished_key_goes_stale(ssr_profile, tmp_path):
     doc = yaml.safe_load(path.read_text())
     keys = [f["key"] for f in doc["features"]]
     assert keys == [f["key"] for f in ssr_profile["features"]]
-    assert all(f["name"] == f["name"] and f["description"] == "" for f in doc["features"])
+    assert all(f["name"] == ft["name_suggestion"] and f["description"] == ""
+               for f, ft in zip(doc["features"], ssr_profile["features"]))
     assert doc["stale"] == []
     doc["purpose"] = "Tracks projects."
     doc["features"][0].update(name="Project board", description="d", how_it_works="h")
@@ -184,3 +185,111 @@ def test_apply_names_fills_profile_and_ignores_malformed(ssr_profile, tmp_path):
     assert names.apply_profile_names(p, tmp_path / "missing.yaml") == 0
     (tmp_path / "bad.yaml").write_text(": : [")
     assert names.apply_profile_names(p, tmp_path / "bad.yaml") == 0
+
+
+def test_unparseable_names_file_untouched_with_backup(ssr_profile, tmp_path):
+    path = tmp_path / "profile-names.yaml"
+    path.write_text("purpose: hand written\nfeatures: [unclosed\n")
+    before = path.read_text()
+    warns = names.emit_profile_names(ssr_profile, path)
+    assert path.read_text() == before
+    assert (tmp_path / "profile-names.yaml.bak").read_text() == before
+    assert len(warns) == 1 and ".bak" in warns[0]
+    assert names.apply_profile_names({**ssr_profile, "feature_names": {}}, path) == 0
+
+
+def test_untouched_stub_vanishes_without_stale_noise(ssr_profile, tmp_path):
+    path = tmp_path / "n.yaml"
+    names.emit_profile_names(ssr_profile, path)
+    doc = yaml.safe_load(path.read_text())
+    stubs = [dict(f) for f in doc["features"]]
+    one = {**ssr_profile["features"][0]}
+    p_few = {**ssr_profile, "features": [one]}
+    kept, renamed, described = stubs[1], stubs[2], stubs[3] if len(stubs) > 3 else None
+    renamed["name"] = "My name"
+    if described:
+        described["description"] = "hand text"
+    doc["features"] = [stubs[0], kept, renamed] + ([described] if described else [])
+    path.write_text(yaml.safe_dump(doc))
+    names.emit_profile_names(p_few, path)
+    stale = {s["key"] for s in yaml.safe_load(path.read_text())["stale"]}
+    assert renamed["key"] in stale and kept["key"] not in stale
+    if described:
+        assert described["key"] in stale
+
+
+def test_malformed_entries_preserved_and_scalars_coerced(ssr_profile, tmp_path):
+    path = tmp_path / "n.yaml"
+    k = ssr_profile["features"][0]["key"]
+    path.write_text(yaml.safe_dump({"purpose": "p", "features": [
+        "junk", {"key": k, "name": 42, "description": ["list"]}, {"name": "no key"}]}))
+    names.emit_profile_names(ssr_profile, path)
+    feats = yaml.safe_load(path.read_text())["features"]
+    assert "junk" in feats and {"name": "no key"} in feats
+    assert {"key": k, "name": 42, "description": ["list"]} in feats  # uncoercible: verbatim
+    path.write_text(yaml.safe_dump({"features": [{"key": k, "name": 42}]}))
+    names.emit_profile_names(ssr_profile, path)
+    assert next(f for f in yaml.safe_load(path.read_text())["features"]
+                if f["key"] == k)["name"] == "42"
+
+
+def test_key_in_both_features_and_stale_is_deduped(ssr_profile, tmp_path):
+    path = tmp_path / "n.yaml"
+    k = ssr_profile["features"][0]["key"]
+    path.write_text(yaml.safe_dump({"features": [{"key": k, "name": "Live"}],
+                                    "stale": [{"key": k, "name": "Old"}]}))
+    names.emit_profile_names(ssr_profile, path)
+    doc = yaml.safe_load(path.read_text())
+    assert doc["stale"] == []
+    assert [f["name"] for f in doc["features"] if f["key"] == k] == ["Live"]
+
+
+def test_pending_frontier_makes_partial(ssr_built_run, tmp_path):
+    run = _copy_run(ssr_built_run, tmp_path, "pend", "20990505-000000")
+    _sql(run, "INSERT INTO frontier(role, kind, url, status) "
+              "VALUES('admin','url','http://x/never','pending')")
+    p = build_profile([run])
+    assert p["status"] == "partial"
+    assert any("crawl not finished: 1 pending frontier items" in c["reason"]
+               for c in p["could_not_determine"])
+
+
+def test_corrupt_run_json_and_broken_sections_do_not_raise(ssr_built_run, tmp_path):
+    run = _copy_run(ssr_built_run, tmp_path, "broken", "20990606-000000")
+    (run / "run.json").write_text("{not json")
+    _sql(run, "DROP TABLE value_links", "DROP TABLE role_access")
+    p = build_profile([run])
+    assert p["status"] == "partial"
+    items = {c["item"]: c["reason"] for c in p["could_not_determine"]}
+    assert "run metadata" in items
+    assert any("OperationalError" in r for r in items.values())
+    assert any(i in items for i in ("layout", "coverage", "accounts"))
+    assert p["environments"][0]["contains_production_data"] is True  # unknown -> masked
+
+
+def test_missing_sqlite_is_an_error(tmp_path):
+    (tmp_path / "empty-run").mkdir()
+    with pytest.raises(FileNotFoundError):
+        build_profile([tmp_path / "empty-run"])
+
+
+def _seed_observed(run, value):
+    _sql(run, "INSERT INTO exchanges(role, origin, method, url, status, content_type, "
+              f"resp_body) VALUES('admin','ui','GET','http://x/api/me',200,'application/json',"
+              f"'{{\"email\": \"{value}\"}}')")
+
+
+def test_second_run_production_masks_observed_in_all_runs(ssr_built_run, tmp_path):
+    first = _copy_run(ssr_built_run, tmp_path, "stg", "20990707-000000")
+    second = _copy_run(ssr_built_run, tmp_path, "prod2", "20990708-000000")
+    _seed_observed(first, "carol.stage@corp.example")
+    meta = json.loads((second / "run.json").read_text())
+    meta["contains_production_data"] = False
+    meta["profile"] = "production"  # flag absent: profile alone marks production
+    (second / "run.json").write_text(json.dumps(meta))
+    masked = build_profile([first, second])
+    vals = [o["value"] for o in masked["accounts"]["observed"]]
+    assert "c***@corp.example" in vals and "carol.stage@corp.example" not in vals
+    shown = build_profile([first, second], include_observed_accounts=True)
+    assert "carol.stage@corp.example" in [o["value"] for o in shown["accounts"]["observed"]]
+    assert masked["environments"][1]["contains_production_data"] is True
