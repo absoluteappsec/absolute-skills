@@ -181,3 +181,72 @@ async def test_catch_all_spa_guesses_not_attributed(api, stub_server, make_cfg, 
     assert _rows(rt.store, "SELECT count(*) FROM exchanges")[0][0] > 5  # they were fetched
     assert _rows(rt.store, "SELECT method, path_pattern FROM endpoints") == []
     rt.store.close()
+
+
+_DJANGO_404 = """<!DOCTYPE html><html lang="en"><head>
+  <title>Page not found at /robots.txt</title></head><body>
+<div id="summary"><h1>Page not found <span>(404)</span></h1></div>
+<div id="info">
+    <p>Using the URLconf defined in <code>taskManager.urls</code>,
+    Django tried these URL patterns, in this order:</p>
+    <ol>
+        <li>
+            <code>admin/</code>
+        </li>
+        <li>
+            <code>taskManager/</code>
+            <code>
+              [name='index']
+            </code>
+        </li>
+        <li>
+            <code>taskManager/</code>
+            <code>forgot_password/ [name='forgot_password']</code>
+        </li>
+        <li>
+            <code>taskManager/</code>
+            <code>&lt;int:project_id&gt;/edit_project/ [name='edit_project']</code>
+        </li>
+        <li>
+            <code>^legacy/</code>
+            <code>^report/(?P&lt;report_id&gt;\\d+)/$ [name='report']</code>
+        </li>
+        <li>
+            <code>^static/(?P&lt;path&gt;.*)$</code>
+        </li>
+    </ol>
+    <p>The current path, <code>robots.txt</code>, didn't match any of these.</p>
+</div>
+<div id="explanation"><p>You're seeing this error because you have <code>DEBUG = True</code>
+  in your Django settings file.</p></div></body></html>"""
+
+
+def test_parse_django_urlconf():
+    from appmap.probe.passive import parse_django_urlconf
+    assert parse_django_urlconf(_DJANGO_404) == [
+        "/admin/", "/taskManager/", "/taskManager/forgot_password/",
+        "/taskManager/{project_id}/edit_project/", "/legacy/report/{report_id}/",
+        "/static/{path}"]
+    assert parse_django_urlconf("<p>Not Found</p>") == []
+
+
+async def test_django_debug_404_routes_queued(api, stub_server, make_cfg, run_dir, tmp_path):
+    from werkzeug.wrappers import Response
+    srv = stub_server({"/robots.txt": lambda r: Response(_DJANGO_404, status=404,
+                                                         mimetype="text/html")})
+    cfg = make_cfg(srv.url)
+    rd = run_dir(tmp_path, cfg)
+    rt, client = _client(cfg, rd)
+    counts = await probe_passive(client, api, cfg, rt.store, Frontier(rt.store), "anonymous")
+    routes = dict(_rows(rt.store, "SELECT r.pattern, s.source FROM routes r JOIN sources s "
+                                  "ON s.item_kind='route' AND s.item_id=r.id"))
+    for p in ("/admin", "/taskManager/forgot_password",  # route patterns are normalized
+              "/taskManager/{project_id}/edit_project", "/legacy/report/{report_id}"):
+        assert routes[p] == "well_known"
+    assert counts["routes"] >= 5
+    for role in [r.name for r in cfg.roles]:
+        urls = {r[0] for r in _rows(rt.store, f"SELECT url FROM frontier WHERE role='{role}'")}
+        assert srv.url + "/taskManager/forgot_password/" in urls
+        assert srv.url + "/admin/" in urls
+        assert not any("{" in u or "project_id" in u for u in urls)  # only concrete paths
+    rt.store.close()

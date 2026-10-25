@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
+
+import yaml
 
 from ..direct import DirectClient
 from ..normalize import normalize_path
@@ -12,7 +15,18 @@ from ..store import Store
 from ._common import base_origins, expired, with_source
 
 OPENAPI_PATHS = ("/openapi.json", "/swagger.json", "/v3/api-docs", "/api-docs",
-                 "/swagger/v1/swagger.json", "/api/openapi.json")
+                 "/swagger/v1/swagger.json", "/api/openapi.json",
+                 # drf-spectacular / drf-yasg / common framework defaults (JSON or YAML)
+                 "/schema/", "/api/schema/", "/openapi/", "/openapi.yaml", "/swagger.yaml",
+                 "/api/swagger.json", "/api/v1/openapi.json", "/swagger/?format=openapi")
+# Swagger UI / ReDoc pages: never a schema themselves, but they name the spec URL.
+DOCS_UI_PATHS = ("/swagger-ui/", "/redoc/", "/api/docs/")
+_SWAGGER_UI = "SwaggerUIBundle("
+_SPEC_URL = re.compile(r"""(?<![\w$])["']?url["']?\s*:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')""")
+_REDOC_ATTR = re.compile(r"""<redoc\b[^>]*\bspec-url\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""",
+                         re.I)
+_REDOC_INIT = re.compile(r"""Redoc\.init\(\s*(?:"([^"]+)"|'([^']+)')""")
+_UI_WINDOW = 4000
 GRAPHQL_PATHS = ("/graphql", "/api/graphql")
 _METHODS = ("get", "put", "post", "delete", "options", "head", "patch", "trace")
 _IN = {"path": "path", "query": "query", "header": "header", "cookie": "cookie",
@@ -116,6 +130,54 @@ def parse_openapi(doc: dict) -> list[SchemaOp]:
     return ops
 
 
+def _js_string(s: str) -> str:
+    """Undo JS string escapes (Django ``escapejs`` writes ``/`` as ``\\u002F``)."""
+    try:
+        return json.loads('"' + s.replace('"', '\\"').replace('\\\\"', '\\"') + '"')
+    except ValueError:
+        return s.replace("\\/", "/")
+
+
+def is_docs_ui(text: str) -> bool:
+    return _SWAGGER_UI in (text or "") or bool(_REDOC_ATTR.search(text or "")) \
+        or "Redoc.init(" in (text or "")
+
+
+def spec_urls_from_html(text: str, page_url: str) -> list[str]:
+    """Spec URLs a Swagger UI (``SwaggerUIBundle({url: ..}`` / ``urls: [{url: ..}]``) or
+    ReDoc (``<redoc spec-url=..>``, ``Redoc.init(..)``) page loads, absolute."""
+    found: list[str] = []
+    text = text or ""
+    start = text.find(_SWAGGER_UI)
+    while start >= 0:
+        window = text[start:start + _UI_WINDOW]
+        for m in _SPEC_URL.finditer(window):
+            found.append(_js_string(m.group(1) if m.group(1) is not None else m.group(2)))
+        start = text.find(_SWAGGER_UI, start + 1)
+    for rx in (_REDOC_ATTR, _REDOC_INIT):
+        for m in rx.finditer(text):
+            found.append(next(g for g in m.groups() if g is not None))
+    out: list[str] = []
+    for u in found:
+        u = urljoin(page_url, u.strip())
+        if u.startswith(("http://", "https://")) and u not in out:
+            out.append(u)
+    return out
+
+
+def load_spec(text: str):
+    """A schema document parsed as JSON, else YAML (drf-spectacular serves YAML by
+    default); None when it is neither."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    try:
+        return yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None
+
+
 def parse_introspection(result) -> list[tuple[str, str]]:
     """``(operation_type, field_name)`` for every root field of an introspection result."""
     if not isinstance(result, dict):
@@ -150,13 +212,25 @@ async def probe_schemas(client: DirectClient, api, cfg, store: Store, role: str,
         return True
 
     # -- OpenAPI ------------------------------------------------------------
-    candidates = [o + p for o in origins for p in OPENAPI_PATHS]
+    candidates = [o + p for o in origins for p in OPENAPI_PATHS + DOCS_UI_PATHS]
     for (url,) in store.conn.execute(
             "SELECT DISTINCT url FROM exchanges WHERE (url LIKE '%openapi%' OR url LIKE '%swagger%') "
-            "AND lower(substr(url, 1, instr(url || '?', '?') - 1)) LIKE '%.json'"):
+            "AND (lower(substr(url, 1, instr(url || '?', '?') - 1)) LIKE '%.json' "
+            "OR lower(substr(url, 1, instr(url || '?', '?') - 1)) LIKE '%.yaml' "
+            "OR lower(substr(url, 1, instr(url || '?', '?') - 1)) LIKE '%.yml')"):
         if url not in candidates and scope.allows(url):
             candidates.append(url)
-    for url in candidates:
+    # Swagger UI / ReDoc pages the crawl already recorded name their spec URL.
+    for row in store.conn.execute(
+            "SELECT url, resp_body FROM exchanges WHERE resp_body LIKE '%SwaggerUIBundle(%' "
+            "OR resp_body LIKE '%<redoc%' OR resp_body LIKE '%Redoc.init(%'").fetchall():
+        for u in spec_urls_from_html(row["resp_body"], row["url"]):
+            if u not in candidates and scope.allows(u):
+                candidates.append(u)
+    i = 0
+    while i < len(candidates):
+        url = candidates[i]
+        i += 1
         if not alive():
             return counts
         got = await with_source(client, "openapi", attribute="ok_nonhtml").request(
@@ -164,10 +238,20 @@ async def probe_schemas(client: DirectClient, api, cfg, store: Store, role: str,
         counts["requests"] += 1
         if got is None or got[0] != 200:
             continue
+        ctype = (got[1].headers.get("content-type") or "").lower()
         try:
-            ops = parse_openapi(json.loads(await got[1].text()))
-        except ValueError:
+            text = await got[1].text()
+        except Exception:  # undecodable body: not a schema
             continue
+        if "html" in ctype:
+            # never a schema (a catch-all SPA's index.html); maybe a docs page naming one
+            if is_docs_ui(text):
+                for u in spec_urls_from_html(text, url):
+                    if u not in candidates and scope.allows(u):
+                        candidates.append(u)
+            continue
+        try:
+            ops = parse_openapi(load_spec(text))
         except Exception as exc:  # malformed real-world document: skip it, keep probing
             log.warning("openapi %s: unparseable document (%s: %s)", url, type(exc).__name__, exc)
             if client.events is not None:

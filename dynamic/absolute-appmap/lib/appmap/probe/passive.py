@@ -4,6 +4,7 @@ from __future__ import annotations
 import html
 import json
 import re
+from pathlib import Path
 from urllib.parse import urldefrag, urljoin, urlsplit
 
 from ..direct import DirectClient
@@ -52,6 +53,43 @@ def parse_sitemap(xml: str) -> tuple[list[str], list[str]]:
     if re.search(r"<sitemapindex", xml or "", re.I):
         return [], locs
     return locs, []
+
+
+_DJANGO_URLCONF = re.compile(r"Using the URLconf defined in.*?<ol>(.*?)</ol>", re.S | re.I)
+_LI = re.compile(r"<li\b[^>]*>(.*?)</li>", re.S | re.I)
+_CODE = re.compile(r"<code\b[^>]*>(.*?)</code>", re.S | re.I)
+_DJ_NAME = re.compile(r"\[name=['\"][^'\"]*['\"]\]")
+_DJ_GROUP = re.compile(r"\(\?P<(\w+)>(?:[^()]|\([^()]*\))*\)")
+_DJ_CONVERTER = re.compile(r"<(?:\w+:)?(\w+)>")
+_DJ_ESCAPED = re.compile(r"\\([./_-])")
+_DJ_REGEX_LEFT = re.compile(r"[\\()\[\]*+?|<>]")
+
+
+def _django_pattern(raw: str) -> str | None:
+    p = html.unescape(re.sub(r"<[^>]+>", "", raw))
+    p = _DJ_NAME.sub("", p).replace("^", "").replace("$", "")
+    p = re.sub(r"\s+", "", p)
+    p = _DJ_GROUP.sub(lambda m: "{%s}" % m.group(1), p)
+    p = _DJ_CONVERTER.sub(lambda m: "{%s}" % m.group(1), p)
+    p = _DJ_ESCAPED.sub(r"\1", p).replace("\\Z", "")
+    if _DJ_REGEX_LEFT.search(p):
+        return None  # unnamed groups, alternations, character classes: no usable path
+    return "/" + p.lstrip("/")
+
+
+def parse_django_urlconf(text: str) -> list[str]:
+    """Route patterns listed on a Django DEBUG 404 page ("Using the URLconf defined in
+    ..."), one per list item, prefixes joined; regex groups and path converters become
+    ``{name}``. Patterns that still contain regex syntax are dropped."""
+    m = _DJANGO_URLCONF.search(text or "")
+    if not m:
+        return []
+    out: list[str] = []
+    for li in _LI.findall(m.group(1)):
+        p = _django_pattern("".join(_CODE.findall(li)))
+        if p and p not in out:
+            out.append(p)
+    return out
 
 
 def _json_urls(obj, out: list[str]) -> None:
@@ -148,4 +186,39 @@ async def probe_passive(client: DirectClient, api, cfg, store: Store, frontier: 
                     add(u, "well_known")
         if counts["timed_out"]:
             break
+    _django_debug_routes(store, cfg, frontier, scope, known, counts, seen)
     return counts
+
+
+def _django_debug_routes(store: Store, cfg, frontier: Frontier, scope, known: list[str],
+                         counts: dict[str, int], seen: set) -> None:
+    """Routes listed by any recorded Django DEBUG 404 page (often robots.txt's own 404).
+    Recorded with source ``well_known``; concrete paths are queued for every role."""
+    for row in store.conn.execute(
+            "SELECT url, resp_body, resp_body_path FROM exchanges WHERE status=404 AND "
+            "(resp_body LIKE '%Using the URLconf defined in%' OR "
+            "(resp_body IS NULL AND resp_body_path IS NOT NULL AND content_type='text/html'))").fetchall():
+        text = row["resp_body"]
+        if text is None:
+            try:
+                text = (Path(store.db_path).parent / row["resp_body_path"]).read_text(
+                    encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+        parts = urlsplit(row["url"])
+        base = f"{parts.scheme}://{parts.netloc}"
+        for pattern in parse_django_urlconf(text):
+            url = base + pattern
+            if not scope.allows(url):
+                continue
+            rid = store.upsert_route(normalize_path(pattern, known), parts.netloc.lower())
+            store.upsert_source("route", rid, "well_known")
+            if (url, "django") not in seen:
+                seen.add((url, "django"))
+                counts["routes"] += 1
+            if "{" in pattern:
+                continue  # a pattern, not a URL the crawler can visit
+            for r in cfg.roles:
+                if frontier.push(r.name, "url", url=url, depth=0, priority=0,
+                                 source="well_known"):
+                    counts["queued"] += 1

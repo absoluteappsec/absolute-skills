@@ -159,3 +159,156 @@ async def test_introspection_and_guesses_leave_no_fake_endpoints(api, spa_url, s
         assert rt.store.conn.execute(
             "SELECT count(*) FROM exchanges WHERE origin='passive'").fetchone()[0] >= 6
         rt.store.close()
+
+
+# --- field test 1: drf-spectacular YAML, Swagger UI / ReDoc pages ----------------
+
+_YAML_SPEC = """openapi: 3.0.3
+info:
+  title: Task Manager API
+  version: 1.0.0
+paths:
+  /api/tasks/:
+    get:
+      operationId: tasks_list
+      parameters:
+      - in: query
+        name: page
+        schema:
+          type: integer
+      responses:
+        '200':
+          description: ''
+  /api/tasks/{id}/:
+    delete:
+      parameters:
+      - in: path
+        name: id
+        required: true
+        schema:
+          type: integer
+      responses:
+        '204':
+          description: No response body
+"""
+
+
+def _rt(cfg, rd):
+    from appmap.crawl import build_runtime
+    rt = build_runtime(cfg, rd)
+    rec = functools.partial(record_exchange, rt.store, rt.events, rt.redactor, rd,
+                            known_patterns=[])
+    return rt, DirectClient(rt.gate, rec, rt.events)
+
+
+def _eps(store):
+    return {(r[0], r[1]) for r in store.conn.execute(
+        "SELECT e.method, e.path_pattern FROM endpoints e JOIN sources s ON "
+        "s.item_kind='endpoint' AND s.item_id=e.id AND s.source='openapi'")}
+
+
+async def test_yaml_schema_at_drf_spectacular_path(api, make_cfg, run_dir, tmp_path,
+                                                   stub_server):
+    from werkzeug.wrappers import Response
+    srv = stub_server({"/api/schema/": lambda r: Response(
+        _YAML_SPEC, content_type="application/vnd.oai.openapi; charset=utf-8")})
+    cfg = make_cfg(srv.url)
+    rd = run_dir(tmp_path, cfg)
+    rt, client = _rt(cfg, rd)
+    counts = await probe_schemas(client, api, cfg, rt.store, "anonymous")
+    assert counts["openapi_ops"] == 2
+    assert _eps(rt.store) >= {("GET", "/api/tasks"), ("DELETE", "/api/tasks/{id}")}
+    rt.store.close()
+
+
+async def test_yaml_schema_at_root_schema_path_and_html_rejected(api, make_cfg, run_dir,
+                                                                 tmp_path, stub_server):
+    from werkzeug.wrappers import Response
+    srv = stub_server({
+        "/schema/": lambda r: Response(_YAML_SPEC, content_type="application/yaml"),
+        # a catch-all HTML page that happens to be valid YAML text is never a schema
+        "/openapi.yaml": lambda r: Response("paths:\n  /evil/:\n    get: {}\n",
+                                            content_type="text/html"),
+    })
+    cfg = make_cfg(srv.url)
+    rd = run_dir(tmp_path, cfg)
+    rt, client = _rt(cfg, rd)
+    await probe_schemas(client, api, cfg, rt.store, "anonymous")
+    eps = _eps(rt.store)
+    assert ("GET", "/api/tasks") in eps and not any(p == "/evil" for _, p in eps)
+    rt.store.close()
+
+
+_SWAGGER_UI = """<!DOCTYPE html><html><head><title>Swagger</title></head><body>
+<div id="swagger-ui"></div>
+<script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<script>
+const ui = SwaggerUIBundle({
+  url: "\\u002Finternal\\u002Fspec\\u002F",
+  dom_id: "#swagger-ui",
+  oauth2RedirectUrl: "https://cdn.example/oauth2-redirect.html",
+})
+</script></body></html>"""
+
+_REDOC = """<!DOCTYPE html><html><body>
+<redoc spec-url='/internal/redoc-spec.json'></redoc>
+<script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
+</body></html>"""
+
+
+async def test_swagger_ui_and_redoc_pages_spec_followed(api, make_cfg, run_dir, tmp_path,
+                                                        stub_server):
+    from werkzeug.wrappers import Response
+    srv = stub_server({
+        "/swagger-ui/": lambda r: Response(_SWAGGER_UI, mimetype="text/html"),
+        "/internal/spec/": lambda r: Response(_YAML_SPEC,
+                                              content_type="application/vnd.oai.openapi"),
+        "/redoc/": lambda r: Response(_REDOC, mimetype="text/html"),
+        "/internal/redoc-spec.json": lambda r: Response(
+            '{"openapi":"3.0.0","paths":{"/api/redoc-only/":{"post":{}}}}',
+            content_type="application/json"),
+    })
+    cfg = make_cfg(srv.url)
+    rd = run_dir(tmp_path, cfg)
+    rt, client = _rt(cfg, rd)
+    await probe_schemas(client, api, cfg, rt.store, "anonymous")
+    eps = _eps(rt.store)
+    assert ("GET", "/api/tasks") in eps and ("POST", "/api/redoc-only") in eps
+    fetched = {p for _, p in srv.requests}
+    assert "/internal/spec/" in fetched and "/internal/redoc-spec.json" in fetched
+    # the Swagger UI page itself is not an API endpoint
+    paths = {r[0] for r in rt.store.conn.execute("SELECT path_pattern FROM endpoints")}
+    assert "/swagger-ui" not in paths
+    rt.store.close()
+
+
+async def test_crawled_swagger_ui_page_spec_followed(api, make_cfg, run_dir, tmp_path,
+                                                     stub_server):
+    from werkzeug.wrappers import Response
+    page = _SWAGGER_UI.replace("\\u002Finternal\\u002Fspec\\u002F", "/v9/custom-spec")
+    srv = stub_server({
+        "/v9/custom-spec": lambda r: Response(_YAML_SPEC, content_type="application/yaml")})
+    cfg = make_cfg(srv.url)
+    rd = run_dir(tmp_path, cfg)
+    rt, client = _rt(cfg, rd)
+    # a page the crawler recorded at an unguessable location
+    record_exchange(rt.store, rt.events, rt.redactor, rd, role="anonymous", origin="ui",
+                    method="GET", url=srv.url + "/dev/tools/api-browser", req_headers={},
+                    req_body=None, status=200, resp_headers={"Content-Type": "text/html"},
+                    resp_body=page.encode(), duration_ms=1.0, caused_by=None,
+                    known_patterns=[])
+    await probe_schemas(client, api, cfg, rt.store, "anonymous")
+    assert ("GET", "/api/tasks") in _eps(rt.store)
+    rt.store.close()
+
+
+def test_spec_urls_from_docs_page():
+    from appmap.probe.schemas import spec_urls_from_html
+    base = "http://t.test/api/docs/"
+    assert spec_urls_from_html(_SWAGGER_UI, base) == ["http://t.test/internal/spec/"]
+    assert spec_urls_from_html(_REDOC, base) == ["http://t.test/internal/redoc-spec.json"]
+    multi = """<script>SwaggerUIBundle({urls: [{url: "v1.json", name: "v1"},
+        {"url": "/v2.yaml", "name": "v2"}], dom_id: '#x'})</script>"""
+    assert spec_urls_from_html(multi, base) == ["http://t.test/api/docs/v1.json",
+                                                "http://t.test/v2.yaml"]
+    assert spec_urls_from_html("<p>url: 'x.json'</p>", base) == []
