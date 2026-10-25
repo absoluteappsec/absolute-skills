@@ -28,7 +28,7 @@ def test_subcommands_registered_and_stubs_emit_status(capsys):
     names = {"init", "auth", "crawl", "probe", "approvals", "build", "status", "query"}
     sub = next(a for a in build_parser()._actions if a.dest == "command")
     assert set(sub.choices) == names
-    assert main(["status"]) == 1
+    assert main(["query"]) == 1
     last = capsys.readouterr().out.strip().splitlines()[-1]
     obj = json.loads(last.removeprefix("APPMAP_STATUS "))
-    assert obj["command"] == "status" and obj["ok"] is False and obj["status"] == "not_implemented"
+    assert obj["command"] == "query" and obj["ok"] is False and obj["status"] == "not_implemented"

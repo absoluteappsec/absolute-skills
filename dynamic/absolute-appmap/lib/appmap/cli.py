@@ -11,7 +11,7 @@ from pathlib import Path
 from appmap import __version__
 
 COMMANDS = ["init", "auth", "crawl", "probe", "approvals", "build", "status", "query"]
-IMPLEMENTED = {"init", "auth", "crawl", "probe", "approvals"}
+IMPLEMENTED = {"init", "auth", "crawl", "probe", "approvals", "status"}
 
 log = logging.getLogger("appmap.cli")
 
@@ -79,6 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="list: print pending items as JSON lines; write: refresh "
                         "approvals.yaml (keeps decisions, rules and notes); apply: load the "
                         "decisions and rules from approvals.yaml")
+    p = sub.add_parser("status", help="progress counts, coverage gaps and the next step")
+    p.add_argument("--run", required=True, help="run directory")
+    p.add_argument("--gaps", action="store_true",
+                   help="also report coverage gaps (JSON line before APPMAP_STATUS)")
+    p.add_argument("--new-pass", action="store_true",
+                   help="start the next pass: snapshot current counts as its baseline")
     for name in COMMANDS:
         if name not in IMPLEMENTED:
             sub.add_parser(name, help=f"{name} (not yet implemented)")
@@ -441,8 +447,60 @@ def cmd_approvals(args) -> int:
     return 0
 
 
+def cmd_status(args) -> int:
+    from appmap.approvals import ApprovalQueue
+    from appmap.gaps import compute_gaps, current_pass, new_in_pass, start_new_pass
+    from appmap.store import Store
+
+    try:
+        rd, _cfg, _meta = _open_run(args.run)
+        store = Store(rd.db_path)
+    except Exception as e:
+        emit_status("status", ok=False, status="error", errors=[str(e)])
+        return 1
+    run = _q(rd.root)
+    try:
+        store.init_schema()
+        if args.new_pass:
+            start_new_pass(store)
+        one = lambda sql: store.conn.execute(sql).fetchone()[0]  # noqa: E731
+        appr = ApprovalQueue(store, rd.approvals_path).summary()
+        pending_frontier = one("SELECT count(*) FROM frontier WHERE status='pending'")
+        counts = {
+            "states": one("SELECT count(*) FROM states"),
+            "transitions": one("SELECT count(*) FROM transitions"),
+            "endpoints": one("SELECT count(*) FROM endpoints"),
+            "routes": one("SELECT count(*) FROM routes"),
+            "exchanges": one("SELECT count(*) FROM exchanges"),
+            "forms": one("SELECT count(*) FROM forms"),
+            "approvals": appr,
+            "pass": current_pass(store),
+            "new_in_pass": new_in_pass(store),
+            "pending_frontier": pending_frontier,
+        }
+        if args.gaps:
+            gaps = compute_gaps(store)
+            print(json.dumps({"gaps": gaps.to_dict()}), flush=True)
+            counts["gaps"] = gaps.summary()
+    except Exception as e:
+        log.exception("status failed")
+        emit_status("status", ok=False, status="error", errors=[str(e)])
+        return 1
+    finally:
+        store.close()
+    if pending_frontier:
+        nxt = f"appmap crawl --run {run}"
+    elif appr["pending"]:
+        nxt = f"appmap approvals --run {run} write"
+    else:
+        nxt = f"appmap build --run {run}"
+    emit_status("status", ok=True, status="new_pass" if args.new_pass else "reported",
+                counts=counts, pending_approvals=appr["pending"], next=nxt)
+    return 0
+
+
 HANDLERS = {"init": cmd_init, "auth": cmd_auth, "crawl": cmd_crawl, "probe": cmd_probe,
-            "approvals": cmd_approvals}
+            "approvals": cmd_approvals, "status": cmd_status}
 
 
 def main(argv: list[str] | None = None) -> int:
