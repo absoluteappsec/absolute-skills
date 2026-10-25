@@ -240,3 +240,16 @@ def test_replayed_request_body_keys_are_fields():
     f = classify(ActionDescriptor("request", "POST", "http://x/api/x", "",
                                   '{"title": "x"}', False, "user", "replay"), "staging")
     assert f.held is False
+
+
+@pytest.mark.parametrize("label,method,url,held", [
+    ("EMAIL ADDRESS", "GET", "http://x/admin/auth/user/?o=2.1", False),  # sort link
+    ("Email settings", "GET", "http://x/settings/email", False),
+    ("Notifications", "GET", "http://x/me", False),
+    ("Email", "POST", "http://x/x", True),
+    ("Send email", "GET", "http://x/x", True),
+    ("Email", "GET", "http://x/api/sendEmail", True),
+])
+def test_mail_nouns_on_get_links_not_held(label, method, url, held):
+    """Field fix 3 minor: a GET link labelled with a mail noun only navigates."""
+    assert classify(_a(label, method, "ui", url=url), "staging").held is held

@@ -42,6 +42,7 @@ _RECOVERY = re.compile(r"\b(?:" + "|".join([
     r"e\s*mail\s+me",
     r"magic\s+link",
 ]) + r")\b")
+_MAIL_NOUN = re.compile(r"^(?:e\s*mails?|notifications?|sms|invitations?)$")
 _LOGOUT = re.compile(r"\b(?:log\s*out|sign\s*out|log\s*off|sign\s*off)\b")
 _CAMEL = re.compile(r"([a-z0-9])([A-Z])")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
@@ -169,6 +170,9 @@ def classify(a: ActionDescriptor, profile: str) -> Flag:
     for cat, rx in _COMPILED:
         for source, text in (("label", tl), ("url", tu), ("context", tc)):
             m = rx.search(text)
+            if m and cat == "outbound_message" and method == "GET" \
+                    and _MAIL_NOUN.match(m.group(0)) and not rx.search(text, m.end()):
+                continue  # field fix 3: a GET link named "Email address" only navigates
             if m:
                 return _held(cat, f"{source} matches {cat} keyword '{m.group(0).lower()}'")
     if writes and _ACCOUNT_URL.search(url):
