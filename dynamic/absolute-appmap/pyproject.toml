@@ -24,7 +24,7 @@ appmap = "appmap.cli:main"
 where = ["lib"]
 
 [tool.setuptools.package-data]
-appmap = ["schema.sql", "templates/*", "resources/**"]
+appmap = ["schema.sql", "templates/*", "resources/**", "resources/samples/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
