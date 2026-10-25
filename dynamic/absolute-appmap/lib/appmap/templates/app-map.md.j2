@@ -219,20 +219,21 @@ No observations.
 ## Records created by this run
 
 {% if records.rows %}
-Successful (2xx/3xx) state-changing requests whose query string or body carries the run marker
-`{{ records.marker }}`{% if records.variants %} or one of this run's truncations of it ({% for v in records.variants %}`{{ v }}`{% if not loop.last %}, {% endif %}{% endfor %}; fields too short for the whole marker){% endif %}. Truncations shorter than the marker prefix plus the run date are not used, so such records are not listed. Use them for post-run cleanup.
+Every successful (2xx/3xx) state-changing request this run sent (login traffic and
+login/logout endpoints left out): candidates for post-run cleanup. {{ records.matched }} carry
+the run marker `{{ records.marker }}`{% if records.variants %} or one of this run's truncations of it ({% for v in records.variants %}`{{ v }}`{% if not loop.last %}, {% endif %}{% endfor %}){% endif %} in their query string or body (`Marker` column); they are listed first.
 
-| Exchange | Role | Request | Status | Location |
-|---|---|---|---|---|
+| Exchange | Role | Origin | Request | Status | Marker | Location |
+|---|---|---|---|---|---|---|
 {% for r in records.rows %}
-| {{ r.id }} | {{ r.role or "" }} | {{ r.method }} `{{ r.url | cell }}` | {{ r.status }} | {{ (r.location or "") | cell }} |
+| {{ r.id }} | {{ r.role or "" }} | {{ r.origin }} | {{ r.method }} `{{ r.url | cell }}` | {{ r.status }} | {% if r.marker %}`{{ r.marker | cell }}`{% endif %} | {{ (r.location or "") | cell }} |
 {% endfor %}
 {% if records.more %}
 
-… {{ records.more }} more — see appmap.sqlite
+… {{ records.more }} more — see appmap.sqlite (`SELECT * FROM exchanges WHERE upper(method) NOT IN ('GET','HEAD','OPTIONS') AND status BETWEEN 200 AND 399 AND origin != 'login'`)
 {% endif %}
 {% else %}
-No records identifiably created by this run.
+No successful state-changing requests were sent by this run.
 {% endif %}
 
 ## Where to dig deeper

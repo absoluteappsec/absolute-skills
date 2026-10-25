@@ -659,12 +659,15 @@ SELECT e.method, e.path_pattern, group_concat(ra.role || '=' || ra.outcome, ', '
 FROM role_access ra JOIN endpoints e ON ra.item_kind = 'endpoint' AND e.id = ra.item_id
 GROUP BY e.id HAVING count(DISTINCT ra.outcome) > 1;
 
--- write requests that carried the full run marker (records created by this run); substitute
--- the marker from run.json and escape LIKE wildcards ('_' and '%') in it. Bodies over
--- 256 KiB are in req_body_path files and are not covered by this query. APP-MAP.md also
--- matches the run's own truncations of the marker (fields too short for it).
-SELECT id, role, method, url, status FROM exchanges
+-- records created by this run (as in APP-MAP.md): every exchange in the run directory was
+-- sent by this run, so all successful writes except login traffic are candidates
+SELECT id, role, origin, method, url, status FROM exchanges
 WHERE upper(method) NOT IN ('GET','HEAD','OPTIONS') AND status BETWEEN 200 AND 399
-  AND (req_body LIKE '%appmap-20261024-120000%' ESCAPE '\'
-       OR url LIKE '%appmap-20261024-120000%' ESCAPE '\');
+  AND origin != 'login'
+ORDER BY id;
+-- APP-MAP.md also drops login/logout endpoints and annotates each row with the run marker
+-- (or a run-specific truncation of it) found in its query string or body; to search for
+-- the full marker yourself, substitute it from run.json and escape '_'/'%':
+--   AND (req_body LIKE '%appmap-20261024-120000%' ESCAPE '\' OR url LIKE '%appmap-20261024-120000%' ESCAPE '\')
+-- (bodies over 256 KiB are in req_body_path files and not covered by LIKE)
 ```

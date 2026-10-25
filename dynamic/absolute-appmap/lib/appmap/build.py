@@ -921,32 +921,42 @@ def _value_forms(token: str) -> set[str]:
     return forms
 
 
+_AUTH_PATH = re.compile(r"(?:^|/)(?:log|sign)[-_]?(?:in|out|on|off)(?:/|$|\.)", re.I)
+
+
 def _ctx_records(store: Store) -> dict:
-    """Successful (2xx/3xx) writes whose query string or body (inline or bodies/ file)
-    carries the marker, or one of this run's own truncations of it as a whole value.
-    URL host and path are never matched."""
+    """Records created by this run (ruling R23): every exchange in the run directory was
+    sent by this run, so this is every successful (2xx/3xx) non-GET exchange except login
+    traffic and login/logout endpoints. ``marker`` annotates the marker or run-specific
+    truncation found in the query string or body (never the URL host or path); rows with
+    a marker come first."""
     marker = run_marker(store)
-    if not marker:
-        return {"rows": [], "more": 0, "variants": []}
-    variants = marker_variants(store, marker)
+    variants = marker_variants(store, marker) if marker else set()
     short = variants - {marker}
-    rows = []
+    matched, other = [], []
     for x in _rows(store, """SELECT x.id, x.role, x.method, x.url, x.status, x.origin, x.req_body,
             x.req_body_path, x.resp_headers, e.path_pattern
         FROM exchanges x LEFT JOIN endpoints e ON e.id=x.endpoint_id
         WHERE upper(x.method) NOT IN ('GET','HEAD','OPTIONS') AND x.status BETWEEN 200 AND 399
-        ORDER BY x.id"""):
-        text = unquote_plus(" ".join(filter(None, (
-            urlsplit(x["url"] or "").query, _body_text(store, x["req_body"], x["req_body_path"])))))
-        if marker not in text and not (short and any(
-                short & _value_forms(t) for t in _TOKEN.findall(text))):
+          AND x.origin != 'login' ORDER BY x.id"""):
+        if _AUTH_PATH.search(urlsplit(x["url"] or "").path):
             continue
+        x["marker"] = ""
+        if marker:
+            text = unquote_plus(" ".join(filter(None, (
+                urlsplit(x["url"] or "").query,
+                _body_text(store, x["req_body"], x["req_body_path"])))))
+            if marker in text:
+                x["marker"] = marker
+            elif short:
+                hit = {v for t in _TOKEN.findall(text) for v in short & _value_forms(t)}
+                x["marker"] = max(hit, key=len) if hit else ""
         hdrs = _loads(x["resp_headers"], {}) or {}
         x["location"] = next((v for k, v in hdrs.items() if str(k).lower() == "location"), None)
-        rows.append(x)
-    shown, more = _cap(rows, CAPS["records"])
-    return {"rows": shown, "more": more, "marker": marker,
-            "variants": sorted(short, key=len, reverse=True)}
+        (matched if x["marker"] else other).append(x)
+    shown, more = _cap(matched + other, CAPS["records"])
+    return {"rows": shown, "more": more, "marker": marker or "",
+            "matched": len(matched), "variants": sorted(short, key=len, reverse=True)}
 
 
 def _ctx_gaps(store: Store) -> dict:

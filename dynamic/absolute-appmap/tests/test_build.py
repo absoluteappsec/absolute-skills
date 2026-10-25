@@ -175,10 +175,15 @@ def test_app_map_sections_present(ssr_run, tmp_path, capsys):
     assert "Handling notice" not in md  # staging run
     assert "/projects/{id}" in md and "admin: Create @ /projects/new" in md
     assert "POST /projects/new" in md
-    # the SSR name field only had room for "appmap-20261" (no full run date): such a
-    # truncation is not run-specific, so the created project is not claimed
+    # R23: every successful write of the run is listed; the SSR name field only had room
+    # for "appmap-20261" (no run date), so the created project has no marker annotation
     created = md.split("## Records created by this run", 1)[1].split("## Where", 1)[0]
-    assert "No records identifiably created by this run." in created
+    rows = [line.split(" | ") for line in created.splitlines() if line.startswith("| ")
+            and line.split("|")[1].strip().isdigit()]
+    news = [r for r in rows if "/projects/new" in r[3]]
+    assert len(news) == 2 and {r[1] for r in news} == {"admin", "alice"}
+    assert all(r[4] == "302" and r[5] == "" for r in news)
+    assert not any("/login" in r[3] for r in rows)
     for secret in ("admin-pw-Fx1", "alice-pw-Fx2"):
         assert secret not in md
         assert secret not in (root / "appmap.json").read_text()
@@ -658,11 +663,18 @@ def test_apply_names_ignores_unhashable_entries(tmp_path):
         store.close()
 
 
-def _record_ids(store, root) -> set[int]:
+def _records(store, root) -> list[tuple[int, str]]:
+    """(exchange id, marker annotation) rows of the Records section, in order."""
     md = render_app_map(store, open_run_dir(root))
     rec = md.split("## Records created by this run", 1)[1].split("## Where", 1)[0]
-    return {int(line.split("|")[1]) for line in rec.splitlines()
-            if line.startswith("| ") and line.split("|")[1].strip().isdigit()}
+    return [(int(c[1]), c[6].strip().strip("`")) for c in
+            (line.split("|") for line in rec.splitlines() if line.startswith("| "))
+            if c[1].strip().isdigit()]
+
+
+def _record_ids(store, root) -> set[int]:
+    """Exchanges annotated with the marker or a run-specific truncation."""
+    return {i for i, mk in _records(store, root) if mk}
 
 
 MARKER = "appmap-20261024-120000"
@@ -697,8 +709,13 @@ def test_records_match_this_runs_truncations_per_field_kind(tmp_path):
         _x(store, "u", "POST", f"{b}/projects", status=302, req_body="name=appmap-2026")
         _x(store, "u", "POST", f"{b}/projects", status=422, req_body=f"name={m}")
         _x(store, "u", "POST", f"{b}/q", status=201, req_body="name=appmap%25_20261024")
-        _x(store, "u", "POST", f"{b}/items/{m}/rename", status=200, req_body="x=1")
+        path_only = _x(store, "u", "POST", f"{b}/items/{m}/rename", status=200, req_body="x=1")
         assert _record_ids(store, root) == {text, email, pw, url, query, big}
+        recs = _records(store, root)
+        assert dict(recs)[email] == m[:17] and dict(recs)[query] == m
+        assert dict(recs)[path_only] == ""  # listed (R23), but not annotated
+        n_marked = 6
+        assert all(mk for _i, mk in recs[:n_marked]) and not any(mk for _i, mk in recs[n_marked:])
     finally:
         store.close()
 
@@ -723,5 +740,27 @@ def test_records_ignore_short_truncations_and_url_paths(tmp_path):
         _x(store, "u", "POST", f"{b}/pw", status=201, req_body=f"pw={m[:11]}-Aa1%21")
         _x(store, "u", "POST", f"{b}/t", status=201, req_body=f"title={m[:14]}")
         assert _record_ids(store, root) == set()
+        assert len(_records(store, root)) == 4  # all listed per R23, none annotated
+    finally:
+        store.close()
+
+
+def test_records_skip_login_traffic_and_cap(tmp_path):
+    store, root = _synthetic(tmp_path)
+    try:
+        b = "https://example.test"
+        store.add_exchange(None, "u", "login", method="POST", url=f"{b}/session", status=302)
+        _x(store, "u", "POST", f"{b}/users/sign_in", status=302)
+        _x(store, "u", "POST", f"{b}/logout", status=302)
+        _x(store, "u", "GET", f"{b}/projects", status=200)
+        keep = _x(store, "u", "DELETE", f"{b}/projects/3", status=204)
+        for i in range(120):
+            _x(store, "u", "POST", f"{b}/notes?n={i}", status=201)
+        md = render_app_map(store, open_run_dir(root))
+        rec = md.split("## Records created by this run", 1)[1].split("## Where", 1)[0]
+        ids = [i for i, _mk in _records(store, root)]
+        assert ids[0] == keep and len(ids) == 100
+        assert "21 more — see appmap.sqlite" in rec
+        assert not any(u in rec for u in (f"{b}/users/sign_in", f"{b}/logout", f"{b}/session"))
     finally:
         store.close()
