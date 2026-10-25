@@ -1,0 +1,9 @@
+{
+  "name": "absolute-appmap",
+  "version": "0.1.0",
+  "description": "Crawl and map running web applications (server-rendered and SPA) with Playwright plus direct HTTP, for every role, with destructive actions held for human approval. Produces a queryable application map (SQLite, JSON, HAR, APP-MAP.md) for test generation and security testing.",
+  "author": { "name": "Absolute AppSec", "url": "https://absoluteappsec.com" },
+  "homepage": "https://github.com/absoluteappsec/absolute-skills",
+  "license": "MIT",
+  "keywords": ["security", "appsec", "crawler", "playwright", "dast", "attack-surface", "testing"]
+}

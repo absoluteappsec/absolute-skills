@@ -1,0 +1,11 @@
+{
+  "name": "absolute-skills",
+  "owner": { "name": "Absolute AppSec", "url": "https://absoluteappsec.com" },
+  "plugins": [
+    {
+      "name": "absolute-appmap",
+      "source": "./dynamic/absolute-appmap",
+      "description": "Crawl and map running web applications (server-rendered and SPA) for every role, with destructive actions held for human approval; emits a queryable application map."
+    }
+  ]
+}
