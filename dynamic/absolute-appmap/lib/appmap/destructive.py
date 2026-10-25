@@ -28,6 +28,19 @@ KEYWORDS: list[tuple[str, list[str]]] = [
                     r"clos(?:e|es|ed|ing)\s+" + _DET + r"account"]),
 ]
 _COMPILED = [(cat, re.compile(r"\b(?:" + "|".join(ws) + r")\b")) for cat, ws in KEYWORDS]
+# Account-recovery / verification requests that make the server send mail. Checked before
+# KEYWORDS (a "password reset request" is outbound mail, not a credential change), but
+# only on label/URL of submits and non-GET requests: a "Forgot password?" link that merely
+# navigates, or a login form whose context mentions it, is not held.
+_RECOVERY = re.compile(r"\b(?:" + "|".join([
+    r"forgot(?:ten)?\s+(?:your\s+|my\s+)?(?:password|username|login)",
+    r"password\s+reset\s+request",
+    r"resend\s+(?:the\s+|your\s+|my\s+|a\s+)?(?:verification|confirmation|activation)"
+    r"\s+(?:e\s*mail|link|code)",
+    r"send\s+(?:me\s+)?(?:a\s+|the\s+)?(?:password\s+)?reset\s+(?:link|e\s*mail|code)",
+    r"e\s*mail\s+me",
+    r"magic\s+link",
+]) + r")\b")
 _LOGOUT = re.compile(r"\b(?:log\s*out|sign\s*out|log\s*off|sign\s*off)\b")
 _CAMEL = re.compile(r"([a-z0-9])([A-Z])")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
@@ -72,6 +85,12 @@ def classify(a: ActionDescriptor, profile: str) -> Flag:
         return _held("logout", "logout/sign-out action")
     if method == "DELETE":
         return _held("delete", "HTTP DELETE request")
+    if a.kind == "submit" or (method and method != "GET"):
+        for source, text in (("label", tl), ("url", tu)):
+            m = _RECOVERY.search(text)
+            if m:
+                return _held("outbound_message",
+                             f"{source} matches account-recovery mail keyword '{m.group(0)}'")
     for cat, rx in _COMPILED:
         for source, text in (("label", tl), ("url", tu), ("context", tc)):
             m = rx.search(text)

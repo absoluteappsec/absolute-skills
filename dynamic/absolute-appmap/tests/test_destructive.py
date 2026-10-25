@@ -75,3 +75,35 @@ def test_inflected_and_camel_case(label, url, method, cat):
 ])
 def test_no_false_positives(label, url):
     assert classify(_a(label, "POST", "ui", url=url), "staging").held is False
+
+
+@pytest.mark.parametrize("kind,label,url,method", [
+    ("submit", "Submit", "http://x/taskManager/forgot_password/", "POST"),
+    ("submit", "Submit", "http://x/accounts/forgotPassword", None),
+    ("submit", "Send reset link", "http://x/pw", "POST"),
+    ("request", "Go", "http://x/api/password_reset_request", "POST"),
+    ("click", "Resend verification email", None, "POST"),
+    ("click", "Resend activation e-mail", None, "POST"),
+    ("submit", "Email me a magic link", "http://x/login", "POST"),
+    ("submit", "Magic link", "http://x/auth/magic", "POST"),
+    ("submit", "Forgot your password?", "http://x/reset", "POST"),
+])
+def test_account_recovery_submits_held_as_outbound(kind, label, url, method):
+    f = classify(_a(label, method, "ui", kind=kind, url=url), "staging")
+    assert f.held is True
+    assert f.category == "outbound_message"
+
+
+@pytest.mark.parametrize("kind,label,url,method", [
+    ("click", "Forgot password?", "http://x/taskManager/forgot_password/", "GET"),
+    ("click", "Forgot your password?", "http://x/forgot-password", None),
+    ("request", "Go", "http://x/forgot_password/", "GET"),
+])
+def test_account_recovery_navigation_not_held(kind, label, url, method):
+    assert classify(_a(label, method, "ui", kind=kind, url=url), "staging").held is False
+
+
+def test_login_submit_with_forgot_link_in_context_not_held():
+    f = classify(_a("Log in", "POST", "ui", kind="submit", url="http://x/login",
+                    context="Forgot your password?"), "staging")
+    assert f.held is False
