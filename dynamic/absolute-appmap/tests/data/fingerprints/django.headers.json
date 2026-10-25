@@ -1,0 +1,5 @@
+{"Content-Type": "text/html; charset=utf-8", "Server": "gunicorn", "Vary": "Cookie",
+ "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff",
+ "Referrer-Policy": "same-origin", "Cross-Origin-Opener-Policy": "same-origin",
+ "Set-Cookie": ["csrftoken=<redacted:csrf>; expires=Sun, 24 Oct 2027 10:00:00 GMT; Max-Age=31449600; Path=/; SameSite=Lax",
+                "sessionid=<redacted:cookie>; expires=Sun, 08 Nov 2026 10:00:00 GMT; HttpOnly; Max-Age=1209600; Path=/; SameSite=Lax"]}

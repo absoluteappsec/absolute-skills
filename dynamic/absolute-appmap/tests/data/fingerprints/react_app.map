@@ -1,0 +1,5 @@
+webpack://storefront/./node_modules/react-dom/cjs/react-dom.production.min.js
+webpack://storefront/./node_modules/react/cjs/react.production.min.js
+webpack://storefront/./node_modules/scheduler/cjs/scheduler.production.min.js
+webpack://storefront/./src/App.jsx
+webpack://storefront/./src/index.js

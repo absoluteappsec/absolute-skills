@@ -1,0 +1,5 @@
+{"Content-Type": "text/html; charset=utf-8", "X-Frame-Options": "SAMEORIGIN",
+ "X-Content-Type-Options": "nosniff", "X-Permitted-Cross-Domain-Policies": "none",
+ "Referrer-Policy": "strict-origin-when-cross-origin", "Cache-Control": "max-age=0, private, must-revalidate",
+ "X-Request-Id": "0f6b2c2a-6a7e-4b55-9a43-7c1f3c3d2f10", "X-Runtime": "0.013542",
+ "Set-Cookie": "_storefront_session=<redacted:cookie>; path=/; httponly; samesite=lax"}

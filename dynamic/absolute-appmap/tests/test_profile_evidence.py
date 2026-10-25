@@ -75,3 +75,36 @@ def test_readonly(tmp_path):
     before = os.stat(db).st_mtime_ns
     list(iter_evidence(root))
     assert os.stat(db).st_mtime_ns == before
+
+
+def test_cookie_names_skip_valueless_lines():
+    from appmap.profile.evidence import _cookie_names
+    assert _cookie_names("abc123VALUE; Path=/\ncsrftoken=x; Path=/") == ["csrftoken"]
+    assert _cookie_names(["  ; Path=/", "sessionid=y"]) == ["sessionid"]
+
+
+def test_error_or_empty_map_not_source_map(tmp_path):
+    root, s = _run(tmp_path)
+    s.add_exchange(None, "r", "ui", method="GET", url="http://x/a.js.map", status=404,
+                   content_type="text/html", resp_body="<html>Not Found</html>")
+    s.add_exchange(None, "r", "ui", method="GET", url="http://x/b.js.map", status=200,
+                   content_type="application/json", resp_body="  ")
+    s.close()
+    kinds = [e.kind for e in iter_evidence(root) if e.kind != "header"]
+    assert "source_map" not in kinds
+    assert kinds == ["error_page"]
+
+
+def test_yaml_schema_needs_yaml_or_text_type(tmp_path):
+    root, s = _run(tmp_path)
+    s.add_exchange(None, "r", "ui", method="GET", url="http://x/page", status=200,
+                   content_type="text/html", resp_body="<pre>\nopenapi: 3.0.0\n</pre>")
+    s.add_exchange(None, "r", "ui", method="GET", url="http://x/spec", status=200,
+                   content_type="application/yaml", resp_body="openapi: 3.0.3\ninfo: {}\n")
+    s.add_exchange(None, "r", "ui", method="GET", url="http://x/docs/api.yml", status=200,
+                   content_type="application/octet-stream", resp_body="swagger: '2.0'\n")
+    s.add_exchange(None, "r", "ui", method="GET", url="http://x/notes", status=200,
+                   content_type="text/plain", resp_body="openapi: 3.1.0\n")
+    s.close()
+    schema_urls = [e.url for e in iter_evidence(root) if e.kind == "schema"]
+    assert schema_urls == ["http://x/spec", "http://x/docs/api.yml", "http://x/notes"]

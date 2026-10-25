@@ -1,0 +1,1 @@
+role=admin login_type=form auth_ok=1 fields=csrfmiddlewaretoken,username,password,next token_headers=x-csrf-token

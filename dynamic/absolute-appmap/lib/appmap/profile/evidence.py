@@ -70,7 +70,10 @@ def _cookie_names(value) -> list[str]:
     lines = value if isinstance(value, list) else str(value).split("\n")
     names = []
     for line in lines:
-        name = str(line).partition(";")[0].partition("=")[0].strip()
+        pair = str(line).partition(";")[0]
+        if "=" not in pair:  # no name=value pair: never emit a value-like token as a name
+            continue
+        name = pair.partition("=")[0].strip()
         if name and name not in names:
             names.append(name)
     return names
@@ -87,9 +90,14 @@ def _is_schema(row, body: str | None) -> bool:
     if not body:
         return False
     head = body[:4096]
-    if _JSON_SPEC.match(head) or _YAML_SPEC.search(head):
+    if _JSON_SPEC.match(head):
         return True
-    return "__schema" in body and "json" in (row["content_type"] or "").lower()
+    ct = (row["content_type"] or "").lower()
+    yamlish = ("yaml" in ct or ct.startswith("text/plain")
+               or path.lower().endswith((".yaml", ".yml")))
+    if yamlish and _YAML_SPEC.search(head):
+        return True
+    return "__schema" in body and "json" in ct
 
 
 def _source_map_text(body: str) -> str:
@@ -111,7 +119,7 @@ def _source_map_text(body: str) -> str:
 def _body_kind(row, body: str) -> str | None:
     path = _path(row["url"]).lower()
     ct = (row["content_type"] or "").lower()
-    if path.endswith(".map"):
+    if path.endswith(".map") and (row["status"] or 0) < 400 and body.strip():
         return "source_map"
     if "javascript" in ct or "ecmascript" in ct or path.endswith((".js", ".mjs")):
         return "script"

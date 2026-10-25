@@ -1,0 +1,571 @@
+# Technology fingerprint rules for `appmap profile` (lib/appmap/profile/fingerprint.py).
+#
+# Each rule: tech, category, evidence (kinds), match (regex, Python syntax), version (regex with
+# exactly one capture group, or null), confidence (confirmed | likely), implies (list of
+# {tech, category}, or null).
+#
+# Evidence kinds: header ("Name: value" lines), cookie (one cookie name), html, script,
+# source_map (the map's source paths), schema, spa, error_page, auth (login summary line:
+# "role=... login_type=... auth_ok=... fields=a,b token_headers=x,y").
+#
+# Confidence: `confirmed` only for an explicit name/version string from an authoritative source
+# (header, library banner, debug/error page, schema, generator meta); `likely` for a single
+# indirect marker (cookie name, DOM marker, script/stylesheet URL, source-map path). Two distinct
+# rules matching the same technology make it confirmed; implied technologies are likely.
+#
+# Version regexes must be anchored to a banner, header or path form (never a bare "v1.2" or
+# `version: "2"` anywhere in a bundle) - app code is full of such strings.
+#
+# Categories: language, server_framework, frontend_framework, js_library, css_framework,
+# web_server, app_server, cdn_proxy, auth, api_style, third_party.
+
+rules:
+  # ---------------------------------------------------------------- Python / Django
+  - tech: Django
+    category: server_framework
+    evidence: [cookie]
+    match: '^(?:csrftoken|sessionid)$'
+    version: null
+    confidence: likely
+    implies: [{tech: Python, category: language}]
+  - tech: Django
+    category: server_framework
+    evidence: [html, error_page, auth]
+    match: 'csrfmiddlewaretoken'
+    version: null
+    confidence: likely
+    implies: [{tech: Python, category: language}]
+  - tech: Django
+    category: server_framework
+    evidence: [error_page, html]
+    match: 'DEBUG = True</code> in your\s+Django settings file|<th>Django Version:</th>'
+    version: '<th>Django Version:</th>\s*<td>\s*(\d+\.\d+(?:\.\d+)?(?:[a-z]+\d*)?)\s*</td>'
+    confidence: confirmed
+    implies: [{tech: Python, category: language}]
+  - tech: Django
+    category: server_framework
+    evidence: [html, error_page]
+    match: '\|\s*Django site admin</title>|">Django administration</a>'
+    version: null
+    confidence: confirmed
+    implies: [{tech: Python, category: language}]
+  - tech: Python
+    category: language
+    evidence: [error_page, html]
+    match: '<th>Python Version:</th>'
+    version: '<th>Python Version:</th>\s*<td>\s*(\d+\.\d+\.\d+)\s*</td>'
+    confidence: confirmed
+    implies: null
+  - tech: Django REST Framework
+    category: server_framework
+    evidence: [html, error_page, schema]
+    match: 'Django REST framework</(?:a|title)>|/static/rest_framework/'
+    version: null
+    confidence: confirmed
+    implies: [{tech: Django, category: server_framework}, {tech: Python, category: language}]
+  - tech: drf-spectacular
+    category: server_framework
+    evidence: [html, schema]
+    match: 'drf[-_]spectacular'
+    version: null
+    confidence: confirmed
+    implies: &drf
+      - {tech: Django REST Framework, category: server_framework}
+      - {tech: Django, category: server_framework}
+      - {tech: Python, category: language}
+  - tech: drf-spectacular
+    category: server_framework
+    evidence: [schema]
+    # drf-spectacular's default session security scheme (`cookieAuth`, cookie `sessionid`).
+    match: '(?s)\bcookieAuth\b["'']?\s*:\s*\{?\s*["'']?type["'']?\s*:\s*["'']?apiKey["'']?\s*,?\s*["'']?in["'']?\s*:\s*["'']?cookie["'']?\s*,?\s*["'']?name["'']?\s*:\s*["'']?sessionid\b'
+    version: null
+    confidence: likely
+    implies: *drf
+
+  # ---------------------------------------------------------------- Flask / Werkzeug
+  - tech: Werkzeug
+    category: app_server
+    evidence: [header]
+    match: '(?im)^server:[^\n]*\bWerkzeug\b'
+    version: '(?im)^server:[^\n]*\bWerkzeug/(\d+\.\d+(?:\.\d+)?)'
+    confidence: confirmed
+    implies: [{tech: Python, category: language}]
+  - tech: Werkzeug
+    category: app_server
+    evidence: [error_page, html]
+    match: '// Werkzeug Debugger</title>|\?__debugger__=yes&amp;cmd=resource'
+    version: null
+    confidence: confirmed
+    implies: [{tech: Flask, category: server_framework}, {tech: Python, category: language}]
+  - tech: Python
+    category: language
+    evidence: [header]
+    match: '(?im)^server:[^\n]*\bPython/\d'
+    version: '(?im)^server:[^\n]*\bPython/(\d+\.\d+(?:\.\d+)?)'
+    confidence: confirmed
+    implies: null
+  - tech: Flask
+    category: server_framework
+    evidence: [error_page]
+    match: 'site-packages[/\\]flask[/\\]'
+    version: null
+    confidence: likely
+    implies: [{tech: Python, category: language}]
+
+  # ---------------------------------------------------------------- Ruby / Rails
+  - tech: Ruby on Rails
+    category: server_framework
+    evidence: [cookie]
+    match: '^(?:_rails_session|_session_id|_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*_session)$'
+    version: null
+    confidence: likely
+    implies: [{tech: Ruby, category: language}]
+  - tech: Ruby on Rails
+    category: server_framework
+    evidence: [html, error_page]
+    match: '<meta name="csrf-param" content="authenticity_token"'
+    version: null
+    confidence: likely
+    implies: [{tech: Ruby, category: language}]
+  - tech: Ruby on Rails
+    category: server_framework
+    evidence: [html, error_page]
+    match: '@hotwired/turbo-rails|rails-ujs|/rails/active_storage/'
+    version: null
+    confidence: likely
+    implies: [{tech: Ruby, category: language}]
+  - tech: Ruby on Rails
+    category: server_framework
+    evidence: [error_page]
+    match: '<title>Action Controller: Exception caught</title>'
+    version: null
+    confidence: confirmed
+    implies: [{tech: Ruby, category: language}]
+
+  # ---------------------------------------------------------------- PHP / Laravel
+  - tech: PHP
+    category: language
+    evidence: [header]
+    match: '(?im)^x-powered-by:[^\n]*\bPHP\b'
+    version: '(?im)^x-powered-by:[^\n]*\bPHP/(\d+\.\d+(?:\.\d+)?)'
+    confidence: confirmed
+    implies: null
+  - tech: PHP
+    category: language
+    evidence: [cookie]
+    match: '^PHPSESSID$'
+    version: null
+    confidence: likely
+    implies: null
+  - tech: Laravel
+    category: server_framework
+    evidence: [cookie]
+    match: '^laravel_session$'
+    version: null
+    confidence: likely
+    implies: [{tech: PHP, category: language}]
+  - tech: Laravel
+    category: server_framework
+    evidence: [error_page]
+    match: 'Illuminate\\\\?[A-Z]\w+|Whoops\\\\?Run\b|Laravel v\d'
+    version: '\bLaravel v(\d+\.\d+\.\d+)\b'
+    confidence: confirmed
+    implies: [{tech: PHP, category: language}]
+
+  # ---------------------------------------------------------------- Node.js / Express
+  - tech: Express
+    category: server_framework
+    evidence: [header]
+    match: '(?im)^x-powered-by:\s*Express\b'
+    version: null
+    confidence: confirmed
+    implies: [{tech: Node.js, category: language}]
+  - tech: Express
+    category: server_framework
+    evidence: [cookie]
+    match: '^connect\.sid$'
+    version: null
+    confidence: likely
+    implies: [{tech: Node.js, category: language}]
+
+  # ---------------------------------------------------------------- Java / Spring
+  - tech: Spring Boot
+    category: server_framework
+    evidence: [error_page, html]
+    match: '<h1>Whitelabel Error Page</h1>'
+    version: null
+    confidence: confirmed
+    implies: [{tech: Java, category: language}]
+  - tech: Java
+    category: language
+    evidence: [cookie]
+    match: '^JSESSIONID$'
+    version: null
+    confidence: likely
+    implies: null
+
+  # ---------------------------------------------------------------- .NET
+  - tech: ASP.NET
+    category: server_framework
+    evidence: [header]
+    match: '(?im)^x-aspnet-version:\s*\d'
+    version: '(?im)^x-aspnet-version:\s*(\d+\.\d+(?:\.\d+)*)'
+    confidence: confirmed
+    implies: [{tech: 'C#', category: language}]
+  - tech: ASP.NET
+    category: server_framework
+    evidence: [header]
+    match: '(?im)^x-powered-by:\s*ASP\.NET\b'
+    version: null
+    confidence: confirmed
+    implies: [{tech: 'C#', category: language}]
+  - tech: ASP.NET
+    category: server_framework
+    evidence: [cookie]
+    match: '^(?:ASP\.NET_SessionId|\.AspNetCore\.[A-Za-z.]+|\.ASPXAUTH)$'
+    version: null
+    confidence: likely
+    implies: [{tech: 'C#', category: language}]
+  - tech: ASP.NET
+    category: server_framework
+    evidence: [html]
+    match: '<input type="hidden" name="__VIEWSTATE"'
+    version: null
+    confidence: likely
+    implies: [{tech: 'C#', category: language}]
+  - tech: ASP.NET MVC
+    category: server_framework
+    evidence: [header]
+    match: '(?im)^x-aspnetmvc-version:\s*\d'
+    version: '(?im)^x-aspnetmvc-version:\s*(\d+\.\d+(?:\.\d+)*)'
+    confidence: confirmed
+    implies: [{tech: ASP.NET, category: server_framework}, {tech: 'C#', category: language}]
+
+  # ---------------------------------------------------------------- web / app servers
+  - tech: nginx
+    category: web_server
+    evidence: [header]
+    match: '(?im)^server:\s*nginx\b'
+    version: '(?im)^server:\s*nginx/(\d+\.\d+(?:\.\d+)?)'
+    confidence: confirmed
+    implies: null
+  - tech: nginx
+    category: web_server
+    evidence: [error_page, html]
+    match: '<hr><center>nginx(?:/[\d.]+)?</center>|<title>Welcome to nginx!</title>'
+    version: '<hr><center>nginx/(\d+\.\d+(?:\.\d+)?)</center>'
+    confidence: confirmed
+    implies: null
+  - tech: Apache HTTP Server
+    category: web_server
+    evidence: [header]
+    match: '(?im)^server:\s*Apache\b(?!-Coyote)'
+    version: '(?im)^server:\s*Apache/(\d+\.\d+(?:\.\d+)?)'
+    confidence: confirmed
+    implies: null
+  - tech: Apache HTTP Server
+    category: web_server
+    evidence: [error_page, html]
+    match: '<address>Apache(?:/[\d.]+)?[^<]* Server at '
+    version: '<address>Apache/(\d+\.\d+(?:\.\d+)?)'
+    confidence: confirmed
+    implies: null
+  - tech: IIS
+    category: web_server
+    evidence: [header]
+    match: '(?im)^server:\s*Microsoft-IIS\b'
+    version: '(?im)^server:\s*Microsoft-IIS/(\d+\.\d+)'
+    confidence: confirmed
+    implies: null
+  - tech: gunicorn
+    category: app_server
+    evidence: [header]
+    match: '(?im)^server:\s*gunicorn\b'
+    version: '(?im)^server:\s*gunicorn/(\d+\.\d+(?:\.\d+)?)'
+    confidence: confirmed
+    implies: [{tech: Python, category: language}]
+  - tech: uvicorn
+    category: app_server
+    evidence: [header]
+    match: '(?im)^server:\s*uvicorn\b'
+    version: null
+    confidence: confirmed
+    implies: [{tech: Python, category: language}]
+
+  # ---------------------------------------------------------------- CDN / proxy
+  - tech: Cloudflare
+    category: cdn_proxy
+    evidence: [header]
+    match: '(?im)^server:\s*cloudflare\b|^cf-ray:'
+    version: null
+    confidence: confirmed
+    implies: null
+  - tech: Amazon CloudFront
+    category: cdn_proxy
+    evidence: [header]
+    match: '(?im)^via:[^\n]*\(CloudFront\)|^x-amz-cf-id:|^x-cache:[^\n]*\bcloudfront\b'
+    version: null
+    confidence: confirmed
+    implies: null
+  - tech: Fastly
+    category: cdn_proxy
+    evidence: [header]
+    match: '(?im)^(?:x-)?fastly-[a-z-]+:|^x-served-by:\s*cache-[a-z0-9-]+'
+    version: null
+    confidence: confirmed
+    implies: null
+
+  # ---------------------------------------------------------------- front-end frameworks
+  - tech: React
+    category: frontend_framework
+    evidence: [script]
+    match: '@license React\b'
+    version: '@license React v(\d+\.\d+\.\d+)'
+    confidence: confirmed
+    implies: null
+  - tech: React
+    category: frontend_framework
+    evidence: [script]
+    match: '__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED|__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE'
+    version: null
+    confidence: likely
+    implies: null
+  - tech: React
+    category: frontend_framework
+    evidence: [source_map]
+    match: '(?m)node_modules/react(?:-dom)?/'
+    version: null
+    confidence: likely
+    implies: null
+  - tech: React
+    category: frontend_framework
+    evidence: [html]
+    match: 'data-reactroot|<script[^>]+\bsrc="[^"]*/react(?:-dom)?(?:@|/)\d'
+    version: '<script[^>]+\bsrc="[^"]*/react(?:-dom)?(?:@|/)(\d+\.\d+\.\d+)/'
+    confidence: likely
+    implies: null
+  - tech: Vue
+    category: frontend_framework
+    evidence: [script]
+    match: '(?m)^\s*\*\s*vue v\d+\.\d+\.\d+\s*$'
+    version: '(?m)^\s*\*\s*vue v(\d+\.\d+\.\d+)\s*$'
+    confidence: confirmed
+    implies: null
+  - tech: Vue
+    category: frontend_framework
+    evidence: [html]
+    match: '<script[^>]+\bsrc="[^"]*/vue(?:@\d[^/"]*)?/dist/vue\.|<script[^>]+\bsrc="[^"]*/vue(?:\.global|\.runtime)?(?:\.prod)?(?:\.min)?\.js"'
+    version: '<script[^>]+\bsrc="[^"]*/vue@(\d+\.\d+\.\d+)/'
+    confidence: likely
+    implies: null
+  - tech: Vue
+    category: frontend_framework
+    evidence: [html]
+    match: 'data-v-(?:[0-9a-f]{8}|app)\b'
+    version: null
+    confidence: likely
+    implies: null
+  - tech: Vue
+    category: frontend_framework
+    evidence: [source_map]
+    match: '(?m)node_modules/(?:@vue/|vue/)|\.vue$'
+    version: null
+    confidence: likely
+    implies: null
+  - tech: vue-router
+    category: js_library
+    evidence: [script]
+    match: '(?m)^\s*\*\s*vue-router v\d+\.\d+\.\d+\s*$'
+    version: '(?m)^\s*\*\s*vue-router v(\d+\.\d+\.\d+)\s*$'
+    confidence: confirmed
+    implies: [{tech: Vue, category: frontend_framework}]
+  - tech: vue-router
+    category: js_library
+    evidence: [source_map]
+    match: '(?m)node_modules/vue-router/'
+    version: null
+    confidence: likely
+    implies: [{tech: Vue, category: frontend_framework}]
+  - tech: Angular
+    category: frontend_framework
+    evidence: [html]
+    match: 'ng-version="\d'
+    version: 'ng-version="(\d+\.\d+\.\d+)"'
+    confidence: confirmed
+    implies: null
+  - tech: Angular
+    category: frontend_framework
+    evidence: [source_map]
+    match: '(?m)node_modules/@angular/core/'
+    version: null
+    confidence: likely
+    implies: null
+  - tech: Next.js
+    category: frontend_framework
+    evidence: [html]
+    match: 'id="__NEXT_DATA__"|/_next/static/'
+    version: null
+    confidence: confirmed
+    implies: [{tech: React, category: frontend_framework}]
+  - tech: Next.js
+    category: frontend_framework
+    evidence: [header]
+    match: '(?im)^x-powered-by:\s*Next\.js\b'
+    version: null
+    confidence: confirmed
+    implies: [{tech: React, category: frontend_framework}]
+  - tech: Nuxt
+    category: frontend_framework
+    evidence: [html]
+    match: '__NUXT__\s*=|id="__nuxt"|/_nuxt/'
+    version: null
+    confidence: confirmed
+    implies: [{tech: Vue, category: frontend_framework}]
+  - tech: SvelteKit
+    category: frontend_framework
+    evidence: [html]
+    match: 'data-sveltekit-[a-z-]+=|__sveltekit_[a-z0-9]+\s*=|/_app/immutable/'
+    version: null
+    confidence: confirmed
+    implies: [{tech: Svelte, category: frontend_framework}]
+  - tech: Svelte
+    category: frontend_framework
+    evidence: [source_map]
+    match: '(?m)node_modules/svelte/|\.svelte$'
+    version: null
+    confidence: likely
+    implies: null
+
+  # ---------------------------------------------------------------- JS / CSS libraries
+  - tech: jQuery
+    category: js_library
+    evidence: [script]
+    match: '/\*!\s*jQuery v\d'
+    version: '/\*!\s*jQuery v(\d+\.\d+\.\d+)'
+    confidence: confirmed
+    implies: null
+  - tech: jQuery
+    category: js_library
+    evidence: [html]
+    match: '<script[^>]+\bsrc="[^"]*/jquery(?:[-.@/]\d+\.\d+\.\d+)?(?:\.slim)?(?:\.min)?\.js'
+    version: '<script[^>]+\bsrc="[^"]*/jquery(?:-|@|/)(\d+\.\d+\.\d+)(?:/|\.slim|\.min|\.js)'
+    confidence: likely
+    implies: null
+  - tech: Bootstrap
+    category: css_framework
+    evidence: [script, html]
+    match: '\*\s*Bootstrap v\d+\.\d+\.\d+ \(https?://getbootstrap\.com/?\)'
+    version: '\*\s*Bootstrap v(\d+\.\d+\.\d+) \(https?://getbootstrap\.com/?\)'
+    confidence: confirmed
+    implies: null
+  - tech: Bootstrap
+    category: css_framework
+    evidence: [html]
+    match: '<(?:link|script)[^>]+\b(?:href|src)="[^"]*/bootstrap(?:@\d[^/"]*/dist/(?:css|js)/bootstrap|/\d+\.\d+\.\d+/(?:css|js)/bootstrap)?(?:\.bundle)?(?:\.min)?\.(?:css|js)"'
+    version: '<(?:link|script)[^>]+\b(?:href|src)="[^"]*/bootstrap(?:@|/)(\d+\.\d+\.\d+)/'
+    confidence: likely
+    implies: null
+  - tech: Font Awesome
+    category: css_framework
+    evidence: [script]
+    match: '\*\s*Font Awesome (?:Free|Pro) \d'
+    version: '\*\s*Font Awesome (?:Free|Pro) (\d+\.\d+\.\d+)'
+    confidence: confirmed
+    implies: null
+  - tech: Font Awesome
+    category: css_framework
+    evidence: [html]
+    match: '<(?:link|script)[^>]+\b(?:href|src)="[^"]*(?:/font-awesome/|/fontawesome-free@|/fontawesome/|kit\.fontawesome\.com/)'
+    version: '<(?:link|script)[^>]+\b(?:href|src)="[^"]*(?:/font-awesome/|/fontawesome-free@)(\d+\.\d+\.\d+)/'
+    confidence: likely
+    implies: null
+
+  # ---------------------------------------------------------------- third party
+  - tech: Google Analytics
+    category: third_party
+    evidence: [html]
+    match: 'googletagmanager\.com/gtag/js|google-analytics\.com/(?:analytics|ga)\.js'
+    version: null
+    confidence: likely
+    implies: null
+  - tech: Google Tag Manager
+    category: third_party
+    evidence: [html]
+    match: 'googletagmanager\.com/(?:gtm\.js|ns\.html)'
+    version: null
+    confidence: likely
+    implies: null
+
+  # ---------------------------------------------------------------- auth mechanisms
+  - tech: JWT bearer
+    category: auth
+    evidence: [auth]
+    match: '\btoken_headers=\S*\bauthorization\b'
+    version: null
+    confidence: likely
+    implies: null
+  - tech: JWT bearer
+    category: auth
+    evidence: [schema]
+    match: '["'']?bearerFormat["'']?\s*:\s*["'']?JWT\b'
+    version: null
+    confidence: likely
+    implies: null
+  - tech: Cookie session
+    category: auth
+    evidence: [cookie]
+    match: '^(?:sessionid|session|connect\.sid|JSESSIONID|PHPSESSID|laravel_session|ASP\.NET_SessionId|_session_id|_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*_session|[A-Za-z0-9_.-]*[_.-]sess(?:ion)?(?:id)?)$'
+    version: null
+    confidence: likely
+    implies: null
+  - tech: CSRF token
+    category: auth
+    evidence: [cookie]
+    match: '(?i)^(?:csrftoken|csrf_token|_csrf|xsrf-token|csrf-token)$'
+    version: null
+    confidence: likely
+    implies: null
+  - tech: CSRF token
+    category: auth
+    evidence: [html, error_page]
+    match: 'name="(?:csrfmiddlewaretoken|csrf-token|csrf-param|_csrf|_token|authenticity_token|__RequestVerificationToken)"'
+    version: null
+    confidence: likely
+    implies: null
+  - tech: CSRF token
+    category: auth
+    evidence: [auth]
+    match: '(?i)\btoken_headers=\S*(?:csrf|xsrf)|\bfields=\S*(?:csrf|authenticity_token|\b_token\b)'
+    version: null
+    confidence: likely
+    implies: null
+
+  # ---------------------------------------------------------------- API styles
+  - tech: OpenAPI
+    category: api_style
+    evidence: [schema]
+    match: '(?m)"(?:openapi|swagger)"\s*:\s*"\d|^(?:openapi|swagger)\s*:\s*["'']?\d'
+    version: '(?m)(?:"(?:openapi|swagger)"\s*:\s*"|^(?:openapi|swagger)\s*:\s*["'']?)(\d+\.\d+(?:\.\d+)?)'
+    confidence: confirmed
+    implies: null
+  - tech: OpenAPI
+    category: api_style
+    evidence: [schema, html]
+    match: 'swagger-ui(?:-bundle)?(?:\.min)?\.(?:js|css)|<redoc\b|redoc\.standalone\.js'
+    version: null
+    confidence: likely
+    implies: null
+  - tech: GraphQL
+    category: api_style
+    evidence: [schema]
+    match: '"__schema"\s*:'
+    version: null
+    confidence: confirmed
+    implies: null
+  - tech: GraphQL
+    category: api_style
+    evidence: [html, schema]
+    match: 'graphiql(?:\.min)?\.(?:js|css)|<title>GraphiQL</title>|graphql-playground'
+    version: null
+    confidence: likely
+    implies: null

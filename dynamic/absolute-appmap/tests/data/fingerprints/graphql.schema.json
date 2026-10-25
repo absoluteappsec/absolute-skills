@@ -1,0 +1,2 @@
+{"data": {"__schema": {"queryType": {"name": "Query"}, "mutationType": {"name": "Mutation"},
+ "types": [{"kind": "OBJECT", "name": "Query", "fields": [{"name": "orders", "args": []}]}]}}}
