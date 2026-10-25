@@ -58,7 +58,7 @@ def _resource(pattern: str) -> str | None:
         segs = segs[1:]
     while segs and _VERSION_SEG.match(segs[0]):
         segs = segs[1:]
-    if not segs or _PLACEHOLDER.match(segs[0]):
+    if not segs or _PLACEHOLDER.match(segs[0]) or "." in segs[0]:
         return None
     return segs[0]
 
@@ -117,8 +117,25 @@ def layout(store: Store, run_id: str) -> dict:
 
 
 # ------------------------------------------------------------------------ data model
+_SENSITIVE_NAME = re.compile(r"token|csrf|xsrf|secret|passw|api[_-]?key|credential|session|"
+                             r"authoriz|jwt|bearer|private[_-]?key", re.I)
+_IDENTITY_NAME = re.compile(r"user[_-]?name|e[_-]?mail|login|owner|^user$|^author$|phone", re.I)
+_WRAPPER_KEY = re.compile(r"cursor|page|next|prev|total|count|limit|offset|size|has_more|more",
+                          re.I)
+_NON_DATA_TYPES = {"div", "span", "button", "submit", "reset", "image", "a", "link"}
+_NON_DATA_WIDGETS = {"button", "link", "tab", "menuitem", "menu"}
+_FORM_TYPES = {"text": "string", "email": "string", "url": "string", "tel": "string",
+               "search": "string", "textarea": "string", "select": "string",
+               "select-one": "string", "radio": "string", "number": "number",
+               "range": "number", "checkbox": "boolean", "date": "date",
+               "datetime-local": "datetime", "time": "time", "month": "string",
+               "week": "string", "file": "file", "color": "string"}
+
+
 def _example(name: str, value) -> str | None:
     if value is None or isinstance(value, (dict, list)):
+        return None
+    if _SENSITIVE_NAME.search(name) or _IDENTITY_NAME.search(name):
         return None
     red = _redactor.json({name: value}).get(name)
     return str(red)[:MAX_EXAMPLE]
@@ -218,7 +235,7 @@ def _graphql_entities(result, ref: dict) -> list[dict]:
             fields.append({"name": f["name"], "type": ftype, "required": req,
                            "constraints": {}, "enum": [], "example_redacted": None})
         idf = next((f for f in fields if f["name"] == "id"), None)
-        id_fmt = "unknown" if not idf else ("int" if idf["type"] == "Int" else "unknown")
+        id_fmt = "int" if idf and idf["type"] == "Int" else "unknown"  # ID alone says nothing
         out.append({"name": t["name"], "source": "graphql", "fields": fields,
                     "id_format": id_fmt, "endpoints": [], "evidence": [ref]})
     return out
@@ -245,35 +262,43 @@ def _schema_entities(store: Store, run_id: str, run_dir: Path | None) -> list[di
 
 
 def _shape_fields(shape) -> dict[str, str]:
-    if isinstance(shape, list):
-        shape = shape[0] if shape else None
+    shape = _unwrap(shape)
     if not isinstance(shape, dict):
         return {}
     out = {}
     for k, v in shape.items():
+        if _SENSITIVE_NAME.search(k):
+            continue
         out[k] = _TYPE_NAMES.get(v, v) if isinstance(v, str) else (
             "array" if isinstance(v, list) else "object")
     return out
 
 
 def _id_format(param_name: str, types: list, examples: list) -> str:
-    for ex in examples:
-        s = str(ex)
-        if _UUID.match(s):
-            return "uuid"
-    if any(t in ("int", "integer") for t in types):
+    exs = [str(e) for e in examples]
+    if any(_UUID.match(e) for e in exs):
+        return "uuid"
+    if any(t in ("int", "integer") for t in types) or (exs and all(e.isdigit() for e in exs)):
         return "int"
-    for ex in examples:
-        if str(ex).isdigit():
-            return "int"
     name = param_name.lower()
     if name in ("uuid", "guid"):
         return "uuid"
-    if name == "id":
-        return "int"
-    if name in ("slug", "name", "handle"):
+    if name in ("slug", "handle"):
         return "slug"
     return "unknown"
+
+
+def _unwrap(shape):
+    """Item shape of a response: lists and list wrappers (an array-of-objects field next to
+    cursor/page/count-style siblings) unwrap to the element."""
+    if isinstance(shape, list):
+        return shape[0] if shape and isinstance(shape[0], dict) else None
+    if not isinstance(shape, dict):
+        return None
+    lists = [k for k, v in shape.items() if isinstance(v, list) and v and isinstance(v[0], dict)]
+    if len(lists) == 1 and all(k == lists[0] or _WRAPPER_KEY.search(k) for k in shape):
+        return shape[lists[0]][0]
+    return shape
 
 
 def _inferred_entities(store: Store, run_id: str) -> list[dict]:
@@ -332,6 +357,8 @@ def _inferred_entities(store: Store, run_id: str) -> list[dict]:
         name = ep_res.get(p["endpoint_id"])
         if not name:
             continue
+        if _SENSITIVE_NAME.search(p["name"]):
+            continue
         types = _loads(p["types"], [])
         examples = _loads(p["examples"], [])
         f = entity(name)["fields"].setdefault(
@@ -349,12 +376,16 @@ def _inferred_entities(store: Store, run_id: str) -> list[dict]:
         ent["refs"].append({"run_id": run_id, "kind": "form", "id": fm["id"]})
         for fld in conn.execute("SELECT name, type, widget, constraints, options FROM fields "
                                 "WHERE form_id=? ORDER BY id", (fm["id"],)):
-            if not fld["name"] or (fld["type"] or "") in ("password", "hidden", "submit") \
-                    or "csrf" in fld["name"].lower():
+            ftype = (fld["type"] or "").lower()
+            if not fld["name"] or ftype in {"password", "hidden"} | _NON_DATA_TYPES \
+                    or (fld["widget"] or "").lower() in _NON_DATA_WIDGETS \
+                    or _SENSITIVE_NAME.search(fld["name"]):
                 continue
+            if fld["name"].lower() in {k.lower() for k in ent["fields"]} - {fld["name"]}:
+                continue  # a UI label for a field already seen under its wire name
             cons = _loads(fld["constraints"], {})
             f = ent["fields"].setdefault(
-                fld["name"], {"type": fld["type"] or fld["widget"] or "unknown",
+                fld["name"], {"type": _FORM_TYPES.get(ftype, "string" if ftype else "unknown"),
                               "required": False, "example": None})
             f["required"] = f["required"] or bool(cons.get("required"))
             f.setdefault("constraints", {}).update(
@@ -365,7 +396,7 @@ def _inferred_entities(store: Store, run_id: str) -> list[dict]:
 
     out = []
     for name, ent in sorted(res.items()):
-        if not ent["fields"] or not (ent["shaped"] or ent["item"]):
+        if not ent["fields"] or not ent["item"]:  # singletons (login, stats, graphql) are not entities
             continue
         ids = [i for i in ent["ids"] if i != "unknown"]
         out.append({
@@ -392,8 +423,19 @@ def _key(name: str) -> str:
 
 
 def data_model(store: Store, run_id: str, run_dir: Path | None = None) -> list[dict]:
-    declared = _schema_entities(store, run_id, run_dir)
-    seen = {_key(e["name"]) for e in declared}
+    declared: dict[str, dict] = {}
+    for e in _schema_entities(store, run_id, run_dir):
+        cur = declared.setdefault(_key(e["name"]), e)
+        if cur is e:
+            continue
+        have = {f["name"] for f in cur["fields"]}
+        cur["fields"] += [f for f in e["fields"] if f["name"] not in have]
+        cur["endpoints"] += [x for x in e["endpoints"] if x not in cur["endpoints"]]
+        cur["evidence"] += [r for r in e["evidence"] if r not in cur["evidence"]]
+        if cur["id_format"] == "unknown":
+            cur["id_format"] = e["id_format"]
+    seen = set(declared)
+    declared = list(declared.values())
     inferred = [e for e in _inferred_entities(store, run_id) if _key(e["name"]) not in seen]
     return declared + inferred
 
