@@ -21,7 +21,7 @@ This skill is a procedure for you, the agent. There is no special tooling: use t
 
 Ask (or confirm from the request): base URL(s), in-scope hosts/paths, anything to avoid (e.g. `/logout`, admin user pages), whether it's staging or production, and the roles to crawl with how to log in as each (the user types credentials or tells you where they are — don't store them).
 
-**Logging in:** after submitting the login form, confirm success by something only a logged-in user sees (a logout link, the username, a page that redirected you before). If it fails, retry at most once (lockouts are real), then continue without that role and report it — say what the page showed (e.g. "Login failed" message) without repeating the credentials.
+**Logging in:** after submitting the login form, confirm success with signals that fit the app — you left the login URL, no password field remains, the login POST redirected (e.g. 302), or a page that redirected you before now loads. Don't rely on a logout link existing. If a role failed to log in on an earlier run, confirm its credentials actually changed (e.g. the file's modification time) before trying again. If it fails, retry at most once (lockouts are real), then continue without that role and report it — say what the page showed (e.g. "Login failed" message) without repeating the credentials.
 
 Create `SITE-MAP.md` in the working directory (or where the user says) with a header: site, date, scope, roles, environment.
 
