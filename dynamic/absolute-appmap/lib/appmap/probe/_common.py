@@ -8,9 +8,12 @@ from urllib.parse import urlsplit
 from ..direct import DirectClient
 
 
-def with_source(client: DirectClient, source: str) -> DirectClient:
-    """A client whose recorded exchanges carry ``source`` (origin stays ``passive``)."""
-    return DirectClient(client.gate, functools.partial(client.rec, source=source), client.events)
+def with_source(client: DirectClient, source: str, attribute: bool | str = "ok") -> DirectClient:
+    """A client whose recorded exchanges carry ``source`` (origin stays ``passive``).
+
+    ``attribute`` as in ``record_exchange``: guesses attribute only 2xx responses."""
+    return DirectClient(client.gate, functools.partial(client.rec, source=source,
+                                                       attribute=attribute), client.events)
 
 
 def expired(deadline: float | None) -> bool:

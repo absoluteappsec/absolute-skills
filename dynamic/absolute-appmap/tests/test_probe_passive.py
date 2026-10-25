@@ -119,3 +119,44 @@ def test_cli_probe_passive(ssr_url, make_cfg, tmp_path, capsys):
     assert main(["probe", "--run", str(run), "--phase", "passive", "--budget-minutes", "0"]) == 0
     st = json.loads(capsys.readouterr().out.strip().splitlines()[-1].removeprefix("APPMAP_STATUS "))
     assert st["status"] == "in_progress" and "--phase passive" in st["next"]
+
+
+def test_guessed_404s_leave_no_endpoints(ssr_url, make_cfg, tmp_path, capsys):
+    import sqlite3
+
+    from appmap.cli import main
+    cfg = make_cfg(ssr_url, roles=[{"name": "anonymous", "login": {"type": "none"}}])
+    assert main(["init", "--config", str(cfg.source_path), "--out", str(tmp_path / "r")]) == 0
+    run = next((tmp_path / "r").iterdir())
+    assert main(["probe", "--run", str(run), "--phase", "passive"]) == 0
+    db = sqlite3.connect(next(run.glob("*.sqlite")))
+    paths = {r[0] for r in db.execute("select path_pattern from endpoints")}
+    assert not paths & {"/swagger.json", "/v3/api-docs", "/api-docs", "/manifest.json",
+                        "/.well-known/security.txt", "/graphql", "/openapi.json"}
+    assert db.execute("select count(*) from exchanges where status=404").fetchone()[0] >= 5
+
+
+def test_probe_with_saved_cookie_session_never_persists_cookie(ssr_url, make_cfg, tmp_path,
+                                                               monkeypatch, capsys):
+    import json
+
+    from appmap.cli import main
+    secret = "SESSIONCOOKIEVALUE-9f3a1c77d2"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    cfg = make_cfg(ssr_url, roles=[{"name": "alice", "login": {
+        "type": "form", "url": f"{ssr_url}/login", "username_env": "APPMAP_ALICE_USER",
+        "password_env": "APPMAP_ALICE_PASS"}}])
+    assert main(["init", "--config", str(cfg.source_path), "--out", str(tmp_path / "r")]) == 0
+    run = next((tmp_path / "r").iterdir())
+    state = tmp_path / "cache" / "absolute-appmap" / "sessions" / run.name / "alice.json"
+    state.parent.mkdir(parents=True)
+    state.write_text(json.dumps({"cookies": [{
+        "name": "session", "value": secret, "domain": "127.0.0.1", "path": "/",
+        "expires": -1, "httpOnly": True, "secure": False, "sameSite": "Lax"}], "origins": []}))
+    assert main(["probe", "--run", str(run), "--phase", "passive"]) == 0
+    seen = [p for p in run.rglob("*") if p.is_file() and secret.encode() in p.read_bytes()]
+    assert seen == []
+    import sqlite3
+    db = sqlite3.connect(next(run.glob("*.sqlite")))
+    assert db.execute("select count(*) from exchanges where role='alice' and origin='passive'"
+                      ).fetchone()[0] > 0

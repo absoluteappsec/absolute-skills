@@ -94,3 +94,68 @@ async def test_probe_schemas_graphql_introspection_live(api, spa_url, make_cfg, 
     # idempotent
     await probe_schemas(client, api, cfg, rt.store, "anonymous")
     rt.store.close()
+
+
+def test_parse_openapi_malformed_and_31_types():
+    doc = {"openapi": "3.1.0", "servers": ["x"], "paths": {
+        "/a": {"parameters": "oops", "get": {
+            "parameters": [{"name": "q", "in": "query", "required": "yes",
+                            "schema": {"type": ["string", "null"]}}, "junk", {"in": "query"}],
+            "requestBody": {"content": {"application/json": {"schema": {
+                "required": True, "properties": ["bad"]}}, "text/plain": "nope"}}}},
+        "/b": "not a dict", "/c": {"post": {"requestBody": {"content": {"application/json": {
+            "schema": {"required": True, "properties": {"n": {"type": ["integer", "null"]}}}}}}}}}}
+    ops = {(o.method, o.path_pattern): o for o in parse_openapi(doc)}
+    assert set(ops) == {("GET", "/a"), ("POST", "/c")}
+    (q,) = ops[("GET", "/a")].params
+    assert q["type"] == "string" and q["required"] is False
+    assert ops[("POST", "/c")].params == [
+        {"name": "n", "in": "body", "required": False, "type": "integer"}]
+
+
+async def test_malformed_openapi_does_not_abort_probe(api, make_cfg, run_dir, tmp_path,
+                                                      stub_server):
+    from werkzeug.wrappers import Response
+
+    from appmap.crawl import build_runtime
+    srv = stub_server({
+        "/openapi.json": lambda r: Response('{"paths": {"/x": {"get": {"parameters": 5, '
+                                            '"responses": null}}, "/y": 3}}',
+                                            content_type="application/json"),
+        "/swagger.json": lambda r: Response('{"paths": [1]}', content_type="application/json"),
+        "/api/openapi.json": lambda r: Response(
+            '{"openapi":"3.0.0","paths":{"/ok":{"get":{}}}}', content_type="application/json")})
+    cfg = make_cfg(srv.url)
+    rd = run_dir(tmp_path, cfg)
+    rt = build_runtime(cfg, rd)
+    rec = functools.partial(record_exchange, rt.store, rt.events, rt.redactor, rd,
+                            known_patterns=[])
+    counts = await probe_schemas(client=DirectClient(rt.gate, rec, rt.events), api=api,
+                                 cfg=cfg, store=rt.store, role="anonymous")
+    eps = {r[0] for r in rt.store.conn.execute("SELECT path_pattern FROM endpoints")}
+    assert "/ok" in eps and counts["openapi_ops"] >= 2
+    rt.store.close()
+
+
+async def test_introspection_and_guesses_leave_no_fake_endpoints(api, spa_url, ssr_url,
+                                                                 make_cfg, run_dir, tmp_path):
+    from appmap.crawl import build_runtime
+    for name, url in (("spa", spa_url), ("ssr", ssr_url)):
+        cfg = make_cfg(url)
+        rd = run_dir(tmp_path / name, cfg) if (tmp_path / name).mkdir() is None else None
+        rt = build_runtime(cfg, rd)
+        rec = functools.partial(record_exchange, rt.store, rt.events, rt.redactor, rd,
+                                known_patterns=[])
+        await probe_schemas(DirectClient(rt.gate, rec, rt.events), api, cfg, rt.store, "anonymous")
+        ops = {r[0] for r in rt.store.conn.execute(
+            "SELECT graphql_op FROM endpoints WHERE kind='graphql_op'")}
+        assert "IntrospectionQuery" not in ops
+        if name == "ssr":
+            assert ops == set()
+            paths = {r[0] for r in rt.store.conn.execute("SELECT path_pattern FROM endpoints")}
+            assert "/graphql" not in paths and "/openapi.json" not in paths
+            assert "/api/openapi.json" in paths
+        # the attempts themselves are still recorded as exchanges
+        assert rt.store.conn.execute(
+            "SELECT count(*) FROM exchanges WHERE origin='passive'").fetchone()[0] >= 6
+        rt.store.close()

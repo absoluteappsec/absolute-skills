@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
@@ -32,6 +33,20 @@ class SchemaOp:
     params: list[dict] = field(default_factory=list)  # {name, in, required, type}
 
 
+log = logging.getLogger("appmap.probe.schemas")
+
+
+def _flat_type(t):
+    """OpenAPI 3.1 allows ``type: ["string", "null"]``; keep one non-null type name."""
+    if isinstance(t, list):
+        t = next((x for x in t if isinstance(x, str) and x != "null"), None)
+    return t if isinstance(t, str) else None
+
+
+def _dicts(value) -> list[dict]:
+    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
+
+
 def _ref(doc: dict, node):
     """Resolve local ``$ref`` chains (bounded)."""
     for _ in range(10):
@@ -46,20 +61,24 @@ def _ref(doc: dict, node):
 
 def _param(doc: dict, raw) -> dict | None:
     p = _ref(doc, raw)
+    if not isinstance(p.get("name"), str):
+        return None
     loc = _IN.get(p.get("in"))
     if not loc or not p.get("name"):
         return None
     schema = _ref(doc, p.get("schema")) if "schema" in p else p
-    return {"name": p["name"], "in": loc, "required": bool(p.get("required")) or loc == "path",
-            "type": schema.get("type")}
+    return {"name": p["name"], "in": loc, "required": p.get("required") is True or loc == "path",
+            "type": _flat_type(schema.get("type"))}
 
 
 def _body_params(doc: dict, schema) -> list[dict]:
     schema = _ref(doc, schema)
-    required = set(schema.get("required") or [])
+    req = schema.get("required")
+    required = {r for r in req if isinstance(r, str)} if isinstance(req, list) else set()
+    props = schema.get("properties")
     return [{"name": n, "in": "body", "required": n in required,
-             "type": _ref(doc, s).get("type")}
-            for n, s in (schema.get("properties") or {}).items()]
+             "type": _flat_type(_ref(doc, s).get("type"))}
+            for n, s in (props.items() if isinstance(props, dict) else []) if isinstance(n, str)]
 
 
 def parse_openapi(doc: dict) -> list[SchemaOp]:
@@ -69,27 +88,29 @@ def parse_openapi(doc: dict) -> list[SchemaOp]:
     prefix = ""
     if "swagger" in doc:
         prefix = (doc.get("basePath") or "").rstrip("/")
-    elif doc.get("servers") and isinstance(doc["servers"][0], dict):
+    elif _dicts(doc.get("servers")):
         prefix = urlsplit(str(doc["servers"][0].get("url", ""))).path.rstrip("/")
     ops: list[SchemaOp] = []
     for path, item in doc["paths"].items():
+        if not isinstance(item, dict):
+            continue
         item = _ref(doc, item)
-        shared = [p for p in (_param(doc, r) for r in item.get("parameters") or []) if p]
+        shared = [p for p in (_param(doc, r) for r in _dicts(item.get("parameters"))) if p]
         for method in _METHODS:
             op = item.get(method)
             if not isinstance(op, dict):
                 continue
             params = {(p["in"], p["name"]): p for p in shared}
-            for raw in op.get("parameters") or []:
+            for raw in _dicts(op.get("parameters")):
                 r = _ref(doc, raw)
                 if r.get("in") == "body":
                     for p in _body_params(doc, r.get("schema")):
                         params[(p["in"], p["name"])] = p
                 elif (p := _param(doc, r)):
                     params[(p["in"], p["name"])] = p
-            content = _ref(doc, op.get("requestBody")).get("content") or {}
-            for media in content.values():
-                for p in _body_params(doc, (media or {}).get("schema")):
+            content = _ref(doc, op.get("requestBody")).get("content")
+            for media in (content.values() if isinstance(content, dict) else []):
+                for p in _body_params(doc, media.get("schema") if isinstance(media, dict) else None):
                     params[(p["in"], p["name"])] = p
             ops.append(SchemaOp(method.upper(), prefix + str(path), list(params.values())))
     return ops
@@ -147,6 +168,12 @@ async def probe_schemas(client: DirectClient, api, cfg, store: Store, role: str,
             ops = parse_openapi(json.loads(await got[1].text()))
         except ValueError:
             continue
+        except Exception as exc:  # malformed real-world document: skip it, keep probing
+            log.warning("openapi %s: unparseable document (%s: %s)", url, type(exc).__name__, exc)
+            if client.events is not None:
+                client.events.emit("error", role=role, url=url,
+                                   error=f"openapi parse failed: {type(exc).__name__}: {exc}")
+            continue
         parts = urlsplit(url)
         host = parts.netloc.lower()
         for op in ops:
@@ -172,14 +199,14 @@ async def probe_schemas(client: DirectClient, api, cfg, store: Store, role: str,
     for url in targets:
         if not alive():
             return counts
-        got = await with_source(client, "graphql").request(
+        got = await with_source(client, "graphql", attribute=False).request(
             api, "POST", url, role=role, origin="passive", json={"query": INTROSPECTION_QUERY})
         counts["requests"] += 1
         if got is None or got[0] != 200:
             continue
         try:
             fields = parse_introspection(json.loads(await got[1].text()))
-        except ValueError:
+        except Exception:  # not JSON / unexpected shape: no operations to record
             continue
         parts = urlsplit(url)
         for kind, name in fields:

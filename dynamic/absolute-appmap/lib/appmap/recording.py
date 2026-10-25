@@ -225,7 +225,10 @@ def record_exchange(store: Store, events: EventLog, redactor: Redactor, rd: RunD
                     role: str, origin: str, method: str, url: str, req_headers: dict,
                     req_body: bytes | None, status: int, resp_headers: dict,
                     resp_body: bytes | None, duration_ms: float, caused_by: str | None,
-                    known_patterns: list[str], source: str | None = None) -> int:
+                    known_patterns: list[str], source: str | None = None,
+                    attribute: bool | str = True) -> int:
+    """``attribute``: False records the exchange without endpoint/response rows; "ok"
+    attributes only 2xx responses (guessed paths that 404 leave no map entries)."""
     if source is None:
         if origin not in _SOURCE_BY_ORIGIN:
             raise ValueError(f"origin {origin!r} has no default source; pass source=")
@@ -247,26 +250,29 @@ def record_exchange(store: Store, events: EventLog, redactor: Redactor, rd: RunD
                           duration_ms=duration_ms, size=len(resp_body or b""))
 
     # Endpoint
+    attributed = attribute is True or (attribute == "ok" and 200 <= status < 300)
     gql = _graphql(req_text)
     path = parts.path or "/"
-    pattern = normalize_path(path, known_patterns)
-    kind = _kind(path, resp_ct, gql is not None)
-    host = parts.netloc.lower()
-    gql_op, gql_type = gql if gql else ("", None)
-    old = _row_json(store, "SELECT content_types, kind FROM endpoints WHERE method=? AND host=? "
-                    "AND path_pattern=? AND graphql_op=?", method, host, pattern, gql_op)
-    cts = json.loads(old["content_types"]) if old and old["content_types"] else []
-    if _base_ct(resp_ct):
-        cts = _merge(cts, [_base_ct(resp_ct)])
-    if old and _KIND_RANK.get(old["kind"], 0) > _KIND_RANK[kind]:
-        kind = old["kind"]
-    endpoint_id = store.upsert_endpoint(method, host, pattern, kind, graphql_op=gql_op,
-                                        graphql_type=gql_type, content_types=cts or None)
-    if origin == "schema" and gql is not None and source == "openapi":
-        source = "graphql"
-    store.upsert_source("endpoint", endpoint_id, source)
-    _index_params(store, redactor, endpoint_id, [s for s in path.split("/") if s], pattern,
-                  parts.query, req_ct, req_text)
+    endpoint_id = None
+    if attributed:
+        pattern = normalize_path(path, known_patterns)
+        kind = _kind(path, resp_ct, gql is not None)
+        host = parts.netloc.lower()
+        gql_op, gql_type = gql if gql else ("", None)
+        old = _row_json(store, "SELECT content_types, kind FROM endpoints WHERE method=? AND host=? "
+                        "AND path_pattern=? AND graphql_op=?", method, host, pattern, gql_op)
+        cts = json.loads(old["content_types"]) if old and old["content_types"] else []
+        if _base_ct(resp_ct):
+            cts = _merge(cts, [_base_ct(resp_ct)])
+        if old and _KIND_RANK.get(old["kind"], 0) > _KIND_RANK[kind]:
+            kind = old["kind"]
+        endpoint_id = store.upsert_endpoint(method, host, pattern, kind, graphql_op=gql_op,
+                                            graphql_type=gql_type, content_types=cts or None)
+        if origin == "schema" and gql is not None and source == "openapi":
+            source = "graphql"
+        store.upsert_source("endpoint", endpoint_id, source)
+        _index_params(store, redactor, endpoint_id, [s for s in path.split("/") if s], pattern,
+                      parts.query, req_ct, req_text)
 
     # Bodies: text up to the inline limit stays in the row, the rest goes to bodies/
     inline: dict[str, str | None] = {"req": None, "resp": None}
@@ -300,22 +306,23 @@ def record_exchange(store: Store, events: EventLog, redactor: Redactor, rd: RunD
                                   resp_body_path=paths.get("resp"))
 
     # Response summary, merged with what earlier exchanges recorded
-    prev = _row_json(store, "SELECT * FROM responses WHERE endpoint_id=? AND role=?",
-                     endpoint_id, role)
-    j = lambda col: json.loads(prev[col]) if prev and prev[col] else []
-    size = len(resp_body or b"")
-    shape = body_shape(obj) if isinstance(obj := _json_or_none(resp_text), (dict, list)) else None
-    seen_2xx = any(200 <= st < 300 for st in j("statuses"))
-    if prev and prev["body_shape"] and (seen_2xx or not 200 <= status < 300):
-        shape = None  # keep the first 2xx shape; errors never replace anything useful
-    store.upsert_response(
-        endpoint_id, role,
-        statuses=sorted(set(j("statuses")) | {status}),
-        content_types=_merge(j("content_types"), [_base_ct(resp_ct)] if _base_ct(resp_ct) else []),
-        body_shape=shape,
-        min_size=size if not prev or prev["min_size"] is None else min(prev["min_size"], size),
-        max_size=size if not prev or prev["max_size"] is None else max(prev["max_size"], size),
-        sample_exchange_ids=_merge(j("sample_exchange_ids"), [exchange_id], _MAX_SAMPLES))
+    if attributed:
+        prev = _row_json(store, "SELECT * FROM responses WHERE endpoint_id=? AND role=?",
+                         endpoint_id, role)
+        j = lambda col: json.loads(prev[col]) if prev and prev[col] else []
+        size = len(resp_body or b"")
+        shape = body_shape(obj) if isinstance(obj := _json_or_none(resp_text), (dict, list)) else None
+        seen_2xx = any(200 <= st < 300 for st in j("statuses"))
+        if prev and prev["body_shape"] and (seen_2xx or not 200 <= status < 300):
+            shape = None  # keep the first 2xx shape; errors never replace anything useful
+        store.upsert_response(
+            endpoint_id, role,
+            statuses=sorted(set(j("statuses")) | {status}),
+            content_types=_merge(j("content_types"), [_base_ct(resp_ct)] if _base_ct(resp_ct) else []),
+            body_shape=shape,
+            min_size=size if not prev or prev["min_size"] is None else min(prev["min_size"], size),
+            max_size=size if not prev or prev["max_size"] is None else max(prev["max_size"], size),
+            sample_exchange_ids=_merge(j("sample_exchange_ids"), [exchange_id], _MAX_SAMPLES))
 
     for okind, detail in detect_observations(status, resp_text, resp_ct, resp_headers or {}):
         store.add_observation(okind, redactor.text(detail), safe_url, role, resp_ev.id)
