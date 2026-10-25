@@ -28,7 +28,7 @@ from .browser.fingerprint import SKELETON_JS, dom_fingerprint, state_id
 from .browser.forms import FormInfo, discover_forms, fill_and_submit
 from .browser.locators import resolve
 from .browser.recorder import TrafficRecorder
-from .browser.session import (RoleSession, ensure_authenticated, is_session_lost, login,
+from .browser.session import (RoleSession, is_session_lost, login,
                               open_role_session, state_path)
 from .browser.settle import install, wait_settled
 from .config import Role, RunConfig
@@ -252,8 +252,7 @@ class Crawler:
         """Network-level destructive guard (ruling R17). Every non-GET request of the role
         context is classified as a ``request`` attributed to the current (or most recent)
         action or page load; held ones are aborted and queued for approval."""
-        if (self._approved_mode or request.method in _SAFE_METHODS
-                or self.recorder.origin_by_role.get(role) == "login"):  # re-login flow
+        if self._approved_mode or request.method in _SAFE_METHODS:
             await route.fallback()
             return
         g = self._guard or self._last_guard.get(role)
@@ -269,7 +268,10 @@ class Crawler:
                                              g["context"], False, role, "ui"), self.cfg.profile)
         except Exception:  # fail closed
             flag = Flag(True, "delete", ["request could not be classified"])
-        if not flag.held:
+        if not flag.held or (flag.category == "data_create" and self._from_login_page(request)):
+            # A login flow's own submit (data_create only in production) must go through;
+            # destructive requests from the login page, and anything from other pages or
+            # workers while it runs, stay guarded.
             await route.fallback()
             return
         await route.abort("blockedbyclient")
@@ -283,6 +285,12 @@ class Crawler:
                       {"method": request.method, "url": url})
         if g is not self._guard and g["item"] is not None:
             self.frontier.mark(g["item"], "queued_approval")  # fired after its item finished
+
+    def _from_login_page(self, request) -> bool:
+        try:
+            return request.frame.page in self.recorder.login_pages
+        except Exception:  # worker requests have no frame
+            return False
 
     def _arm_guard(self, role: str, kind: str, path: list[dict], *, label: str = "",
                    context: str = "", state: str | None = None,
@@ -332,7 +340,7 @@ class Crawler:
                     self.events.emit("error", role=role, message="session lost again after re-login",
                                      url=self.redactor.url(page.url))
                     return "failed"
-                if not await ensure_authenticated(sess, page, self.cfg, self.events):
+                if not await self._relogin(sess, page):
                     log.warning("[%s] re-login failed", role)
                     return "failed"
                 log.info("[%s] session restored; retrying item %d", role, item.id)
@@ -348,6 +356,21 @@ class Crawler:
                 log.warning("[%s] item %d error: %s", role, item.id, msg)
                 return "failed"
         return "failed"
+
+    async def _relogin(self, sess: RoleSession, page: Page) -> bool:
+        """Re-authenticate after a detected session loss. The crawl page is parked on
+        about:blank (and popups closed) first, so its pending timers cannot fire while the
+        login flow runs."""
+        role = sess.role.name
+        self.events.emit("session_lost", role=role, url=self.redactor.url(page.url),
+                         status=self.recorder.last_status.get(role))
+        await self._close_popups(page)
+        try:
+            await page.goto("about:blank")
+        except Exception:
+            pass
+        sess.auth_headers.clear()
+        return await login(sess, self.cfg, self.events)
 
     async def _check_lost(self, sess: RoleSession, page: Page) -> None:
         last = self.recorder.last_status.get(sess.role.name)

@@ -47,6 +47,7 @@ class TrafficRecorder:
         self.auth_headers: dict[str, dict[str, str]] = {}
         self.origin_by_role: dict[str, str] = {}   # "login" while a login flow runs
         self.last_status: dict[str, int | None] = {}
+        self.login_pages: set[Page] = set()        # pages a login flow is running on
         self._pending: set[asyncio.Task] = set()
         self._gate_tasks: dict[Page, asyncio.Task] = {}
         self._orphans: dict[str, list[tuple[float, str]]] = {}  # per role/context

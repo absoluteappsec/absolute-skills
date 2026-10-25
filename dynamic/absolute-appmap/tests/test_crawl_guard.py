@@ -17,9 +17,9 @@ def _cache(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
 
 
-def H(body):
+def H(body, title="Items"):
     return lambda r: werkzeug.Response(
-        "<html><head><title>Items</title></head><body>" + body + "</body></html>",
+        f"<html><head><title>{title}</title></head><body>" + body + "</body></html>",
         mimetype="text/html")
 
 
@@ -97,3 +97,90 @@ async def test_production_js_writes_held(case, browser, stub_server, make_cfg, r
     assert stats.status == "done"
     assert ("POST", "/api/items") not in srv.requests
     assert any(a["category"] == "data_create" for a in _approvals(rd))
+
+
+# -- second review round: popups/frames reached without a crawler click, re-login window --
+POP = H("<script>fetch('/api/items/7',{method:'DELETE'})</script><p>p</p>")
+OPENERS = {
+    "blank_link": {"/": H("<a href='/pop' target='_blank'>Open details</a>"), "/pop": POP},
+    "load_popup": {"/": H("<script>window.open('/pop')</script><p>hi</p>"), "/pop": POP},
+    "iframe": {"/": H("<iframe src='/pop'></iframe><p>hi</p>"), "/pop": POP},
+    "form_target_blank": {"/": H("<form action='/pop' target='_blank'><input name=q>"
+                                 "<button>Search</button></form>"), "/pop": POP},
+}
+
+
+@pytest.mark.parametrize("case", list(OPENERS))
+async def test_destructive_request_from_opened_page_held(case, browser, stub_server, make_cfg,
+                                                         run_dir, tmp_path):
+    routes = dict(OPENERS[case])
+    routes["/api/items/7"] = lambda r: "ok"
+    srv, rd, _ = await _crawl(routes, browser, stub_server, make_cfg, run_dir, tmp_path)
+    assert ("DELETE", "/api/items/7") not in srv.requests
+    assert any(json.loads(a["predicted_request"] or "{}").get("method") == "DELETE"
+               for a in _approvals(rd))
+
+
+def _login_routes(login_extra: str = ""):
+    login_page = H("<form method=post action='/login'><input name=username>"
+                   "<input type=password name=password><button type=submit>Sign in</button>"
+                   "</form>" + login_extra, "Sign in")
+
+    def login(r):
+        if r.method == "POST":
+            resp = werkzeug.Response("", status=302, headers={"Location": "/"})
+            resp.set_cookie("sid", "1")
+            return resp
+        return login_page(r)
+    return login
+
+
+def _alice(make_cfg, url, profile="staging"):
+    return make_cfg(url, profile=profile, limits=FAST, roles=[{"name": "alice", "login": {
+        "type": "form", "url": f"{url}/login", "username_env": "APPMAP_ALICE_USER",
+        "password_env": "APPMAP_ALICE_PASS"}}])
+
+
+async def test_relogin_window(browser, stub_server, make_cfg, run_dir, tmp_path):
+    """A destructive timer armed by a crawl action must not fire while re-login runs."""
+    srv = stub_server({
+        "/login": _login_routes(),
+        "/": H("<button onclick=\"fetch('/api/me');setTimeout(()=>fetch('/api/items/7',"
+               "{method:'DELETE'}),700)\">Refresh</button>"),
+        "/api/me": lambda r: werkzeug.Response("no", status=401),
+        "/api/items/7": lambda r: "ok",
+    })
+    cfg = _alice(make_cfg, srv.url)
+    rd = run_dir(tmp_path, cfg)
+    await run_crawl(cfg, rd, roles=["alice"], budget_minutes=2, browser=browser)
+    assert ("DELETE", "/api/items/7") not in srv.requests
+    types = [json.loads(line)["type"] for line in rd.events_path.read_text().splitlines()]
+    assert "session_lost" in types and types.count("login") >= 2
+
+
+async def test_login_page_destructive_request_still_held(browser, stub_server, make_cfg,
+                                                         run_dir, tmp_path):
+    """The login exemption covers only the login submit, not a DELETE the login page sends;
+    in production the login POST itself (data_create) still goes through."""
+    srv = stub_server({
+        "/login": _login_routes("<script>fetch('/api/items/7',{method:'DELETE'})</script>"),
+        "/": H("<p>home</p>"),
+        "/api/items/7": lambda r: "ok",
+    })
+    cfg = _alice(make_cfg, srv.url, profile="production")
+    rd = run_dir(tmp_path, cfg)
+    # the initial login runs before any crawl page exists, under the crawler's guard
+    from appmap.browser.session import login, open_role_session
+    from appmap.crawl import Crawler, build_runtime, make_datagen
+    rt = build_runtime(cfg, rd)
+    sess = await open_role_session(browser, cfg, rd, cfg.roles[0], rt.recorder)
+    crawler = Crawler(cfg, rd, rt.store, rt.events, rt.gate, rt.queue, rt.recorder,
+                      {"alice": sess}, make_datagen(cfg, rd))
+    page = await crawler._open_page(sess)  # installs the context guard
+    assert await login(sess, cfg, rt.events)
+    await rt.recorder.drain()
+    await page.close()
+    await sess.context.close()
+    rt.store.close()
+    assert ("POST", "/login") in srv.requests
+    assert ("DELETE", "/api/items/7") not in srv.requests

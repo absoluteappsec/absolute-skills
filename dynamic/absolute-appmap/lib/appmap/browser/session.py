@@ -120,6 +120,14 @@ async def _new_page(sess: RoleSession) -> Page:
     return await sess.context.new_page()
 
 
+async def _new_login_page(sess: RoleSession) -> Page:
+    """A page for a login flow, registered so request guards can recognise its traffic."""
+    page = await _new_page(sess)
+    if sess.recorder:
+        sess.recorder.login_pages.add(page)
+    return page
+
+
 # -- login -------------------------------------------------------------------
 async def _visible(page: Page, selector: str) -> bool:
     try:
@@ -189,10 +197,10 @@ async def login(sess: RoleSession, cfg: RunConfig, events: EventLog) -> bool:
             p = _spec_state_path(cfg, role)
             ok = bool(state_path(sess.rd, role.name).exists() or (p and p.exists()))
             if ok:
-                page = await _new_page(sess)
+                page = await _new_login_page(sess)
                 await page.goto(_login_url(cfg, role))
         else:
-            page = await _new_page(sess)
+            page = await _new_login_page(sess)
             ok = await (_form_login(sess, cfg, page) if spec.type == "form"
                         else _manual_login(sess, cfg, page))
         if ok and page is not None:
@@ -211,6 +219,8 @@ async def login(sess: RoleSession, cfg: RunConfig, events: EventLog) -> bool:
         await _save_state(sess, page)
     if page is not None:
         await page.close()
+        if rec:
+            rec.login_pages.discard(page)
     if ok and rec:
         rec.last_status[role.name] = None
     ev = events.emit("login", role=role.name, ok=ok, login_type=spec.type)
