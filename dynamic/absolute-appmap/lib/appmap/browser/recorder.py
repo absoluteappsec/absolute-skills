@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Awaitable
 from urllib.parse import urlsplit
@@ -42,10 +44,15 @@ class TrafficRecorder:
         self.last_status: dict[str, int | None] = {}
         self._pending: set[asyncio.Task] = set()
         self._gate_tasks: dict[Page, asyncio.Task] = {}
+        self._orphans: list[tuple[float, str]] = []  # aborted frameless navigations
+        self._roles: dict[BrowserContext, str] = {}
+        self._safe: set[Page] = set()        # armed before any request could start
+        self._quarantine: set[Page] = set()  # unarmed pages whose requests are refused
 
     # -- wiring ------------------------------------------------------------
     async def attach(self, context: BrowserContext, role: str) -> None:
         self.auth_headers.setdefault(role, {})
+        self._roles[context] = role
         await context.route("**/*", lambda route, request: self._route(route, request, role))
         await context.route_web_socket("**/*", lambda ws: self._gate_websocket(ws, role))
         context.on("request", lambda request: self._learn_auth(request, role))
@@ -101,9 +108,9 @@ class TrafficRecorder:
         (popups) are armed asynchronously and may miss their very first request.
         """
         page = await context.new_page()
-        task = self._gate_tasks.get(page)
-        if task is not None:
-            await task
+        task = self._watch_page(page, self._roles[context])  # usually made by the "page" event
+        await task
+        self._safe.add(page)
         return page
 
     def _spawn(self, coro: Awaitable[Any]) -> None:
@@ -130,6 +137,27 @@ class TrafficRecorder:
 
     async def _route(self, route: Route, request: Request, role: str) -> None:
         url = request.url
+        # Fetch interception only applies to requests that start after Fetch.enable, so a
+        # request already in flight on a page that was not armed up front (popup, or a page
+        # from plain context.new_page()) could follow a redirect chain out of scope. Fail
+        # closed: quarantine the page, abort, arm it, then replay main-frame GET navigations
+        # (the replay starts after arming, so its hops are gated).
+        page = self._page_of(request)
+        if page is None:
+            # No page to arm yet (new window's first request): refuse it, and replay it on
+            # the popup once its page appears and is armed (see _adopt_orphan).
+            if request.is_navigation_request() and request.method == "GET":
+                self._orphans.append((time.monotonic(), url))
+            await route.abort()
+            return
+        if page not in self._safe:
+            task = self._watch_page(page, role)
+            self._quarantine.add(page)
+            await route.abort()
+            if request.is_navigation_request() and request.method == "GET" \
+                    and request.frame == page.main_frame:
+                self._spawn(self._replay_navigation(page, task, url, role))
+            return
         if request.resource_type in STATIC_TYPES and self.gate.scope.allows(url):
             await route.continue_()
             return
@@ -143,6 +171,37 @@ class TrafficRecorder:
             await route.continue_()
         else:
             await route.abort()
+
+    @staticmethod
+    def _page_of(request: Request) -> Page | None:
+        try:
+            return request.frame.page
+        except Exception:  # popup's first request: issued before its frame exists
+            return None
+
+    async def _adopt_orphan(self, page: Page, armed: asyncio.Task, role: str) -> None:
+        try:
+            if await page.opener() is None:
+                return
+        except Exception:
+            return
+        while self._orphans:
+            ts, url = self._orphans.pop(0)
+            if time.monotonic() - ts < 5.0:
+                self._quarantine.add(page)
+                await self._replay_navigation(page, armed, url, role)
+                return
+
+    async def _replay_navigation(self, page: Page, armed: asyncio.Task, url: str,
+                                 role: str) -> None:
+        try:
+            await armed
+            self._quarantine.discard(page)
+            self._safe.add(page)
+            await page.goto(url)
+        except Exception as exc:
+            self.events.emit("error", role=role, url=url,
+                             message=f"navigation replay after arming failed: {exc}")
 
     async def _gate_websocket(self, ws, role: str) -> None:
         try:
@@ -193,13 +252,38 @@ class TrafficRecorder:
                              url=request.url)
 
     # -- websockets --------------------------------------------------------
-    def _watch_page(self, page: Page, role: str) -> None:
-        if page not in self._gate_tasks:
-            task = asyncio.ensure_future(self._enable_redirect_gate(page, role))
-            self._gate_tasks[page] = task
-            self._pending.add(task)
-            task.add_done_callback(self._pending.discard)
+    def _watch_page(self, page: Page, role: str) -> asyncio.Task:
+        task = self._gate_tasks.get(page)
+        if task is not None:
+            return task
+        task = asyncio.ensure_future(self._arm(page, role))
+        self._gate_tasks[page] = task
+        self._pending.add(task)
+
+        def done(t: asyncio.Task) -> None:
+            self._pending.discard(t)
+            if not t.cancelled():
+                t.exception()  # retrieved: failure is reported via the error event
+
+        task.add_done_callback(done)
+        def closed(_p: Page) -> None:
+            self._gate_tasks.pop(page, None)
+            self._safe.discard(page)
+            self._quarantine.discard(page)
+
+        page.on("close", closed)
+        if self._orphans:
+            self._spawn(self._adopt_orphan(page, task, role))
         page.on("websocket", lambda ws: self._on_websocket(ws, role))
+        return task
+
+    async def _arm(self, page: Page, role: str) -> None:
+        try:
+            await self._enable_redirect_gate(page, role)
+        except Exception as exc:
+            self.events.emit("error", role=role,
+                             message=f"redirect gate could not be armed: {exc}")
+            raise
 
     def _on_websocket(self, ws: WebSocket, role: str) -> None:
         parts = urlsplit(ws.url)
@@ -231,14 +315,19 @@ class TrafficRecorder:
         har = json.loads(path.read_text(encoding="utf-8"))
         for entry in har.get("log", {}).get("entries", []):
             self._redact_bodies(entry)
-        path.write_text(json.dumps(self.redactor.json(har), indent=1), encoding="utf-8")
+        tmp = path.with_suffix(".har.tmp")
+        tmp.write_text(json.dumps(self.redactor.json(har), indent=1), encoding="utf-8")
+        os.replace(tmp, path)
         return path
 
     def _redact_body(self, text: str, mime: str, encoding: str | None) -> str:
         """Redact a HAR body the way recording.py redacts stored bodies."""
         is_b64 = encoding == "base64"
         if is_b64:
-            raw = base64.b64decode(text)
+            try:
+                raw = base64.b64decode(text, validate=True)
+            except ValueError:
+                return "<redacted:undecodable>"
             try:
                 text = raw.decode("utf-8")
             except UnicodeDecodeError:
