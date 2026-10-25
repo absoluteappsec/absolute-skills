@@ -45,8 +45,9 @@ How to read it:
 | | `done` | Frontier exhausted for the selected roles |
 | | `limit_reached` | Cumulative crawl time hit `limits.max_runtime_minutes`. Stop crawling |
 | | `paused_circuit` | Too many 429/5xx from the target. **Stop and tell the operator** |
+| | `auth_failed` | A role's login or mid-crawl re-login failed (`errors` names it; at most 2 re-logins in a row, a failed one is never repeated). That role stopped with its pending items kept; other roles ran. `ok` is false; run `next` (`appmap auth … --role R`, with the operator for manual roles), then rerun crawl |
 | | `error` | Unexpected failure; `errors` and `crawl.log` explain |
-| `crawl --approved-only` | `done` / `in_progress` / `paused_circuit` | Approved items executed / budget used, rerun with `--approved-only` / stop and tell the operator. `counts` has `executed`, `failed`, `skipped` |
+| `crawl --approved-only` | `done` / `in_progress` / `paused_circuit` / `auth_failed` | Approved items executed / budget used, rerun with `--approved-only` / stop and tell the operator. `counts` has `executed`, `failed`, `skipped` |
 | `probe` | `in_progress` | Budget used up; rerun the same command |
 | | `done` | Phase finished |
 | | `paused_circuit` | Stop and tell the operator |

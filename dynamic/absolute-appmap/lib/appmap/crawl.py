@@ -28,7 +28,7 @@ from .browser.fingerprint import SKELETON_JS, dom_fingerprint, state_id
 from .browser.forms import FormInfo, discover_forms, fill_and_submit
 from .browser.locators import resolve
 from .browser.recorder import TrafficRecorder
-from .browser.session import (RoleSession, is_session_lost, login,
+from .browser.session import (MAX_RELOGINS, RoleSession, is_session_lost, login,
                               open_role_session, state_path)
 from .browser.settle import install, wait_settled
 from .config import Role, RunConfig
@@ -49,7 +49,7 @@ from .throttle import CircuitBreaker, CircuitOpen, RateLimiter
 
 log = logging.getLogger("appmap.crawl")
 
-CrawlStatus = Literal["done", "in_progress", "paused_circuit", "limit_reached"]
+CrawlStatus = Literal["done", "in_progress", "paused_circuit", "limit_reached", "auth_failed"]
 # url items first (cheap, map pages), then clicks, then form submissions
 PRIORITY = {"url": 2, "click": 1, "submit": 0}
 NAV_TIMEOUT_MS = 15000
@@ -94,6 +94,8 @@ class CrawlStats:
     warnings: list[str] = field(default_factory=list)
     # --approved-only: approved items executed / failed / skipped in this invocation
     approvals: dict[str, int] = field(default_factory=dict)
+    # roles whose login or re-login failed: stopped, their pending items kept
+    auth_failed: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -111,6 +113,10 @@ class _Lost(Exception):
 
 class _Fail(Exception):
     """A step of an item could not be performed (unresolvable locator, navigation error)."""
+
+
+class _AuthFailed(Exception):
+    """The role could not be re-authenticated: stop it, leave the item pending."""
 
 
 def canon_url(url: str) -> str:
@@ -158,6 +164,10 @@ class Crawler:
         # one so requests fired later (timers, popups, workers) are still attributed.
         self._guard: dict | None = None
         self._last_guard: dict[str, dict] = {}
+        # Re-login bookkeeping (C1): consecutive re-logins per role (reset when an item
+        # completes) and roles stopped because authentication failed (role -> reason).
+        self._relogins: dict[str, int] = {}
+        self.auth_failed: dict[str, str] = {}
 
     # -- driver --------------------------------------------------------------
     async def run(self, roles: list[str], *, budget_minutes: float,
@@ -173,18 +183,50 @@ class Crawler:
                  self.frontier.pending_count())
         try:
             for role in roles:
+                if role in self.auth_failed:
+                    continue
                 status = await self._crawl_role(role, start, prior, budget_s, limit_s)
+                if status == "auth_failed":  # that role stops; the others still run
+                    status = "done"
+                    continue
                 if status != "done":
                     break
         finally:
             self.store.set_meta("crawl_elapsed_s", f"{prior + time.monotonic() - start:.3f}")
         if status == "done" and any(self.frontier.pending_count(r) for r in roles):
             status = "in_progress"
+        status = self._auth_status(status)
         stats = self.stats(status)
+        self._auth_report(stats)
         stats.warnings += list(self._spa_skipped.values())
         log.info("crawl stopped: status=%s states=%d transitions=%d pending_approvals=%d",
                  status, stats.states, stats.transitions, stats.queued_approvals)
         return stats
+
+    def _auth_status(self, status: CrawlStatus) -> CrawlStatus:
+        """A role stopped for authentication outranks done/in_progress: the operator must
+        re-run ``appmap auth`` before the crawl can finish."""
+        return "auth_failed" if self.auth_failed and status in ("done", "in_progress") \
+            else status
+
+    def _auth_report(self, stats: CrawlStats) -> None:
+        stats.auth_failed = sorted(self.auth_failed)
+        for role in stats.auth_failed:
+            manual = self.sessions[role].role.login.type == "manual" if role in self.sessions \
+                else False
+            stats.warnings.append(
+                f"role {role}: {self.auth_failed[role]}; role stopped, its pending items "
+                f"are kept. Run 'appmap auth --role {role}"
+                f"{' --manual-login' if manual else ''}' (the operator logs in for manual "
+                "roles), then crawl again")
+
+    def _stop_role(self, role: str, why: str) -> None:
+        if role in self.auth_failed:
+            return
+        self.auth_failed[role] = why
+        self.events.emit("error", role=role, message=f"authentication failed: {why}; "
+                                                      "role stopped")
+        log.warning("[%s] %s; role stopped", role, why)
 
     async def _crawl_role(self, role: str, start: float, prior: float, budget_s: float,
                           limit_s: float) -> CrawlStatus:
@@ -218,10 +260,16 @@ class Crawler:
                     outcome = await self._process(sess, page, item)
                 except CircuitOpen:
                     return "paused_circuit"
+                except _AuthFailed:
+                    log.warning("[%s] authentication failed; item %d left pending", role,
+                                item.id)
+                    return "auth_failed"
                 if self.gate.breaker.tripped:
                     log.warning("circuit breaker tripped; item %d left pending", item.id)
                     return "paused_circuit"
                 self.frontier.mark(item.id, outcome)
+                if outcome == "done":
+                    self._relogins[role] = 0  # the session works again
                 log.info("[%s] item %d %s %s -> %s", role, item.id, item.kind,
                          item.url or self._describe(item.action_path[-1:]), outcome)
                 if role not in self._spa_routes and not page.is_closed():
@@ -353,8 +401,8 @@ class Crawler:
                  sum(1 for a in items if a.role in roles))
         try:
             for a in items:
-                if a.role not in roles:
-                    continue
+                if a.role not in roles or a.role in self.auth_failed:
+                    continue  # left approved and unexecuted for a later run
                 if time.monotonic() - start >= budget_s:
                     status = "in_progress"
                     break
@@ -375,6 +423,8 @@ class Crawler:
                 except CircuitOpen:
                     status = "paused_circuit"
                     break
+                except _AuthFailed:  # nothing was let through; the item stays approved
+                    continue
                 res[outcome] += 1
                 if reason:
                     warnings.append(f"approval {a.id} ({a.label}): {reason}")
@@ -383,9 +433,11 @@ class Crawler:
                     log.info("[%s] approval %s executed: %s", a.role, a.id, a.label)
         finally:
             await self.recorder.drain()
+        status = self._auth_status(status)
         stats = self.stats(status)
         stats.approvals = res
         stats.warnings += warnings
+        self._auth_report(stats)
         log.info("approved-only stopped: status=%s %s", status, res)
         return stats
 
@@ -564,8 +616,10 @@ class Crawler:
                 await self._check_lost(sess, page)
                 return None
             except _Lost:
-                if attempt == 2 or not await self._relogin(sess, page):
+                if attempt == 2:
                     return "session lost while restoring"
+                if not await self._relogin(sess, page):
+                    raise _AuthFailed()
             except _Fail as exc:
                 return f"restore failed: {exc}"
         return "session lost while restoring"
@@ -756,14 +810,13 @@ class Crawler:
                                      url=self.redactor.url(page.url))
                     return "failed"
                 if not await self._relogin(sess, page):
-                    log.warning("[%s] re-login failed", role)
-                    return "failed"
+                    raise _AuthFailed()  # the item is not at fault: it stays pending
                 log.info("[%s] session restored; retrying item %d", role, item.id)
             except _Fail as exc:
                 self.events.emit("error", role=role, message=str(exc))
                 log.info("[%s] item %d failed: %s", role, item.id, exc)
                 return "failed"
-            except CircuitOpen:
+            except (CircuitOpen, _AuthFailed):
                 raise
             except Exception as exc:  # a single item must never stop the crawl
                 msg = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
@@ -775,8 +828,20 @@ class Crawler:
     async def _relogin(self, sess: RoleSession, page: Page) -> bool:
         """Re-authenticate after a detected session loss. The crawl page is parked on
         about:blank (and popups closed) first, so its pending timers cannot fire while the
-        login flow runs."""
+        login flow runs.
+
+        At most ``MAX_RELOGINS`` consecutive re-logins per role (reset when an item
+        completes); a failed re-login is never repeated in this invocation (lockout risk).
+        Either way the role is stopped (``auth_failed``). Manual roles never log in here."""
         role = sess.role.name
+        if role in self.auth_failed:
+            return False
+        n = self._relogins.get(role, 0)
+        if n >= MAX_RELOGINS:
+            self._stop_role(role, f"session lost again after {n} re-login(s) "
+                                  f"(limit {MAX_RELOGINS})")
+            return False
+        self._relogins[role] = n + 1
         self.events.emit("session_lost", role=role, url=self.redactor.url(page.url),
                          status=self.recorder.last_status.get(role))
         await self._close_popups(page)
@@ -785,7 +850,11 @@ class Crawler:
         except Exception:
             pass
         sess.auth_headers.clear()
-        return await login(sess, self.cfg, self.events)
+        ok = await login(sess, self.cfg, self.events)
+        if not ok:
+            self._stop_role(role, "manual role's session expired" if sess.role.login.type
+                            == "manual" else "re-login after session loss failed")
+        return ok
 
     async def _check_lost(self, sess: RoleSession, page: Page) -> None:
         last = self.recorder.last_status.get(sess.role.name)
@@ -1446,19 +1515,23 @@ async def _crawl_with(cfg: RunConfig, rd: RunDir, names: list[str] | None, budge
         rt.queue.write_yaml()  # rule decisions become visible items (no revocation on reload)
     sessions: dict[str, RoleSession] = {}
     crawl_roles: list[str] = []
+    failed: dict[str, str] = {}
     try:
         for role in select_roles(cfg, names):
             sess = await open_role_session(browser, cfg, rd, role, rt.recorder)
             sessions[role.name] = sess
-            # No saved session (``appmap auth`` not run): log in now.
+            # No saved session (``appmap auth`` not run): log in now. A manual role is
+            # never prompted for here (fails closed: the operator runs ``appmap auth``).
             if role.login.type != "none" and not state_path(rd, role.name).exists() \
                     and not await login(sess, cfg, rt.events):
-                warnings.append(f"role {role.name}: login failed; role not crawled")
-                log.warning("role %s: login failed; skipped", role.name)
-                continue
+                failed[role.name] = ("no saved session (manual roles log in only through "
+                                     "'appmap auth --manual-login')"
+                                     if role.login.type == "manual" else "login failed")
+                log.warning("role %s: %s; not crawled", role.name, failed[role.name])
             crawl_roles.append(role.name)
         crawler = Crawler(cfg, rd, rt.store, rt.events, rt.gate, rt.queue, rt.recorder,
                           sessions, make_datagen(cfg, rd))
+        crawler.auth_failed.update(failed)
         stats = await crawler.run(crawl_roles, budget_minutes=budget, approved_only=approved_only)
         stats.warnings = warnings + stats.warnings
         return stats

@@ -52,11 +52,12 @@ Read the `APPMAP_STATUS` line after every invocation:
 | `done` | The frontier is exhausted for the selected roles. Go to Step 4 |
 | `limit_reached` | `limits.max_runtime_minutes` total crawl time is used up. Stop crawling this run; this is a double-back stop condition. Tell the operator (they may raise the limit in the config) |
 | `paused_circuit` | **Stop.** The target returned too many 429/5xx responses. Tell the operator, quote `errors`, suggest lowering `max_requests_per_second`, and wait for their go-ahead before rerunning |
+| `auth_failed` | A role could not log in, or its session was lost and the re-login failed (wrong/changed password, expired manual session). That role stopped; its pending items are kept and nothing was marked failed. Run `next` (`appmap auth --run <run> --role R`; for a manual role the operator logs in by hand) via `authenticate-roles`, then rerun the crawl. Never retry the login in a loop yourself (account lockout) |
 | `error` | Read `errors` (and the tail of `<run>/crawl.log`). Fix the cause (missing session, config problem) before rerunning |
 
 Also read every time: `counts` (`states`, `transitions`, `forms`, `exchanges`,
 `queued_approvals`), `pending_approvals`, and `errors` — warnings such as
-`role X: login failed; role not crawled` (rerun `authenticate-roles` for X) or
+`role X: … role stopped, its pending items are kept` (rerun `authenticate-roles` for X) or
 `approvals.yaml: …` (a malformed decision or rule).
 
 ---

@@ -25,8 +25,8 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from playwright.async_api import Browser, async_playwright
 
 from ..approvals import ApprovalQueue, PendingAction
-from ..browser.session import (RoleSession, is_session_lost, login, open_role_session,
-                               state_path)
+from ..browser.session import (MAX_RELOGINS, RoleSession, is_session_lost, login,
+                               open_role_session, state_path)
 from ..config import RunConfig
 from ..destructive import ActionDescriptor, Flag, classify
 from ..direct import DirectClient
@@ -52,7 +52,6 @@ _REDACTED = "<redacted:"
 # Exchanges of approved (destructive) actions are never used: see approval_blocked_ids.
 _CAPTURED = ("ui", "passive", "bundle")
 PROGRESS_KEY = "probe_active"
-MAX_RELOGINS = 2
 WARM_UP_TIMEOUT_MS = 10000
 _GUARDED: "weakref.WeakSet" = weakref.WeakSet()
 

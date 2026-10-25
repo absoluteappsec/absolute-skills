@@ -149,7 +149,7 @@ $A build --run "$RUN"                                 # fill names.yaml, then bu
 | Open the run | `init` | `initialized` (`config_error`: fix the file, rerun) |
 | Authenticate | `auth` | `authenticated` (`auth_failed`: see `errors`, fix, rerun for that `--role`) |
 | Passive probe | `probe --phase passive` | `done` (rerun while `in_progress`) |
-| Crawl | `crawl` | `done` or `limit_reached` (rerun while `in_progress`) |
+| Crawl | `crawl` | `done` or `limit_reached` (rerun while `in_progress`; `auth_failed`: a role's login or re-login failed and it stopped with its items kept — rerun `auth` for it, then `crawl`) |
 | Active probe | `probe --phase active` | `done` (rerun while `in_progress`) |
 | Approvals | `approvals write` / `apply`, `crawl --approved-only`, `crawl` | no pending items you want decided; approved ones executed |
 | Double back | `status --new-pass`, `status --gaps` | the stop rule below is met |

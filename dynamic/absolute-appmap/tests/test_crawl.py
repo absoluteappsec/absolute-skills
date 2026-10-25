@@ -345,3 +345,73 @@ def test_cli_missing_run_dir_reports_error(tmp_path, capsys):
     assert main(["crawl", "--run", str(tmp_path / "nope")]) == 1
     st = _status(capsys)
     assert not st["ok"] and st["errors"]
+
+
+async def test_failed_relogin_stops_role_and_keeps_frontier(browser, ssr_url, make_cfg,
+                                                            run_dir, tmp_path, monkeypatch):
+    """C1: a re-login that fails (password changed mid-crawl) is not retried on every
+    remaining item: the role stops, its items stay pending, status is auth_failed."""
+    from appmap.browser.session import MAX_RELOGINS
+    cfg = make_cfg(ssr_url, limits=FAST)
+    rd = run_dir(tmp_path, cfg)
+
+    async def break_creds():
+        while True:
+            await asyncio.sleep(0.01)
+            try:
+                if q1(rd, "select count(*) from states") >= 1:
+                    break
+            except Exception:
+                continue
+        monkeypatch.setenv("APPMAP_ADMIN_PASS", "wrong")
+        await asyncio.to_thread(urllib.request.urlopen, urllib.request.Request(
+            ssr_url + "/__expire", method="POST", data=b""))
+
+    t = asyncio.ensure_future(break_creds())
+    stats = await run_crawl(cfg, rd, roles=["admin"], budget_minutes=3, browser=browser)
+    await t
+    assert stats.status == "auth_failed"
+    assert stats.auth_failed == ["admin"]
+    assert any("admin" in w and "appmap auth" in w for w in stats.warnings)
+    assert q1(rd, "select count(*) from frontier where role='admin' and status='pending'") >= 1
+    assert q1(rd, "select count(*) from frontier where status='failed'") == 0
+    posts = q1(rd, "select count(*) from exchanges where method='POST' and url like '%/login'")
+    assert posts <= 1 + MAX_RELOGINS  # initial login + capped re-logins
+    logins = [json.loads(l) for l in rd.events_path.read_text().splitlines()
+              if json.loads(l)["type"] == "login"]
+    assert sum(1 for e in logins if not e.get("data", e).get("ok")) == 1
+
+
+async def test_manual_role_never_prompts_in_crawl(browser, ssr_url, make_cfg, run_dir,
+                                                  tmp_path, monkeypatch):
+    """A manual role without a saved session fails closed (no input() behind a headless
+    browser): auth_failed with a clear warning."""
+    def no_input(*a, **k):
+        raise AssertionError("crawl must never prompt for a manual login")
+    monkeypatch.setattr("builtins.input", no_input)
+    cfg = make_cfg(ssr_url, limits=FAST, roles=[
+        {"name": "sso", "login": {"type": "manual", "url": f"{ssr_url}/login"}}])
+    rd = run_dir(tmp_path, cfg)
+    stats = await run_crawl(cfg, rd, roles=["sso"], budget_minutes=1, browser=browser)
+    assert stats.status == "auth_failed" and stats.auth_failed == ["sso"]
+    assert any("--manual-login" in w for w in stats.warnings)
+
+
+def test_cli_crawl_auth_failed_next(monkeypatch, ssr_url, make_cfg, tmp_path, capsys):
+    import appmap.crawl as crawl_mod
+    cfg = make_cfg(ssr_url, roles=[
+        {"name": "sso", "login": {"type": "manual", "url": f"{ssr_url}/login"}}])
+    out = tmp_path / "runs"
+    assert main(["init", "--config", str(cfg.source_path), "--out", str(out)]) == 0
+    _status(capsys)
+    run = next(out.iterdir())
+
+    async def fake(*a, **k):
+        return CrawlStats(0, 0, 0, 0, 0, "auth_failed", warnings=["role sso: ..."],
+                          auth_failed=["sso"])
+    monkeypatch.setattr(crawl_mod, "run_crawl", fake)
+    assert main(["crawl", "--run", str(run)]) == 1
+    st = _status(capsys)
+    assert not st["ok"] and st["status"] == "auth_failed"
+    assert st["next"] == (f"appmap auth --run {shlex.quote(str(run))} --role sso "
+                          "--manual-login")

@@ -21,6 +21,9 @@ USERNAME_SELECTOR = "input[type=email], input[name*=user i], input[name*=email i
 PASSWORD_SELECTOR = "input[type=password]"
 SUBMIT_SELECTOR = "button[type=submit], input[type=submit]"
 LOGIN_TIMEOUT_S = 10.0
+# Re-logins after a detected session loss, per role and invocation, before giving up
+# (crawl: consecutive, reset by a completed item; probe: total). Bounds lockout risk.
+MAX_RELOGINS = 2
 
 
 @dataclass
@@ -184,8 +187,21 @@ async def _manual_login(sess: RoleSession, cfg: RunConfig, page: Page) -> bool:
     return True
 
 
-async def login(sess: RoleSession, cfg: RunConfig, events: EventLog) -> bool:
+async def login(sess: RoleSession, cfg: RunConfig, events: EventLog, *,
+                interactive: bool = False) -> bool:
+    """Log the role in. A ``manual`` login needs the operator at a terminal and a headed
+    browser, so only ``appmap auth`` passes ``interactive=True``; everywhere else (crawl,
+    probe) a manual role without a usable saved session fails closed."""
     role, spec, rec = sess.role, sess.role.login, sess.recorder
+    if spec.type == "manual" and not interactive:
+        msg = (f"role {role.name}: manual login needs the operator; run "
+               f"'appmap auth --manual-login --role {role.name}'")
+        events.emit("error", role=role.name, message=msg)
+        ev = events.emit("login", role=role.name, ok=False, login_type=spec.type)
+        if rec:
+            rec.store.upsert_role(role.name, login_type=spec.type, auth_ok=False,
+                                  last_login_event=ev.id)
+        return False
     page: Page | None = None
     ok = False
     if rec:

@@ -229,7 +229,7 @@ async def _auth(cfg, rd, roles, headed: bool) -> dict[str, bool]:
                 for role in roles:
                     sess = await open_role_session(browser, cfg, rd, role, rt.recorder)
                     try:
-                        results[role.name] = await login(sess, cfg, rt.events)
+                        results[role.name] = await login(sess, cfg, rt.events, interactive=True)
                         log.info("auth: role %s (%s) -> %s", role.name, role.login.type,
                                  "ok" if results[role.name] else "FAILED")
                     finally:
@@ -298,6 +298,14 @@ def cmd_crawl(args) -> int:
     errors = list(stats.warnings)
     run = _q(rd.root)
     again = f"appmap crawl --run {run}" + (f" --role {_q(args.role)}" if args.role else "")
+    if stats.status == "auth_failed":
+        # A role's login/re-login failed: it was stopped with its items left pending.
+        emit_status("crawl", ok=False, status="auth_failed",
+                    counts={"states": stats.states, "exchanges": stats.exchanges,
+                            "queued_approvals": stats.queued_approvals, **stats.approvals},
+                    pending_approvals=stats.queued_approvals, errors=errors,
+                    next=_auth_next(run, cfg, stats.auth_failed))
+        return 1
     if args.approved_only:
         ok = stats.status in ("done", "in_progress")
         if stats.status == "paused_circuit":
@@ -327,6 +335,16 @@ def cmd_crawl(args) -> int:
                         "queued_approvals": stats.queued_approvals},
                 pending_approvals=stats.queued_approvals, errors=errors, next=nxt)
     return 0 if ok else 1
+
+
+def _auth_next(run: str, cfg, roles: list[str]) -> str:
+    """``appmap auth`` for the roles whose authentication failed."""
+    cmd = f"appmap auth --run {run}"
+    if len(roles) == 1:
+        cmd += f" --role {_q(roles[0])}"
+        if any(r.name == roles[0] and r.login.type == "manual" for r in cfg.roles):
+            cmd += " --manual-login"  # the operator logs in by hand
+    return cmd
 
 
 async def _probe_passive(cfg, rd, role_name: str, budget_minutes: float) -> dict[str, int]:
