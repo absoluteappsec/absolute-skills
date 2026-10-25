@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from .store import Store
 _DECISIONS = {"approve", "deny", "skip"}
 _MATCH_KEYS = {"category", "role", "url_contains", "label_contains"}
 _FAILED_KEY = "approval_failed:"  # meta key prefix: why an approved item could not run
+_INFLIGHT_KEY = "approval_inflight:"  # meta key prefix: final action let through, not finished
 
 
 @dataclass
@@ -100,8 +102,25 @@ class ApprovalQueue:
                 item["execution"] = execution  # informational; ignored when loading
             items.append(item)
         out = {"items": items, "rules": old.get("rules") or []}
+        self._write_atomic(yaml.safe_dump(out, sort_keys=False, default_flow_style=False))
+
+    def _write_atomic(self, text: str) -> None:
+        """Readers (and a human editor) never see a half-written approvals.yaml."""
         self.yaml_path.parent.mkdir(parents=True, exist_ok=True)
-        self.yaml_path.write_text(yaml.safe_dump(out, sort_keys=False, default_flow_style=False))
+        tmp = self.yaml_path.with_name(f".{self.yaml_path.name}.{os.getpid()}.tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, self.yaml_path)
+
+    def set_decision(self, id: str, decision: str, *, decided_by: str) -> None:
+        """Decide an item in the store and in approvals.yaml (so a reload keeps it)."""
+        self.store.upsert_approval(id, decision=decision, decided_by=decided_by)
+        data = self._read_yaml()
+        hit = False
+        for item in data.get("items") or []:
+            if isinstance(item, dict) and item.get("id") == id:
+                item["decision"], hit = decision, True
+        if hit:
+            self._write_atomic(yaml.safe_dump(data, sort_keys=False, default_flow_style=False))
 
     @staticmethod
     def _rule_error(rule) -> str | None:
@@ -180,7 +199,24 @@ class ApprovalQueue:
 
     def mark_executed(self, id: str, event_id: str) -> None:
         self.store.upsert_approval(id, executed_event=event_id)
-        self.store.conn.execute("DELETE FROM meta WHERE key=?", (_FAILED_KEY + id,))
+        self.store.conn.execute("DELETE FROM meta WHERE key IN (?, ?)",
+                                (_FAILED_KEY + id, _INFLIGHT_KEY + id))
+
+    def mark_started(self, id: str, event_id: str) -> None:
+        """Before the final action is let through: the item counts as executed from now
+        on, so an interrupted run can never execute it a second time."""
+        self.store.upsert_approval(id, executed_event=event_id)
+        self.store.set_meta(_INFLIGHT_KEY + id, event_id)
+
+    def unmark_started(self, id: str) -> None:
+        """Nothing was sent after all (refused before the request left)."""
+        self.store.conn.execute("UPDATE approvals SET executed_event=NULL WHERE id=?", (id,))
+        self.store.conn.execute("DELETE FROM meta WHERE key=?", (_INFLIGHT_KEY + id,))
+
+    def in_flight(self) -> dict[str, str]:
+        """Items whose final action started but whose run never recorded the outcome."""
+        return {r["key"][len(_INFLIGHT_KEY):]: r["value"] for r in self.store.conn.execute(
+            "SELECT key, value FROM meta WHERE key LIKE ?", (_INFLIGHT_KEY + "%",))}
 
     def mark_failed(self, id: str, reason: str) -> None:
         """Record why an approved item could not be (fully) executed."""

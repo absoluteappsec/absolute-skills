@@ -12,7 +12,7 @@ from appmap.redact import Redactor
 
 EVENT_TYPES = frozenset({
     "navigate", "click", "fill", "submit", "request", "response", "dialog",
-    "state_entered", "approval_queued", "approval_executed", "login",
+    "state_entered", "approval_queued", "approval_started", "approval_executed", "login",
     "session_lost", "websocket", "sse", "error", "observation",
 })
 

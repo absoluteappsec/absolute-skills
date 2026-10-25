@@ -290,3 +290,225 @@ async def test_mutating_prefix_fails_and_logout_is_skipped(browser, stub_server,
     assert rows[bad]["executed_event"] is None and rows[out]["decision"] == "skip"
     items = {i["id"]: i for i in yaml.safe_load(rd.approvals_path.read_text())["items"]}
     assert "mutating" in items[bad]["execution"]
+
+
+# -- fix round 1 -------------------------------------------------------------------------
+async def _crawl_and_approve(srv, make_cfg, run_dir, tmp_path, browser, pick):
+    """Normal crawl, then approve the approvals ``pick(predicted_url)`` selects."""
+    cfg = _anon(make_cfg, srv.url)
+    rd = run_dir(tmp_path, cfg)
+    await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=2, browser=browser)
+    rows = q(rd.root, "SELECT id, predicted_request FROM approvals")
+    chosen = {r["id"]: "approve" for r in rows
+              if pick(json.loads(r["predicted_request"] or "{}").get("url") or "")}
+    assert chosen, rows
+    _decide(rd, chosen)
+    return cfg, rd
+
+
+async def test_page_load_approval_resent_by_the_browser(browser, stub_server, make_cfg,
+                                                        run_dir, tmp_path):
+    """A request the guard caught during a page load is executed by reloading the page,
+    so the real request (body + content type) is what goes out."""
+    def delete(r):
+        ok = r.mimetype == "application/json" and r.get_json(silent=True) == {"confirm": True}
+        return werkzeug.Response("deleted" if ok else "bad", status=201 if ok else 400)
+
+    srv = stub_server({
+        "/": H("<script>fetch('/api/items/7/delete',{method:'POST',headers:"
+               "{'Content-Type':'application/json'},body:JSON.stringify({confirm:true})})"
+               "</script><p>hi</p>"),
+        "/api/items/7/delete": delete})
+    cfg, rd = await _crawl_and_approve(srv, make_cfg, run_dir, tmp_path, browser,
+                                       lambda u: u.endswith("/api/items/7/delete"))
+    assert ("POST", "/api/items/7/delete") not in srv.requests
+    stats = await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=2, approved_only=True,
+                            browser=browser)
+    assert stats.approvals["executed"] == 1, stats.warnings
+    ex = q(rd.root, "SELECT origin, status, req_body FROM exchanges WHERE method='POST'")
+    assert len(ex) == 1 and ex[0]["origin"] == "approved" and ex[0]["status"] == 201
+    assert "confirm" in ex[0]["req_body"]
+
+
+def _go_page(extra=""):
+    return H("<button onclick=\"fetch('/api/items/7',{method:'DELETE'});" + extra +
+             "\">Go</button>")
+
+
+async def test_interrupted_approval_is_never_resent(browser, stub_server, make_cfg, run_dir,
+                                                    tmp_path, monkeypatch):
+    import asyncio
+
+    import appmap.crawl as crawl_mod
+
+    srv = stub_server({"/": _go_page(), "/api/items/7": lambda r: "ok"})
+    cfg, rd = await _crawl_and_approve(srv, make_cfg, run_dir, tmp_path, browser,
+                                       lambda u: u.endswith("/api/items/7"))
+    real = crawl_mod.wait_settled
+
+    async def settle_then_die(page, ms):
+        await real(page, ms)
+        if ("DELETE", "/api/items/7") in srv.requests:
+            raise asyncio.CancelledError()  # interrupted after the request went out
+
+    monkeypatch.setattr(crawl_mod, "wait_settled", settle_then_die)
+    with pytest.raises(asyncio.CancelledError):
+        await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=2, approved_only=True,
+                        browser=browser)
+    monkeypatch.setattr(crawl_mod, "wait_settled", real)
+    assert srv.requests.count(("DELETE", "/api/items/7")) == 1
+    stats = await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=2, approved_only=True,
+                            browser=browser)
+    assert stats.approvals["executed"] == 0
+    assert srv.requests.count(("DELETE", "/api/items/7")) == 1
+    events = [json.loads(line) for line in rd.events_path.read_text().splitlines()]
+    assert [e["data"]["outcome"] for e in events if e["type"] == "approval_executed"] == [
+        "unknown (interrupted)"]
+
+
+async def test_hard_kill_mid_action_is_recovered_not_resent(browser, stub_server, make_cfg,
+                                                            run_dir, tmp_path, monkeypatch):
+    """Process killed after the request left (no outcome recorded at all)."""
+    import asyncio
+
+    import appmap.crawl as crawl_mod
+    from appmap.crawl import Crawler
+
+    srv = stub_server({"/": _go_page(), "/api/items/7": lambda r: "ok"})
+    cfg, rd = await _crawl_and_approve(srv, make_cfg, run_dir, tmp_path, browser,
+                                       lambda u: u.endswith("/api/items/7"))
+    real = crawl_mod.wait_settled
+
+    async def settle_then_die(page, ms):
+        await real(page, ms)
+        if ("DELETE", "/api/items/7") in srv.requests:
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(crawl_mod, "wait_settled", settle_then_die)
+    monkeypatch.setattr(Crawler, "_finish_approval", lambda self, *a, **k: None)  # "killed"
+    with pytest.raises(asyncio.CancelledError):
+        await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=2, approved_only=True,
+                        browser=browser)
+    monkeypatch.undo()
+    stats = await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=2, approved_only=True,
+                            browser=browser)
+    assert srv.requests.count(("DELETE", "/api/items/7")) == 1
+    assert stats.approvals == {"executed": 0, "failed": 1, "skipped": 0}
+    assert any("interrupted" in w for w in stats.warnings)
+    items = yaml.safe_load(rd.approvals_path.read_text())["items"]
+    assert "interrupted" in [i for i in items if i["predicted_request"]["url"].endswith(
+        "/api/items/7")][0]["execution"]
+
+
+async def test_timer_request_to_other_url_stays_blocked(browser, stub_server, make_cfg,
+                                                        run_dir, tmp_path):
+    srv = stub_server({
+        "/": _go_page("setTimeout(()=>fetch('/api/items/8',{method:'DELETE'}),30)"),
+        "/api/items/7": lambda r: "ok", "/api/items/8": lambda r: "ok"})
+    cfg, rd = await _crawl_and_approve(srv, make_cfg, run_dir, tmp_path, browser,
+                                       lambda u: u.endswith("/api/items/7"))
+    stats = await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=2, approved_only=True,
+                            browser=browser)
+    assert stats.approvals["executed"] == 1
+    assert ("DELETE", "/api/items/7") in srv.requests
+    assert ("DELETE", "/api/items/8") not in srv.requests
+    other = [r for r in q(rd.root, "SELECT * FROM approvals")
+             if json.loads(r["predicted_request"] or "{}").get("url", "").endswith("/8")]
+    assert other and other[0]["decision"] == "pending"
+
+
+async def test_window_rule_only_covers_the_acted_on_page(browser, stub_server, make_cfg,
+                                                         run_dir, tmp_path):
+    """R21: with no predicted write, a popup's held request is not let through."""
+    srv = stub_server({
+        "/": H("<button onclick=\"if (confirm('Sure?')) {fetch('/api/thing',{method:'POST'});"
+               "window.open('/pop')}\">Proceed</button>"),
+        "/pop": H("<script>fetch('/api/items/9',{method:'DELETE'})</script><p>pop</p>"),
+        "/api/thing": lambda r: "ok", "/api/items/9": lambda r: "ok"})
+    cfg = _anon(make_cfg, srv.url)
+    rd = run_dir(tmp_path, cfg)
+    await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=2, browser=browser)
+    aid = q(rd.root, "SELECT id FROM approvals WHERE label='Proceed'")[0]["id"]
+    _decide(rd, {aid: "approve"})
+    stats = await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=2, approved_only=True,
+                            browser=browser)
+    assert stats.approvals["executed"] == 1
+    assert srv.requests.count(("POST", "/api/thing")) == 1
+    assert ("DELETE", "/api/items/9") not in srv.requests
+    held = [r for r in q(rd.root, "SELECT * FROM approvals")
+            if json.loads(r["predicted_request"] or "{}").get("url", "").endswith("/api/items/9")]
+    assert held and held[0]["decision"] == "pending"
+
+
+async def test_approved_direct_write_does_not_follow_redirect(browser, stub_server, make_cfg,
+                                                              run_dir, tmp_path):
+    srv = stub_server({"/": H("<p>home</p>"), "/done": H("<p>done</p>"),
+                       "/api/items/9": lambda r: werkzeug.Response(
+                           "", status=302, headers={"Location": "/done"})})
+    cfg = _anon(make_cfg, srv.url)
+    rd = run_dir(tmp_path, cfg)
+    url = srv.url + "/api/items/9"
+    [aid] = _enqueue(rd.root, _pa(f"DELETE {url}", path=[{"type": "request", "method": "DELETE",
+                                                          "url": url, "origin": "replay"}],
+                                  pred={"method": "DELETE", "url": url}))
+    _decide(rd, {aid: "approve"})
+    stats = await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=2, approved_only=True,
+                            browser=browser)
+    assert stats.approvals["executed"] == 1
+    assert srv.requests == [("DELETE", "/api/items/9")]
+    assert q(rd.root, "SELECT status, origin FROM exchanges") == [
+        {"status": 302, "origin": "approved"}]
+
+
+async def test_circuit_open_before_send_does_not_spend_approval(browser, stub_server, make_cfg,
+                                                                run_dir, tmp_path, monkeypatch):
+    from appmap.gate import RequestGate
+    from appmap.throttle import CircuitOpen
+
+    srv = stub_server({"/": H("<p>home</p>"), "/api/items/9": lambda r: "ok"})
+    cfg = _anon(make_cfg, srv.url)
+    rd = run_dir(tmp_path, cfg)
+    url = srv.url + "/api/items/9"
+    [aid] = _enqueue(rd.root, _pa(f"DELETE {url}", path=[{"type": "request", "method": "DELETE",
+                                                          "url": url}],
+                                  pred={"method": "DELETE", "url": url}))
+    _decide(rd, {aid: "approve"})
+
+    async def refuse(self, method, url, **kw):
+        raise CircuitOpen("tripped")
+
+    monkeypatch.setattr(RequestGate, "admit", refuse)
+    stats = await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=2, approved_only=True,
+                            browser=browser)
+    monkeypatch.undo()
+    assert stats.status == "paused_circuit" and srv.requests == []
+    row = q(rd.root, "SELECT decision, executed_event FROM approvals")[0]
+    assert row == {"decision": "approve", "executed_event": None}
+    assert not q(rd.root, "SELECT 1 FROM meta WHERE key LIKE 'approval_inflight:%'")
+    stats = await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=2, approved_only=True,
+                            browser=browser)
+    assert stats.approvals["executed"] == 1 and srv.requests == [("DELETE", "/api/items/9")]
+
+
+async def test_yaml_edits_during_crawl_are_kept(browser, stub_server, make_cfg, run_dir,
+                                                tmp_path, monkeypatch):
+    from appmap.crawl import Crawler
+
+    srv = stub_server({"/": H("<p>home</p>")})
+    cfg = _anon(make_cfg, srv.url)
+    rd = run_dir(tmp_path, cfg)
+    [aid] = _enqueue(rd.root, _pa("Delete x", pred={"method": "DELETE", "url": srv.url + "/x"}))
+    _decide(rd, {})
+    real = Crawler.run
+
+    async def run_and_edit(self, *a, **k):
+        stats = await real(self, *a, **k)
+        _edit_yaml(rd.root, decisions={aid: "deny"}, notes={aid: "not this one"})
+        return stats
+
+    monkeypatch.setattr(Crawler, "run", run_and_edit)
+    await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=2, browser=browser)
+    item = yaml.safe_load(rd.approvals_path.read_text())["items"][0]
+    assert item["decision"] == "deny" and item["note"] == "not this one"
+    assert q(rd.root, "SELECT decision FROM approvals")[0]["decision"] == "deny"
+    assert not list(rd.root.glob(".approvals.yaml.*.tmp"))

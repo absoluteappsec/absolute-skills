@@ -341,6 +341,9 @@ class Crawler:
         res = {"executed": 0, "failed": 0, "skipped": 0}
         warnings: list[str] = []
         status: CrawlStatus = "done"
+        for aid, why in self._recover_interrupted():
+            res["failed"] += 1
+            warnings.append(f"approval {aid}: {why}")
         items = self.queue.approved_unexecuted()
         idle = sorted({a.role for a in items if a.role not in roles and a.role in self.sessions})
         if idle:
@@ -360,7 +363,7 @@ class Crawler:
                     break
                 if a.category == "logout":
                     # Executing it would end the role's session: never run, even if approved.
-                    self.store.upsert_approval(a.id, decision="skip", decided_by="appmap")
+                    self.queue.set_decision(a.id, "skip", decided_by="appmap")
                     msg = (f"approval {a.id} ({a.label}): logout actions are never executed "
                            "(they end the session); marked skip")
                     warnings.append(msg)
@@ -386,12 +389,54 @@ class Crawler:
         log.info("approved-only stopped: status=%s %s", status, res)
         return stats
 
+    def _recover_interrupted(self) -> list[tuple[str, str]]:
+        """Items whose final action was let through by a run that never finished: the
+        request may have been sent, so they count as executed and are never re-run."""
+        out = []
+        for aid, started in self.queue.in_flight().items():
+            row = self.store.conn.execute("SELECT role, label FROM approvals WHERE id=?",
+                                          (aid,)).fetchone()
+            reason = "interrupted while executing; outcome unknown (not re-run)"
+            ev = self.events.emit("approval_executed", role=row["role"] if row else None,
+                                  caused_by=started, approval_id=aid,
+                                  label=row["label"] if row else "",
+                                  outcome="unknown (interrupted)", error=reason)
+            self.queue.mark_executed(aid, ev.id)
+            self.queue.mark_failed(aid, reason)
+            out.append((aid, reason))
+        return out
+
     def _approval_failed(self, a: PendingAction, reason: str) -> tuple[str, str]:
         """An approved item that could not be executed (nothing destructive was sent)."""
         self.queue.mark_failed(a.id, reason)
         self.events.emit("error", role=a.role, approval_id=a.id,
                          message=f"approved action not executed: {reason}")
         return "failed", reason
+
+    def _start_approval(self, a: PendingAction, mode: str, label: str):
+        """Persist that the approved action is about to be let through (before it is):
+        an interrupted run then never executes it a second time."""
+        ev = self.events.emit("approval_started", role=a.role, approval_id=a.id,
+                              category=a.category, label=label, mode=mode)
+        self.queue.mark_started(a.id, ev.id)
+        return ev
+
+    def _finish_approval(self, a: PendingAction, role: str, caused_by: str, mode: str,
+                         label: str, mark: int, error: str | None, interrupted: bool,
+                         **data) -> None:
+        ids = self._ids_since(mark, role)
+        if interrupted:
+            outcome = "unknown (interrupted)"
+            error = error or "interrupted while executing; outcome unknown"
+        else:
+            outcome = "error" if error else "done"
+        done = self.events.emit("approval_executed", role=role, caused_by=caused_by,
+                                approval_id=a.id, category=a.category, label=label, mode=mode,
+                                exchange_ids=ids, outcome=outcome, error=error, **data)
+        self.queue.mark_executed(a.id, done.id)  # at most once, whatever happened
+        self._settle_frontier(role, a.action_path)
+        if error:
+            self.queue.mark_failed(a.id, f"approved action: {error}")
 
     async def _execute_approval(self, a: PendingAction) -> tuple[str, str | None]:
         sess = self.sessions.get(a.role)
@@ -402,10 +447,10 @@ class Crawler:
         pred = a.predicted_request or {}
         if last.get("type") in ("click", "submit"):
             mode = "ui"
-        elif last.get("type") == "request" or (pred.get("url") and (
-                not path or (pred.get("method") or "GET").upper() not in _SAFE_METHODS)):
-            mode = "direct"  # replay/schema/cross-role, or a request a page load fired
+        elif last.get("type") == "request" or (not path and pred.get("url")):
+            mode = "direct"  # replay / schema / cross-role requests
         elif last.get("type") == "goto":
+            # a held link, or a request the page load fired: the browser re-sends the real one
             mode = "goto"
         else:
             return self._approval_failed(a, "approval has no action or request to perform")
@@ -438,33 +483,44 @@ class Crawler:
         if "<redacted:" in url or "<redacted:" in (body or ""):
             return self._approval_failed(a, "the recorded request holds redacted credentials; "
                                             "not sent")
+        if not self.gate.scope.allows(url):
+            return self._approval_failed(a, "request URL is out of scope; not sent")
+        if self.gate.breaker.tripped:
+            raise CircuitOpen(f"circuit breaker tripped; approval {a.id} not sent")
         rec = functools.partial(record_exchange, self.store, self.events, self.redactor,
                                 self.rd, known_patterns=self.recorder.known_patterns)
         client = DirectClient(self.gate, rec, self.events)
-        mark = self._exchange_mark()
         ctype = step.get("content_type")
-        error = None
+        mark = self._exchange_mark()
+        started = self._start_approval(a, "direct", a.label)
         got = None
+        error = None
+        finished = False
         try:
-            got = await client.request(
-                sess.context.request, method, url, role=role, origin="approved",
-                headers={"Content-Type": ctype} if body is not None and ctype else None,
-                data=body.encode("utf-8") if body is not None else None,
-                extra_auth=dict(sess.auth_headers) or None)
-            if got is None:
-                error = "request refused by the scope gate or failed on the network"
+            try:
+                # An approved write is sent once: its redirect is recorded, not followed.
+                got = await client.request(
+                    sess.context.request, method, url, role=role, origin="approved",
+                    headers={"Content-Type": ctype} if body is not None and ctype else None,
+                    data=body.encode("utf-8") if body is not None else None,
+                    extra_auth=dict(sess.auth_headers) or None,
+                    follow_redirects=method in ("GET", "HEAD"))
+            except CircuitOpen:
+                if not self._ids_since(mark, role):  # refused before anything was sent
+                    self.queue.unmark_started(a.id)
+                    started = None
+                    raise
+                error = "circuit breaker tripped while following redirects"
+            if got is None and error is None:
+                error = "request failed on the network (see events)"
+            finished = True
         finally:
-            ids = self._ids_since(mark, role)
-            ev = self.events.emit("approval_executed", role=role, approval_id=a.id,
-                                  category=a.category, label=a.label, mode="direct",
-                                  method=method, url=self.redactor.url(url),
-                                  status=got[0] if got else None, exchange_ids=ids,
-                                  outcome="error" if error or got is None else "done",
-                                  error=error)
-            self.queue.mark_executed(a.id, ev.id)  # at most once, whatever happened
-            self._settle_frontier(role, a.action_path)
+            if started is not None:
+                self._finish_approval(a, role, started.id, "direct", a.label, mark, error,
+                                      not finished, method=method,
+                                      url=self.redactor.url(url),
+                                      status=got[0] if got else None)
         if error:
-            self.queue.mark_failed(a.id, error)
             return "failed", error
         status, resp = got
         location = resp.headers.get("location")
@@ -486,43 +542,45 @@ class Crawler:
             return s
         return None
 
+    async def _restore_for_approval(self, sess: RoleSession, page: Page, a: PendingAction,
+                                    prefix: list[dict]) -> str | None:
+        """Replay ``prefix`` with the guard fully armed (no held request passes, confirm()
+        is dismissed). Returns a failure reason, or None when restored."""
+        role = sess.role.name
+        bad = self._restore_blocker(prefix)
+        if bad is not None:
+            return (f"restoring its action path needs a mutating step "
+                    f"({self._describe([bad]).strip()}); not executed")
+        if not prefix or prefix[0].get("type") != "goto":
+            return "action path does not start at an entry URL"
+        for attempt in (1, 2):
+            hits = self._arm_guard(role, "load", prefix)
+            try:
+                await self._replay(page, prefix)
+                await self.recorder.drain()
+                if hits:
+                    return ("restoring its action path issued a request that needs approval "
+                            "(aborted); not executed")
+                await self._check_lost(sess, page)
+                return None
+            except _Lost:
+                if attempt == 2 or not await self._relogin(sess, page):
+                    return "session lost while restoring"
+            except _Fail as exc:
+                return f"restore failed: {exc}"
+        return "session lost while restoring"
+
     async def _execute_ui(self, sess: RoleSession, page: Page, a: PendingAction,
                           mode: str) -> tuple[str, str | None]:
         role, path = sess.role.name, a.action_path
         step = path[-1]
-        prefix = path[:-1] if mode == "ui" else []
+        src = None
         if mode == "ui":
-            bad = self._restore_blocker(prefix)
-            if bad is not None:
-                return self._approval_failed(
-                    a, f"restoring its action path needs a mutating step "
-                       f"({self._describe([bad]).strip()}); not executed")
-            if not prefix or prefix[0].get("type") != "goto":
-                return self._approval_failed(a, "action path does not start at an entry URL")
-            # Restore with the guard fully armed: no held request passes, confirm()
-            # dialogs are dismissed.
-            for attempt in (1, 2):
-                hits = self._arm_guard(role, "load", prefix)
-                try:
-                    await self._replay(page, prefix)
-                    await self.recorder.drain()
-                    if hits:
-                        return self._approval_failed(
-                            a, "restoring its action path issued a request that needs "
-                               "approval (aborted); not executed")
-                    await self._check_lost(sess, page)
-                    break
-                except _Lost:
-                    if attempt == 2 or not await self._relogin(sess, page):
-                        return self._approval_failed(a, "session lost while restoring")
-                    if page.is_closed():
-                        page = await self._open_page(sess)
-                except _Fail as exc:
-                    return self._approval_failed(a, f"restore failed: {exc}")
+            why = await self._restore_for_approval(sess, page, a, path[:-1])
+            if why:
+                return self._approval_failed(a, why)
             src = await self._record_state(page, role, visit=False)
             await self._drain_nav(page)
-        else:
-            src = None
         before = canon_url(page.url) if page.url.startswith("http") else ""
         form = loc = None
         try:  # locate the control before anything is let through
@@ -542,55 +600,56 @@ class Crawler:
         mark = self._exchange_mark()
         hits = self._arm_guard(role, "action", path, label=label,
                                context=step.get("context", ""), state=src.id if src else None)
-        if mode == "ui":
-            # Without a predicted write, held requests fired in this action window pass.
-            self._approval = {"role": role, "match": match, "allowed": []}
+        started = self._start_approval(a, mode, label)
+        # R21: a predicted write passes by method + URL; without one, only held requests of
+        # the acted-on page during this action window pass (popups/workers stay guarded).
+        self._approval = {"role": role, "match": match, "page": page, "allowed": []}
         self._confirm_mode = "defer" if form is not None and form.has_confirm else "accept"
         self.recorder.origin_by_role[role] = "approved"
         result = None
         error = None
-        ev = self.events.emit(step["type"] if mode == "ui" else "navigate", role=role,
-                              approval_id=a.id, label=label,
-                              url=self.redactor.url(step.get("url") or page.url))
+        allowed: list = []
+        ev = None
+        finished = False
         try:
-            if mode == "goto":
-                await self._goto(page, step["url"])
-            elif step["type"] == "click":
-                await loc.click(timeout=ACTION_TIMEOUT_MS)
-                await asyncio.sleep(0.05)
-                await wait_settled(page, self.limits.quiet_window_ms)
-            else:
-                result = await fill_and_submit(
-                    page, form, self.gen, max_retries=0,
-                    settle_ms=self.limits.quiet_window_ms,
-                    exchange_ids_since=lambda: self._ids_since(mark, role))
-        except CircuitOpen:
-            error = "circuit breaker tripped during the action"
-        except Exception as exc:
-            error = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
-        finally:
             try:
-                await self.recorder.drain()
+                ev = self.events.emit("navigate" if mode == "goto" else step["type"],
+                                      role=role, caused_by=started.id, approval_id=a.id,
+                                      label=label,
+                                      url=self.redactor.url(step.get("url") or page.url))
+                if mode == "goto":
+                    await self._goto(page, step["url"])
+                elif step["type"] == "click":
+                    await loc.click(timeout=ACTION_TIMEOUT_MS)
+                    await asyncio.sleep(0.05)
+                    await wait_settled(page, self.limits.quiet_window_ms)
+                else:
+                    result = await fill_and_submit(
+                        page, form, self.gen, max_retries=0,
+                        settle_ms=self.limits.quiet_window_ms,
+                        exchange_ids_since=lambda: self._ids_since(mark, role))
+            except CircuitOpen:
+                error = "circuit breaker tripped during the action"
+            except Exception as exc:
+                error = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
             finally:
-                allowed = (self._approval or {}).get("allowed", [])
-                self._approval = None
-                self._confirm_mode = "dismiss"
-                self.recorder.origin_by_role.pop(role, None)
-        ids = self._ids_since(mark, role)
-        done = self.events.emit(
-            "approval_executed", role=role, caused_by=ev.id, approval_id=a.id,
-            category=a.category, label=label, mode=mode, exchange_ids=ids,
-            allowed_requests=[f"{m} {u}" for m, u in allowed],
-            blocked_requests=[f"{m} {u}" for _f, m, u in hits],
-            outcome="error" if error else "done", error=error)
-        self.queue.mark_executed(a.id, done.id)  # at most once, whatever happened
-        self._settle_frontier(role, path)
+                try:
+                    await self.recorder.drain()
+                finally:
+                    allowed = (self._approval or {}).get("allowed", [])
+                    self._approval = None
+                    self._confirm_mode = "dismiss"
+                    self.recorder.origin_by_role.pop(role, None)
+            finished = True
+        finally:
+            self._finish_approval(a, role, (ev or started).id, mode, label, mark, error,
+                                  not finished,
+                                  allowed_requests=[f"{m} {u}" for m, u in allowed],
+                                  blocked_requests=[f"{m} {u}" for _f, m, u in hits])
         if error:
-            reason = f"approved action raised: {error}"
-            self.queue.mark_failed(a.id, reason)
-            return "failed", reason
-        await self._after_approved(sess, page, step, src, ev.id, label, ids, before, form,
-                                   result)
+            return "failed", f"approved action: {error}"
+        await self._after_approved(sess, page, step, src, ev.id, label,
+                                   self._ids_since(mark, role), before, form, result)
         return "executed", None
 
     async def _after_approved(self, sess: RoleSession, page: Page, step: dict,
@@ -629,8 +688,8 @@ class Crawler:
             self.events.emit("error", role=role, message=f"after approved action: {exc}")
 
     def _approval_allows(self, request, role: str) -> bool:
-        """During an approved action only: its predicted request (method + URL), or any
-        held request of the action window when no write was predicted."""
+        """During an approved action only: its predicted request (method + URL), or, when
+        no write was predicted, held requests of the acted-on page in the action window."""
         ap = self._approval
         if ap is None or ap["role"] != role:
             return False
@@ -641,6 +700,13 @@ class Crawler:
             if not (rm == method or (rm == "POST" and method not in ("GET", "POST"))):
                 return False
             if self._norm_url(request.url) != url:
+                return False
+        else:
+            try:
+                same_page = request.frame.page is ap["page"]
+            except Exception:  # workers have no frame
+                same_page = False
+            if not same_page:
                 return False
         ap["allowed"].append((request.method, self.redactor.url(request.url)))
         return True
@@ -1377,6 +1443,7 @@ async def _crawl_with(cfg: RunConfig, rd: RunDir, names: list[str] | None, budge
     if rd.approvals_path.exists():
         rt.queue.load_decisions()
         warnings += [f"approvals.yaml: {w}" for w in rt.queue.warnings]
+        rt.queue.write_yaml()  # rule decisions become visible items (no revocation on reload)
     sessions: dict[str, RoleSession] = {}
     crawl_roles: list[str] = []
     try:
@@ -1403,5 +1470,12 @@ async def _crawl_with(cfg: RunConfig, rd: RunDir, names: list[str] | None, budge
                 rt.recorder.finalize_har(name)
             except Exception as exc:
                 log.warning("closing role %s failed: %s", name, exc)
+        try:
+            if rd.approvals_path.exists():  # keep decisions edited while the crawl ran
+                rt.queue.load_decisions()
+                for w in rt.queue.warnings:
+                    log.warning("approvals.yaml: %s", w)
+        except Exception as exc:
+            log.warning("re-reading approvals.yaml failed: %s", exc)
         rt.queue.write_yaml()
         rt.store.close()

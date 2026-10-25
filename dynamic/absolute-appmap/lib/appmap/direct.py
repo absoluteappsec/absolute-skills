@@ -51,10 +51,12 @@ class DirectClient:
                       origin: str, caused_by: str | None = None,
                       headers: dict | None = None, data: Any = None, json: Any = None,
                       params: dict | None = None,
-                      extra_auth: dict | None = None) -> tuple[int, APIResponse] | None:
+                      extra_auth: dict | None = None,
+                      follow_redirects: bool = True) -> tuple[int, APIResponse] | None:
         """Return ``(status, response)`` of the last response received, or None when the
         gate refuses the initial URL. A redirect to an out-of-scope URL is not followed:
         the 3xx response is returned and the target lands in ``external_links``.
+        ``follow_redirects=False`` records and returns the first response, 3xx included.
         """
         url = _with_params(url, params)
         origin_netloc = urlsplit(url).netloc
@@ -92,7 +94,7 @@ class DirectClient:
                      resp_body=resp_body, duration_ms=duration_ms, caused_by=caused_by)
             result = (resp.status, resp)
             location = resp.headers.get("location")
-            if resp.status not in _REDIRECTS or not location:
+            if resp.status not in _REDIRECTS or not location or not follow_redirects:
                 return result
             found_on = url
             url = urljoin(url, location)
