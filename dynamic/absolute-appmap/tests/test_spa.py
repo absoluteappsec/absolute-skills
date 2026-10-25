@@ -96,5 +96,31 @@ async def test_unlinked_settings_route_crawled(browser, spa_url, make_cfg, run_d
         assert q("select 1 from sources s join routes r on r.id=s.item_id "
                  "where s.item_kind='route' and s.source='spa_router' and r.pattern='/settings'")
         assert q("select 1 from frontier where url like '%/settings' and source='spa_router'")
+        # parameterized route re-filled with ids observed during the crawl (drain pass)
+        assert q("select 1 from frontier where role='admin' and source='spa_router' "
+                 "and url glob '*/items/[0-9]*'")
+        assert not [w for w in stats.warnings if "/items/{id}" in w]
+    finally:
+        store.close()
+
+
+async def test_spa_routes_seeded_per_role(browser, spa_url, make_cfg, run_dir, tmp_path,
+                                          monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    roles = _roles(spa_url) + [{"name": "alice", "login": {
+        "type": "form", "url": f"{spa_url}/", "username_env": "APPMAP_ALICE_USER",
+        "password_env": "APPMAP_ALICE_PASS", "success_selector": "text=Signed in as"}}]
+    cfg = make_cfg(spa_url, roles=roles, limits=FAST)
+    rd = run_dir(tmp_path, cfg)
+    await run_crawl(cfg, rd, roles=["admin", "alice"], budget_minutes=5, browser=browser)
+    store = Store(rd.db_path)
+    try:
+        q = lambda sql, *a: [dict(r) for r in store.conn.execute(sql, a)]
+        for role in ("admin", "alice"):
+            seeded = {r["url"].removeprefix(spa_url) for r in q(
+                "select url from frontier where role=? and source='spa_router'", role)}
+            assert "/settings" in seeded, (role, seeded)
+            assert q("select 1 from frontier where role=? and url=?", role, spa_url + "/admin")
+        assert q("select 1 from states where role='admin' and route_pattern='/admin'")
     finally:
         store.close()

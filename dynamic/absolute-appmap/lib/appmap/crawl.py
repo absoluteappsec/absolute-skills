@@ -143,8 +143,10 @@ class Crawler:
             "SELECT pattern FROM routes WHERE kind='spa_route'")]
         self._url_patterns: dict[str, Counter] = {}
         self._installed: set = set()
-        self._spa_seeded: set[str] = set()   # roles whose SPA routes were queued
-        self._spa_warnings: list[str] = []
+        self._spa_routes: dict[str, list] = {}   # role -> router routes (once detected)
+        self._spa_base: dict[str, str] = {}      # role -> URL the routes were read from
+        self._spa_filled: set[tuple[str, str]] = set()
+        self._spa_skipped: dict[tuple[str, str], str] = {}  # (role, pattern) -> warning
         self._confirm_seen = False
         self._approved_mode = False  # set while executing approved actions (Task 17)
         # Network guard attribution: the action (or page load) requests are charged to.
@@ -180,7 +182,7 @@ class Crawler:
         if status == "done" and any(self.frontier.pending_count(r) for r in roles):
             status = "in_progress"
         stats = self.stats(status)
-        stats.warnings += self._spa_warnings
+        stats.warnings += list(self._spa_skipped.values())
         log.info("crawl stopped: status=%s states=%d transitions=%d pending_approvals=%d",
                  status, stats.states, stats.transitions, stats.queued_approvals)
         return stats
@@ -205,6 +207,11 @@ class Crawler:
                     return "paused_circuit"
                 item = self.frontier.pop(role)
                 if item is None:
+                    # Drained: IDs seen since seeding may fill more parameterized routes
+                    # (and a router may only have appeared after login).
+                    if page is not None and not page.is_closed() \
+                            and await self._seed_spa(page, role):
+                        continue
                     return "done"
                 if page is None or page.is_closed():
                     page = await self._open_page(sess)
@@ -218,7 +225,7 @@ class Crawler:
                 self.frontier.mark(item.id, outcome)
                 log.info("[%s] item %d %s %s -> %s", role, item.id, item.kind,
                          item.url or self._describe(item.action_path[-1:]), outcome)
-                if role not in self._spa_seeded and not page.is_closed():
+                if role not in self._spa_routes and not page.is_closed():
                     await self._seed_spa(page, role)
         finally:
             if page is not None and not page.is_closed():
@@ -509,10 +516,6 @@ class Crawler:
         return "done"
 
     # -- SPA routes ---------------------------------------------------------------
-    def _spa_patterns(self) -> set[str]:
-        return {r[0] for r in self.store.conn.execute(
-            "SELECT pattern FROM routes WHERE kind='spa_route'")}
-
     async def _drain_nav(self, page: Page) -> list[dict]:
         """Client route changes (pushState/replaceState/hashchange/popstate) since last read."""
         try:
@@ -530,49 +533,65 @@ class Crawler:
             self.frontier.push(role, "url", url=self._safe_url(url), depth=depth + 1,
                                priority=PRIORITY["url"], source="ui")
 
-    async def _seed_spa(self, page: Page, role: str) -> None:
-        """After a role's first loaded page: detect the SPA, record its router's routes and
-        queue each concrete one for this role."""
+    async def _seed_spa(self, page: Page, role: str) -> int:
+        """Detect the SPA (until a router is found), record its routes, and queue each
+        concrete route for this role. Returns how many new frontier items were queued."""
         if self.cfg.spa == "off" or not page.url.startswith(("http://", "https://")):
-            return
-        self._spa_seeded.add(role)
-        info = await detect_spa(page)
-        if not (info["has_router"] or self.cfg.spa == "on"):
-            return
+            return 0
+        if role not in self._spa_routes:
+            info = await detect_spa(page)
+            if not (info["has_router"] or self.cfg.spa == "on"):
+                return 0
 
-        async def fetch_text(url: str) -> str | None:
-            try:
-                return await page.evaluate(
-                    "u => fetch(u).then(r => r.ok ? r.text() : null)", url)
-            except Exception:
-                return None
+            async def fetch_text(url: str) -> str | None:
+                try:
+                    return await page.evaluate(
+                        "u => fetch(u).then(r => r.ok ? r.text() : null)", url)
+                except Exception:
+                    return None
 
-        routes = await extract_routes(page, page.url, fetch_text)
-        host = urlsplit(page.url).netloc.lower()
-        log.info("[%s] SPA %s: %d routes", role, info["framework"], len(routes))
-        for r in routes:
-            rid = self.store.upsert_route(r.pattern, host, "spa_route")
-            self.store.upsert_source("route", rid, r.source)
-            if r.pattern not in self.known:
-                self.known.append(r.pattern)
-            if r.pattern not in self.recorder.known_patterns:
-                self.recorder.known_patterns.append(r.pattern)
+            routes = await extract_routes(page, page.url, fetch_text)
+            if not routes and info["framework"] in ("unknown", "react", "angular") \
+                    and self.cfg.spa != "on":
+                return 0
+            self._spa_routes[role] = routes
+            self._spa_base[role] = page.url
+            host = urlsplit(page.url).netloc.lower()
+            log.info("[%s] SPA %s: %d routes", role, info["framework"], len(routes))
+            for r in routes:
+                rid = self.store.upsert_route(r.pattern, host, "spa_route")
+                self.store.upsert_source("route", rid, r.source)
+                if r.pattern not in self.known:
+                    self.known.append(r.pattern)
+                if r.pattern not in self.recorder.known_patterns:
+                    self.recorder.known_patterns.append(r.pattern)
+        return self._fill_spa(role)
+
+    def _fill_spa(self, role: str) -> int:
+        base, pushed = self._spa_base[role], 0
+        for r in self._spa_routes[role]:
             if "{" in r.pattern:
-                ids = observed_ids(self.store.conn, Path(self.rd.root), role, r.pattern,
-                                   self.cap)
+                if (role, r.pattern) in self._spa_filled:
+                    continue  # sampled once per role and pattern, like list sampling
+                ids = observed_ids(self.store.conn, Path(self.rd.root), role, r.pattern, 1000)
                 if not ids:
-                    msg = (f"spa route {r.pattern}: no observed ids for role {role}; "
-                           "recorded, not queued")
-                    log.info(msg)
-                    self._spa_warnings.append(msg)
+                    self._spa_skipped[(role, r.pattern)] = (
+                        f"spa route {r.pattern}: no observed ids for role {role}; "
+                        "recorded, not queued")
                     continue
-                urls = [concrete_url(page.url, r.pattern, i) for i in ids]
+                self._spa_skipped.pop((role, r.pattern), None)
+                self._spa_filled.add((role, r.pattern))
+                urls = [u for u in (concrete_url(base, r.pattern, i) for i in ids)
+                        if self.frontier.id_of(role, "url", url=self._safe_url(u)) is None]
+                urls = urls[:self.cap]  # ids the crawl already reached are not repeated
             else:
-                urls = [concrete_url(page.url, r.pattern, "")]
+                urls = [concrete_url(base, r.pattern, "")]
             for url in urls:
-                if self.gate.scope.allows(url):
-                    self.frontier.push(role, "url", url=self._safe_url(url), depth=0,
-                                       priority=PRIORITY["url"], source="spa_router")
+                if self.gate.scope.allows(url) and self.frontier.push(
+                        role, "url", url=self._safe_url(url), depth=0,
+                        priority=PRIORITY["url"], source="spa_router"):
+                    pushed += 1
+        return pushed
 
     # -- restore -------------------------------------------------------------
     async def _goto(self, page: Page, url: str) -> None:
@@ -654,7 +673,7 @@ class Crawler:
                                 screenshot=shot, dom_snapshot=dom)
         rid = self.store.upsert_route(pattern, urlsplit(url).netloc.lower(), "page")
         self.store.upsert_source("route", rid, "ui")
-        if pattern in self._spa_patterns():
+        if pattern in self.known:
             self.store.upsert_source("route", rid, "spa_router")
         return st
 
