@@ -407,3 +407,96 @@ async def test_login_and_static_allow_hosts_in_browser(browser, stub_server, mak
     assert ("GET", "/lib.js") in ext.requests and ("GET", "/sso") in ext.requests
     assert not [r for r in rows(h, "SELECT url FROM exchanges") if "localhost" in r["url"]]
     await sess.context.close()
+
+
+_DJANGO_REGISTER = """<!doctype html><html><body>
+<form method="post" action="/taskManager/register/" enctype="multipart/form-data">
+<input type="hidden" name="csrfmiddlewaretoken" value="Zk9QcXJzdFV2d3h5ejAxMjM0NTY3ODk">
+<input name="username"><input type="password" name="password">
+<input name="ssn"><input type="file" name="avatar">
+<button type="submit">Register</button></form></body></html>"""
+
+
+async def test_multipart_register_redacted_end_to_end(browser, stub_server, make_cfg, run_dir,
+                                                      tmp_path, monkeypatch):
+    """A Django-style multipart register form: password and csrfmiddlewaretoken are
+    redacted in the stored request body and the HAR; ssn (customer data) and the
+    uploaded file bytes are kept."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    got = {}
+
+    def register(r):
+        if r.method == "POST":
+            got["form"] = dict(r.form)
+            got["file"] = r.files["avatar"].read()
+            return Response(status=302, headers={"Location": "/taskManager/login/"})
+        return Response(_DJANGO_REGISTER, mimetype="text/html")
+    srv = stub_server({
+        "/taskManager/register/": register,
+        "/taskManager/login/": lambda r: Response("<p>login</p>", mimetype="text/html"),
+    })
+    cfg = make_cfg(srv.url, roles=[{"name": "anonymous", "login": {"type": "none"}}])
+    rd = run_dir(tmp_path, cfg)
+    h = Harness(cfg, rd)
+    sess = await h.open(browser, "anonymous")
+    page = await h.recorder.new_page(sess.context)
+    await page.goto(srv.url + "/taskManager/register/")
+    await page.fill("input[name=username]", "alice")
+    await page.fill("input[name=password]", "Hunter2-pass-Zq9")
+    await page.fill("input[name=ssn]", "123-45-6789")
+    await page.set_input_files("input[name=avatar]", files=[{
+        "name": "a.txt", "mimeType": "text/plain", "buffer": b"avatar-file-contents"}])
+    await page.click("button[type=submit]")
+    await page.wait_for_url("**/taskManager/login/")
+    await h.recorder.drain()
+    await sess.context.close()
+    assert got["form"]["password"] == "Hunter2-pass-Zq9"  # the app itself got the real value
+
+    ex = next(r for r in rows(h, "SELECT * FROM exchanges WHERE method='POST'"))
+    stored = (ex["req_body"] or "").encode() if ex["req_body"] else \
+        (rd.root / ex["req_body_path"]).read_bytes()
+    for secret in (b"Hunter2-pass-Zq9", b"Zk9QcXJzdFV2d3h5ejAxMjM0NTY3ODk"):
+        assert secret not in stored
+    assert b"<redacted:password>" in stored and b"<redacted:csrf>" in stored
+    assert b"123-45-6789" in stored and b"avatar-file-contents" in stored
+
+    text = h.recorder.finalize_har("anonymous").read_text()
+    assert "Hunter2-pass-Zq9" not in text
+    assert "Zk9QcXJzdFV2d3h5ejAxMjM0NTY3ODk" not in text
+    assert "123-45-6789" in text
+    har = json.loads(text)
+    post = next(e["request"]["postData"] for e in har["log"]["entries"]
+                if e["request"]["method"] == "POST")
+    assert "<redacted:password>" in post.get("text", "") or any(
+        p.get("value") == "<redacted:password>" for p in post.get("params") or [])
+    blob = rd.events_path.read_text() + json.dumps(rows(h, "SELECT * FROM params"))
+    assert "Hunter2-pass-Zq9" not in blob and "Zk9QcXJzdFV2d3h5ejAxMjM0NTY3ODk" not in blob
+
+
+async def test_finalize_har_multipart_post_data_redacted(make_cfg, run_dir, tmp_path, ssr_url):
+    cfg = make_cfg(ssr_url)
+    rd = run_dir(tmp_path, cfg)
+    h = Harness(cfg, rd)
+    body = ("--BND\r\nContent-Disposition: form-data; name=\"csrfmiddlewaretoken\"\r\n\r\n"
+            "tokTOKtok12345678\r\n--BND\r\nContent-Disposition: form-data; name=\"password\""
+            "\r\n\r\nPw-Secret-777\r\n--BND\r\nContent-Disposition: form-data; name=\"ssn\""
+            "\r\n\r\n123-45-6789\r\n--BND--\r\n")
+    har = {"log": {"entries": [
+        {"request": {"method": "POST", "url": "http://x/register/", "headers": [],
+                     "postData": {"mimeType": "multipart/form-data; boundary=BND", "text": body,
+                                  "params": [{"name": "csrfmiddlewaretoken",
+                                              "value": "tokTOKtok12345678"},
+                                             {"name": "password", "value": "Pw-Secret-777"},
+                                             {"name": "ssn", "value": "123-45-6789"}]}},
+         "response": {"status": 302, "headers": [], "content": {"mimeType": "text/html"}}}]}}
+    path = rd.traffic_dir / "anon.har"
+    path.write_text(json.dumps(har))
+    h.recorder.finalize_har("anon")
+    post = json.loads(path.read_text())["log"]["entries"][0]["request"]["postData"]
+    assert "tokTOKtok12345678" not in json.dumps(post) and "Pw-Secret-777" not in json.dumps(post)
+    assert "<redacted:csrf>" in post["text"] and "<redacted:password>" in post["text"]
+    assert "123-45-6789" in post["text"]
+    assert post["text"].startswith("--BND\r\n") and post["text"].endswith("--BND--\r\n")
+    assert {p["name"]: p["value"] for p in post["params"]} == {
+        "csrfmiddlewaretoken": "<redacted:csrf>", "password": "<redacted:password>",
+        "ssn": "123-45-6789"}

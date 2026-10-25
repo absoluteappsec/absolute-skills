@@ -199,6 +199,10 @@ def _index_params(store: Store, redactor: Redactor, endpoint_id: int, raw_segs: 
         _upsert_param(store, redactor, endpoint_id, "query", k, v)
     if req_text is None:
         return
+    if is_multipart(req_ct):
+        for k, v in multipart_fields(req_text.encode("latin-1"), req_ct):
+            _upsert_param(store, redactor, endpoint_id, "body", k, v)
+        return
     if "x-www-form-urlencoded" in (req_ct or "").lower():
         for k, v in parse_qsl(req_text, keep_blank_values=True):
             _upsert_param(store, redactor, endpoint_id, "body", k, v)
@@ -209,14 +213,109 @@ def _index_params(store: Store, redactor: Redactor, endpoint_id: int, raw_segs: 
                 _upsert_param(store, redactor, endpoint_id, "body", k, v)
 
 
+_MP_BOUNDARY = re.compile(r"""\bboundary\s*=\s*(?:"([^"]+)"|([^;\s]+))""", re.I)
+_MP_NAME = re.compile(rb"""\bname\s*=\s*(?:"([^"]*)"|([^;\s]+))""", re.I)
+_MP_FILENAME = re.compile(rb"\bfilename\*?\s*=", re.I)
+
+
+def is_multipart(content_type: str | None) -> bool:
+    return _base_ct(content_type) == "multipart/form-data"
+
+
+def _mp_boundary(content_type: str | None) -> bytes | None:
+    m = _MP_BOUNDARY.search(content_type or "")
+    return (m.group(1) or m.group(2)).encode("latin-1", "replace") if m else None
+
+
+def _mp_split(body: bytes, boundary: bytes) -> list[tuple[bytes, bytes, bytes, bytes]] | None:
+    """``[(head, sep, content, tail)]`` per part plus the framing kept around them, or None
+    when ``body`` is not framed by ``boundary``. ``head`` holds the part's lead newline and
+    headers, ``sep`` the blank line, ``tail`` the newline that belongs to the next delimiter."""
+    chunks = body.split(b"--" + boundary)
+    if len(chunks) < 3:
+        return None
+    parts = []
+    for chunk in chunks[1:-1]:
+        for sep in (b"\r\n\r\n", b"\n\n"):
+            i = chunk.find(sep)
+            if i >= 0:
+                break
+        else:
+            return None
+        head, content = chunk[:i], chunk[i + len(sep):]
+        tail = b"\r\n" if content.endswith(b"\r\n") else b"\n" if content.endswith(b"\n") else b""
+        parts.append((head, sep, content[:len(content) - len(tail)], tail))
+    return parts
+
+
+def _mp_name(head: bytes) -> tuple[str | None, bool]:
+    """Field name of a part and whether it is a file upload."""
+    for line in head.splitlines():
+        if line.lower().startswith(b"content-disposition"):
+            m = _MP_NAME.search(line)
+            name = (m.group(1) if m.group(1) is not None else m.group(2)) if m else None
+            return (name.decode("utf-8", "replace") if name is not None else None,
+                    bool(_MP_FILENAME.search(line)))
+    return None, False
+
+
+def multipart_fields(body: bytes, content_type: str | None) -> list[tuple[str, str]]:
+    """``(name, value)`` of every non-file part (values decoded as UTF-8)."""
+    boundary = _mp_boundary(content_type)
+    parts = _mp_split(body, boundary) if boundary else None
+    out = []
+    for head, _sep, content, _tail in parts or []:
+        name, is_file = _mp_name(head)
+        if name is not None and not is_file:
+            out.append((name, content.decode("utf-8", "replace")))
+    return out
+
+
+def _lat(redact, raw: bytes) -> bytes:
+    return redact(raw.decode("latin-1")).encode("latin-1", errors="replace")
+
+
+def redact_multipart(redactor: Redactor, body: bytes, content_type: str | None) -> bytes:
+    """Redact a ``multipart/form-data`` body part by part, keeping its framing: text parts
+    by field name (the urlencoded/JSON key rules: password, csrf, token, secret, api_key),
+    then as text; file parts keep their bytes apart from literal-secret scrubbing. A body
+    that does not parse as multipart is scrubbed as opaque bytes."""
+    boundary = _mp_boundary(content_type)
+    parts = _mp_split(body, boundary) if boundary else None
+    if parts is None:
+        return redact_bytes(redactor, body)
+    delim = b"--" + boundary
+    chunks = body.split(delim)
+    out = [_lat(redactor.literals, chunks[0])]
+    for head, sep, content, tail in parts:
+        name, is_file = _mp_name(head)
+        kind = redactor.key_kind(name) if name is not None and not is_file else None
+        if kind:
+            content = f"<redacted:{kind}>".encode()
+        elif is_file:
+            content = _lat(redactor.literals, content)
+        else:
+            content = _lat(redactor.text, content)
+        out.append(_lat(redactor.text, head) + sep + content + tail)
+    out.append(_lat(redactor.literals, chunks[-1]))
+    return delim.join(out)
+
+
 def redact_bytes(redactor: Redactor, raw: bytes) -> bytes:
     """Redact binary / non-UTF-8 content via a lossless latin-1 round trip."""
     return redactor.text(raw.decode("latin-1")).encode("latin-1", errors="replace")
 
 
 def redact_text(redactor: Redactor, text: str, content_type: str | None = None) -> str:
-    """JSON by key, form-urlencoded by parameter name (``authenticity_token=…``), anything
-    else (HTML included: hidden CSRF inputs, meta tokens) as text."""
+    """JSON by key, form-urlencoded by parameter name (``authenticity_token=…``),
+    multipart/form-data part by part (``redact_multipart``), anything else (HTML included:
+    hidden CSRF inputs, meta tokens) as text."""
+    if is_multipart(content_type):
+        try:
+            return redact_multipart(redactor, text.encode("latin-1"), content_type).decode("latin-1")
+        except UnicodeEncodeError:  # real Unicode text: work on its UTF-8 bytes
+            return redact_multipart(redactor, text.encode("utf-8", "surrogatepass"),
+                                    content_type).decode("utf-8", "replace")
     if "x-www-form-urlencoded" in (content_type or "").lower():
         return redactor.url("x?" + text)[2:]
     obj = _json_or_none(text)
@@ -246,6 +345,8 @@ def record_exchange(store: Store, events: EventLog, redactor: Redactor, rd: RunD
     req_ct = _hget(req_headers, "content-type")
     resp_ct = _hget(resp_headers, "content-type")
     req_text = _decode(req_body, req_ct)
+    if req_body and is_multipart(req_ct):
+        req_text = req_body.decode("latin-1")  # lossless view; parts are parsed as bytes
     resp_text = _decode(resp_body, resp_ct)
 
     req_ev = events.emit("request", role=role, caused_by=caused_by, method=method,
@@ -289,6 +390,9 @@ def record_exchange(store: Store, events: EventLog, redactor: Redactor, rd: RunD
     for side, raw, text, ct in (("req", req_body, req_text, req_ct),
                                 ("resp", resp_body, resp_text, resp_ct)):
         if not raw:
+            continue
+        if side == "req" and is_multipart(ct):
+            files[side] = (redact_multipart(redactor, raw, ct), "bin")
             continue
         if text is None:
             files[side] = (redact_bytes(redactor, raw), _ext(ct, False))

@@ -198,3 +198,85 @@ def test_form_urlencoded_request_body_redacted_by_name():
     out = redact_text(Redactor([], []), "authenticity_token=wDlCmkO01QF_Dg&name=appmap-1",
                       "application/x-www-form-urlencoded")
     assert "wDlCmkO01QF_Dg" not in out and "name=appmap-1" in out
+
+
+# --- multipart/form-data request bodies -------------------------------------------
+
+_BOUNDARY = "----WebKitFormBoundaryX3sZ9qPq"
+_MP_CT = f"multipart/form-data; boundary={_BOUNDARY}"
+_FILE_BYTES = b"\x89PNG\r\n\x1a\n\x00\xffavatar-bytes s3cret \x00"
+
+
+def _mp_body(boundary=_BOUNDARY, nl=b"\r\n"):
+    b = boundary.encode()
+
+    def field(name, value):
+        return (b"--" + b + nl + b'Content-Disposition: form-data; name="' + name.encode()
+                + b'"' + nl + nl + value + nl)
+    return (field("csrfmiddlewaretoken", b"Qm9vZ3JhbW1hcjEyMzQ1Njc4OTA")
+            + field("username", b"alice") + field("password1", b"Hunter2-pass!")
+            + field("ssn", b"123-45-6789") + field("bio", b"my key is s3cret ok")
+            + b"--" + b + nl
+            + b'Content-Disposition: form-data; name="avatar"; filename="a.png"' + nl
+            + b"Content-Type: image/png" + nl + nl + _FILE_BYTES + nl
+            + b"--" + b + b"--" + nl)
+
+
+def _parts(body: bytes, boundary=_BOUNDARY):
+    from email.parser import BytesParser
+    from email.policy import HTTP
+    msg = BytesParser(policy=HTTP).parsebytes(
+        f"Content-Type: multipart/form-data; boundary={boundary}\r\n\r\n".encode() + body)
+    assert not msg.defects
+    return {p.get_param("name", header="content-disposition"): p.get_payload(decode=True)
+            for p in msg.iter_parts()}
+
+
+def test_redact_multipart_by_field_name():
+    from appmap.recording import redact_multipart
+    out = redact_multipart(Redactor(["s3cret"], []), _mp_body(), _MP_CT)
+    parts = _parts(out)
+    assert parts["csrfmiddlewaretoken"] == b"<redacted:csrf>"
+    assert parts["password1"] == b"<redacted:password>"
+    assert parts["username"] == b"alice"
+    assert parts["ssn"] == b"123-45-6789"  # customer data is kept (spec decision 11)
+    assert parts["bio"] == b"my key is <redacted:secret> ok"
+    # file part bytes preserved except the literal secret
+    assert parts["avatar"] == _FILE_BYTES.replace(b"s3cret", b"<redacted:secret>")
+    assert b"Hunter2-pass!" not in out and b"Qm9vZ3JhbW1hcjEyMzQ1Njc4OTA" not in out
+
+
+def test_redact_multipart_quoted_boundary_and_lf_and_str():
+    from appmap.recording import redact_multipart, redact_text
+    red = Redactor([], [])
+    out = redact_multipart(red, _mp_body(nl=b"\n"),
+                           f'multipart/form-data; boundary="{_BOUNDARY}"')
+    assert b"Hunter2-pass!" not in out and b"<redacted:password>" in out
+    assert b"123-45-6789" in out
+    text = redact_text(red, _mp_body().decode("latin-1"), _MP_CT)
+    assert "Hunter2-pass!" not in text and "alice" in text
+    assert _parts(text.encode("latin-1"))["avatar"] == _FILE_BYTES
+
+
+def test_redact_multipart_without_boundary_falls_back_to_text_scrub():
+    from appmap.recording import redact_multipart
+    out = redact_multipart(Redactor(["s3cret"], []), b"junk s3cret", "multipart/form-data")
+    assert out == b"junk <redacted:secret>"
+
+
+def test_multipart_request_body_redacted_in_store_and_params(env):
+    rec, store, rd, _ = env
+    eid = rec(method="POST", url="http://t.test/register/",
+              req_headers={"Content-Type": _MP_CT}, req_body=_mp_body(),
+              resp_headers={"content-type": "text/html"}, resp_body=b"<p>ok</p>")
+    row = rows(store, "SELECT * FROM exchanges WHERE id=?", eid)[0]
+    stored = (row["req_body"] or "").encode("latin-1") if row["req_body"] else \
+        (rd.root / row["req_body_path"]).read_bytes()
+    assert b"Hunter2-pass!" not in stored and b"Qm9vZ3JhbW1hcjEyMzQ1Njc4OTA" not in stored
+    parts = _parts(stored)
+    assert parts["ssn"] == b"123-45-6789"
+    blob = rd.events_path.read_text() + json.dumps(rows(store, "SELECT * FROM params"))
+    assert "Hunter2-pass!" not in blob and "Qm9vZ3JhbW1hcjEyMzQ1Njc4OTA" not in blob
+    names = {r["name"] for r in rows(store, "SELECT name FROM params WHERE location='body'")}
+    assert {"csrfmiddlewaretoken", "username", "password1", "ssn"} <= names
+    assert "avatar" not in names

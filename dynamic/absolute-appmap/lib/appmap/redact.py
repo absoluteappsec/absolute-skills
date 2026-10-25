@@ -118,6 +118,14 @@ class Redactor:
         return ";".join(parts)
 
     # -- public API --------------------------------------------------------
+    def key_kind(self, key: str) -> str | None:
+        """Placeholder kind for a field/parameter/header named ``key``, or None to keep it."""
+        return self._key_kind(key)
+
+    def literals(self, s: str) -> str:
+        """Scrub only literal secrets (configured, learned, ``redact_patterns``)."""
+        return self._scrub.sub(_ph("secret"), s) if self._scrub and isinstance(s, str) else s
+
     def text(self, s: str) -> str:
         if not isinstance(s, str):
             return s
