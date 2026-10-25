@@ -14,11 +14,11 @@ import pytest
 import yaml
 
 from profile_helpers import ISSUED_SECRETS
-from test_e2e import PASSWORDS, Agent, _b64_forms
+from test_e2e import Agent, _needles
 
 OUTPUTS = ("profile.json", "APP-PROFILE.md", "profile-names.yaml")
 REF_KINDS = {"exchange", "state", "file", "route", "endpoint", "flow", "form"}
-JUDGMENT = re.compile(r"outdated|vulnerab|\bCVE\b", re.I)
+JUDGMENT = re.compile(r"outdated|vulnerab|\bCVE\b|insecure|end-of-life|deprecated", re.I)
 
 
 def _profile(run: Path, out: Path, cache: Path) -> tuple[dict, dict, str]:
@@ -41,16 +41,14 @@ def _assert_evidence_refs(profile: dict, run_id: str) -> None:
             assert len(ev["snippet"]) <= 200
 
 
-def _assert_clean(out: Path, run: Path) -> None:
+def _assert_clean(out: Path, run: Path, expect: tuple[str, ...]) -> None:
     """No fixture password, sid, CSRF token or JWT (verbatim or base64 at any alignment)
-    and no judgment wording in any profile output."""
-    secrets = ISSUED_SECRETS[run]
-    assert secrets, "no session secret was captured from the fixture"
-    raw = {s.encode() for s in set(PASSWORDS) | secrets if s}
-    needles = {n: n for n in raw}
-    for n in raw:
-        for form in _b64_forms(n):
-            needles[form] = n
+    and no judgment wording in any profile output. ``expect``: secret classes the fixture
+    must have issued, so the scan is not vacuous."""
+    issued = ISSUED_SECRETS[run]
+    for cls in expect:
+        assert issued[cls], f"no {cls} secret was captured from the fixture"
+    needles = _needles(set().union(*issued.values()))
     hits = []
     for name in OUTPUTS:
         data = (out / name).read_bytes()
@@ -81,8 +79,11 @@ def test_ssr_technologies(ssr):
     assert python["category"] == "language"
     # language is inferred (likely) unless a header names it outright (Werkzeug's Server
     # header carries "Python/x.y.z", which is authoritative -> confirmed)
-    assert python["confidence"] == "likely" or any(
-        e["kind"] == "header" and "Python/" in e["snippet"] for e in python["evidence"])
+    assert python["confidence"] in ("likely", "confirmed")
+    if python["confidence"] == "confirmed":
+        assert any(e["kind"] == "header" and "Python/" in e["snippet"]
+                   for e in python["evidence"]), python["evidence"]
+        assert python["versions"]
     assert techs["Cookie session"]["category"] == "auth"
     assert techs["CSRF token"]["category"] == "auth"
     assert "JWT bearer" not in techs
@@ -159,15 +160,15 @@ def test_rendered_sub_blocks_absent_in_fixture_runs(ssr):
 
 
 def test_no_secrets_or_judgment_in_outputs(ssr, spa):
-    for r in (ssr, spa):
-        _assert_clean(r["out"], r["run"])
+    _assert_clean(ssr["out"], ssr["run"], ("sid", "csrf"))
+    _assert_clean(spa["out"], spa["run"], ("jwt",))
 
 
 def test_skill_flow_names_round_trip(ssr, tmp_path_factory):
     """Skill steps 4-5: fill profile-names.yaml, re-run, the prose lands in the outputs."""
     out = ssr["out"]
     names = yaml.safe_load((out / "profile-names.yaml").read_text())
-    assert set(names) == {"purpose", "features", "stale"}
+    assert set(names) == {"purpose", "features", "stale", "technology_overrides"}
     assert ssr["status"]["next"] and "profile-names.yaml" in ssr["status"]["next"]
     names["purpose"] = "Project tracker for a small team (states 1, 2)."
     for i, f in enumerate(names["features"]):
@@ -182,4 +183,4 @@ def test_skill_flow_names_round_trip(ssr, tmp_path_factory):
     assert len(profile["feature_names"]) == len(names["features"])
     assert names["purpose"] in md
     assert "### Feature 0" in md and "Step one, then step two (exchange 0)." in md
-    _assert_clean(out, ssr["run"])
+    _assert_clean(out, ssr["run"], ("sid", "csrf"))

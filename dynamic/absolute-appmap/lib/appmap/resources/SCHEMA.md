@@ -413,7 +413,7 @@ Written by `appmap profile` (not by `build`), next to `APP-PROFILE.md` and
 | `observed_accounts_masked` | `true` when observed usernames/emails are masked (production input without `--include-observed-accounts`) |
 | `could_not_determine` | `[{item, run_id, reason}]` |
 | `environments` | Per run: `run_id`, `base_urls`, `hosts`, `profile`, `started_at`, `tool_version`, `contains_production_data` |
-| `technologies` | `[{name, category, versions, versions_by_environment, confidence, evidence}]`; `confidence` is `confirmed` or `likely`; `evidence` is `[{ref, kind, snippet}]` (snippet ≤ 200 chars, redacted) |
+| `technologies` | `[{name, category, versions, versions_by_environment, confidence, evidence}]`; `confidence` is `confirmed` or `likely` (or lower after an override); `evidence` is `[{ref, kind, snippet}]` (snippet ≤ 200 chars, redacted). A downgrade from `technology_overrides` in `profile-names.yaml` adds `detected_confidence` (the detector's level) and `confidence_reason` |
 | `layout` | `areas` (`prefix`, `routes`, `endpoints`, `roles`), `entry_points` (role → URLs), `api_groups` (`resource`, `endpoints`) |
 | `features` | `[{key, resource, flow_keys, routes, endpoints, forms, roles, name_suggestion}]`; `key` is stable across re-runs |
 | `data_model` | `[{name, source, fields, id_format, endpoints, evidence}]`; `source` is `openapi`, `graphql` or `inferred`; fields have `name`, `type`, `required`, `constraints`, `enum`, `example_redacted` |

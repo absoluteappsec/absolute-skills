@@ -293,3 +293,17 @@ def test_second_run_production_masks_observed_in_all_runs(ssr_built_run, tmp_pat
     shown = build_profile([first, second], include_observed_accounts=True)
     assert "carol.stage@corp.example" in [o["value"] for o in shown["accounts"]["observed"]]
     assert masked["environments"][1]["contains_production_data"] is True
+
+
+def test_feature_routes_and_endpoints_are_unique(ssr_built_run, spa_built_run):
+    for run in (ssr_built_run, spa_built_run):
+        for f in build_profile([run])["features"]:
+            assert len(f["routes"]) == len(set(f["routes"])), f
+            assert len(f["endpoints"]) == len(set(f["endpoints"])), f
+
+
+def test_captured_schema_without_entities_warns_differently(spa_built_run):
+    p = build_profile([spa_built_run])
+    assert not any(e["source"] in ("openapi", "graphql") for e in p["data_model"])
+    assert not any("no API schema" in w for w in p["warnings"])
+    assert any("has no entity types" in w for w in p["warnings"])

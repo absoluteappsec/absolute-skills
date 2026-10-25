@@ -18,10 +18,13 @@ Rules:
 
 - The command assigns `confirmed`/`likely` to technologies; it never emits `guessed`. Only
   your prose can be `guessed`, and it must say so ("appears to", "probably").
-- You may **downgrade** (write about a `confirmed` claim as `likely` when its evidence is
-  weaker than the label — e.g. both detectors read the same generic cookie) and you must say
-  why in your report. You may **never upgrade** without new evidence, and you never add a
-  technology no detector found — mention it as an open question in the report instead.
+- You may **downgrade** a claim whose evidence is weaker than its label (e.g. both
+  detectors read the same generic cookie): add a `technology_overrides` entry in
+  `profile-names.yaml` with `name`, `category` (if the name is ambiguous), the lower
+  `confidence` and a `reason` with refs. The profile keeps the detector's level as
+  `detected_confidence` and shows both. You may **never upgrade** — `appmap profile` refuses
+  it with a warning — and you never add a technology no detector found; mention it as an open
+  question in the report instead.
 - Versions: report every version listed; conflicting versions (different environments, or a
   CDN copy and a bundled copy) are all kept — do not pick one.
 - A technology without a version is fine; no body means no version, and nothing is re-fetched.

@@ -514,7 +514,8 @@ def features(store: Store, run_id: str) -> list[dict]:
         res = _resource(r["pattern"])
         if res:
             f = feat(res)
-            f["routes"].append(r["pattern"])
+            if r["pattern"] not in f["routes"]:  # a pattern can be both page and spa_route
+                f["routes"].append(r["pattern"])
             f["roles"] |= access.get(("route", r["id"]), set())
     ep_res: dict[int, str] = {}
     for e in conn.execute("SELECT id, method, path_pattern, kind FROM endpoints "
@@ -524,7 +525,9 @@ def features(store: Store, run_id: str) -> list[dict]:
             continue
         ep_res[e["id"]] = res
         f = feat(res)
-        f["endpoints"].append(f"{e['method']} {e['path_pattern']}")
+        label = f"{e['method']} {e['path_pattern']}"
+        if label not in f["endpoints"]:
+            f["endpoints"].append(label)
         f["roles"] |= access.get(("endpoint", e["id"]), set())
     for fm in conn.execute(
             "SELECT f.id, f.method, f.purpose, f.action_endpoint_id, e.path_pattern "

@@ -57,7 +57,7 @@ How to read it:
 | `status` | `reported` | Plain report |
 | | `new_pass` | `--new-pass` closed a pass: read `counts.prev_pass` and `counts.new_in_prev_pass` |
 | | `no_change` | `--new-pass` refused: nothing ran since the current pass began |
-| `profile` | `profiled` | Profile written (`profile.json`, `APP-PROFILE.md`, `profile-names.yaml`). `counts`: `technologies`, `features`, `entities`, `environments`. `errors` holds warnings (e.g. an unparseable `profile-names.yaml`, left untouched and copied to `.bak`); `next` asks for the purpose/feature names until they are filled |
+| `profile` | `profiled` | Profile written (`profile.json`, `APP-PROFILE.md`, `profile-names.yaml`). `counts`: `technologies`, `features`, `entities`, `environments`. `errors` holds warnings (e.g. an unparseable `profile-names.yaml`, left untouched and copied to `.bak`); `next` stays set until the purpose and, for every feature, a name other than the generated suggestion or a description are filled. Refused `technology_overrides` (upgrades, unknown names) are warnings in `errors` |
 | | `partial` | Written, but something could not be determined (no build, failed role, unfinished crawl, unreadable section); see `could_not_determine` in `profile.json` |
 | | `error` | Nothing written: no `appmap.sqlite`, or the output directory is not writable (pass `--out`) |
 | `query` | `complete` / `error` | `counts.rows`, `counts.recipe`; `sql` also `counts.truncated` (rows beyond `--limit`, default 1000) |

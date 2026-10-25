@@ -153,7 +153,7 @@ directory given with `--out`:
 |------|-------------|
 | `profile.json` | Structured, versioned application profile (`profile_schema_version`): technologies with versions, confidence (`confirmed` / `likely`) and evidence refs, layout, features, data model, data setup, accounts, environments and differences, coverage, what could not be determined. |
 | `APP-PROFILE.md` | The briefing, leading with purpose and features. Descriptive only — no judgments of versions or security. |
-| `profile-names.yaml` | Agent-written purpose and feature names, descriptions and "how it works", applied on every profile run; entries whose feature disappeared move to `stale`. |
+| `profile-names.yaml` | Agent-written purpose and feature names, descriptions and "how it works", plus optional technology confidence downgrades (`technology_overrides`), applied on every profile run; entries whose feature disappeared move to `stale`. |
 
 Saved login sessions are kept outside the run directory, in
 `~/.cache/absolute-appmap/sessions/<run_id>/`.

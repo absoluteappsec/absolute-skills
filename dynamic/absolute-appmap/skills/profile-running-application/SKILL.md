@@ -1,6 +1,6 @@
 ---
 name: profile-running-application
-description: Use when someone needs to come up to speed on a web application that an absolute-appmap run has already mapped - its purpose, main features, technology stack with versions, layout, how each feature works, data model, data setup, test accounts, environments and coverage - e.g. before planning full test coverage or generating tests. Profiles the running application from its appmap run directory (one per environment), not from source code (for a source-code portrait use absolute-codereview's profile-application). Runs appmap profile, writes the purpose and feature names, descriptions and how-it-works prose with evidence refs into profile-names.yaml, and re-runs to render APP-PROFILE.md. Triggers on "profile the app", "profile the running application", "write APP-PROFILE.md", "what is this app built with", "brief me on the mapped application", "what does this app do".
+description: Use when someone needs to come up to speed on a web application that an absolute-appmap run has already mapped - its purpose, main features, technology stack with versions, layout, how each feature works, data model, data setup, test accounts, environments and coverage - e.g. before planning full test coverage or generating tests. Profiles the running application from its appmap run directory (one per environment), not from source code (for a source-code portrait use absolute-codereview's profile-application). Runs appmap profile, writes the purpose and feature names, descriptions and how-it-works prose with evidence refs into profile-names.yaml, and re-runs to render APP-PROFILE.md. Triggers on "profile the mapped app", "profile this appmap run", "write APP-PROFILE.md from the app map", "what is the mapped app built with", "brief me on the app-map run", "what does the mapped application do".
 ---
 
 ## Purpose
@@ -40,7 +40,9 @@ Conventions (`appmap` = the plugin's `scripts/appmap` wrapper, run by absolute p
 ## Step 1 — Check the Inputs
 
 You need one run directory per environment of **the same application** (e.g. staging and
-production). For each:
+production). **No run directory yet** (only a URL or a config): this skill cannot crawl — run
+`map-running-application` (`../map-running-application/SKILL.md`) first, then come back. For
+each run directory:
 
 1. `run.json` → `status` should be `complete` (the map was built); note `profile` and
    `contains_production_data`.
@@ -70,8 +72,10 @@ directory is not writable, or should stay as it is).
 | `error` | Nothing written (no `appmap.sqlite`, unwritable output directory — `errors` says why) |
 
 `counts`: `technologies`, `features`, `entities`, `environments`. `errors` carries warnings
-(e.g. an unparseable `profile-names.yaml`, left untouched and copied to `.bak`). `next` asks you
-to fill `profile-names.yaml` and re-run while the purpose or any feature name is missing.
+(e.g. an unparseable `profile-names.yaml`, left untouched and copied to `.bak`; a refused
+technology override). `next` asks you to fill `profile-names.yaml` and re-run until the purpose
+is set **and** every feature has a name other than its generated suggestion or a description —
+the pre-filled suggestion names do not count.
 
 Outputs: `profile.json`, `APP-PROFILE.md`, `profile-names.yaml`.
 
@@ -113,10 +117,10 @@ Work through `references/profile-guide.md`:
   step with refs.
 - **Technology claims** — check each against its evidence snippets. If the evidence is weaker
   than the confidence suggests (a generic cookie name, a marker that could belong to something
-  else), treat it as one level lower in your prose and report it. Never present a technology,
-  version or confidence higher than the evidence supports, and never add one without a
-  detector hit. `profile.json` is regenerated on every run, so record doubts in your report
-  (and in the affected feature's "how it works" where it matters), not by editing the file.
+  else), lower it with a `technology_overrides` entry (Step 5) and a reason citing refs. Only
+  downgrades are applied — an upgrade is refused with a warning. Never add a technology
+  without a detector hit; mention it in your report instead. Do not edit `profile.json`: it is
+  regenerated on every run.
 
 Never write judgments: no "outdated", "vulnerable", "insecure", "end-of-life", CVE or risk
 wording anywhere.
@@ -134,6 +138,11 @@ features:
   description: ""
   how_it_works: ""
 stale: []                      # names whose feature key no longer exists
+technology_overrides: []       # optional confidence downgrades, e.g.:
+# - name: Django
+#   category: server_framework
+#   confidence: likely           # guessed | likely (lower than detected)
+#   reason: "only a csrftoken cookie [exchange 164]"
 ```
 
 - Keep `key` and `suggestion` as generated; fill `purpose`, `name`, `description`,
@@ -143,13 +152,17 @@ stale: []                      # names whose feature key no longer exists
   the new key and list it in your report; never drop it silently.
 - Cite refs inline in the format of `references/profile-guide.md` (e.g. `[exchange 42]`,
   `[flow 3]`).
+- `technology_overrides`: `name` (and `category` when the name is ambiguous), the lower
+  `confidence`, and a `reason`. The profile then shows the new level with the detected one and
+  your reason (`detected_confidence`, `confidence_reason` in `profile.json`).
 
 ---
 
 ## Step 6 — Re-run and Review
 
 Run the same `appmap profile` command again (same `--run`s and `--out`). `next` is `null` once
-the purpose and every feature name are filled. Read `APP-PROFILE.md` top to bottom: purpose and
+the purpose is set and every feature has its own name or a description. Check `errors` for
+refused overrides. Read `APP-PROFILE.md` top to bottom: purpose and
 features first, technology table, layout, data model, data setup, test accounts, environments
 (and differences), coverage orientation, "Could not determine", notes. Fix the YAML and re-run
 if anything reads wrong.
@@ -174,10 +187,12 @@ encrypted, share only with authorized people, delete them when the engagement en
 - [ ] `purpose` and every feature `name`, `description` and `how_it_works` filled from evidence,
       with refs on every factual sentence — or deliberately left blank and reported.
 - [ ] Stale names re-mapped or reported; none silently dropped.
-- [ ] Technology claims checked against evidence; no confidence raised without evidence.
+- [ ] Technology claims checked against evidence; weak ones lowered via
+      `technology_overrides` with a reason; nothing raised.
 - [ ] No outdated/vulnerable/CVE/risk judgments written anywhere; no credentials, tokens or
       env-var values in any file or message.
-- [ ] Re-ran after editing `profile-names.yaml` (`next` is `null`); `APP-PROFILE.md` reviewed.
+- [ ] Re-ran after editing `profile-names.yaml` (`next` is `null`, no refused overrides in
+      `errors`); `APP-PROFILE.md` reviewed.
 - [ ] Report delivered with the "could not determine" list and, for production, the handling
       notice.
 

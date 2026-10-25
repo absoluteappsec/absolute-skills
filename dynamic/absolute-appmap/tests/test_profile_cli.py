@@ -218,3 +218,63 @@ def test_next_roundtrips_paths_with_spaces(ssr_built_run, tmp_path, capsys):
     assert str(out / "profile-names.yaml") in words
     assert words[words.index("appmap"):][:4] == ["appmap", "profile", "--run", str(run)]
     assert words[-2:] == ["--out", str(out)]
+
+
+def test_next_stays_until_features_are_judged(ssr_built_run, tmp_path, capsys):
+    """Pre-filled suggestion names do not count: next stays until every feature has a
+    non-suggestion name or a description."""
+    run = _copy_run(ssr_built_run, tmp_path / "run")
+    _profile(capsys, "--run", str(run))
+    names = run / "profile-names.yaml"
+    doc = yaml.safe_load(names.read_text())
+    doc["purpose"] = "A project tracker."
+    names.write_text(yaml.safe_dump(doc, sort_keys=False))
+    _, st = _profile(capsys, "--run", str(run))
+    assert st["next"] and "profile-names.yaml" in st["next"]
+    for i, f in enumerate(doc["features"]):
+        if i % 2:
+            f["name"] = f"Judged {i}"           # renamed, no description
+        else:
+            f["description"] = f"About {i}."    # suggestion kept, but described
+    names.write_text(yaml.safe_dump(doc, sort_keys=False))
+    _, st = _profile(capsys, "--run", str(run))
+    assert st["next"] is None
+
+
+def test_technology_overrides_downgrade_only(ssr_built_run, tmp_path, capsys):
+    run = _copy_run(ssr_built_run, tmp_path / "run")
+    _profile(capsys, "--run", str(run))
+    names = run / "profile-names.yaml"
+    doc = yaml.safe_load(names.read_text())
+    assert doc["technology_overrides"] == []
+    techs = {t["name"]: t for t in json.loads((run / "profile.json").read_text())
+             ["technologies"]}
+    assert techs["Werkzeug"]["confidence"] == "confirmed"
+    assert techs["CSRF token"]["confidence"] == "likely"
+    doc["technology_overrides"] = [
+        {"name": "Werkzeug", "category": "app_server", "confidence": "likely",
+         "reason": "only the dev-server header seen [exchange 1]"},
+        {"name": "CSRF token", "category": "auth", "confidence": "confirmed",
+         "reason": "trying to upgrade"},
+        {"name": "Nonexistent", "category": "auth", "confidence": "guessed", "reason": "x"},
+        {"name": "Python", "confidence": "certain", "reason": "bad level"},
+    ]
+    names.write_text(yaml.safe_dump(doc, sort_keys=False))
+    rc, st = _profile(capsys, "--run", str(run))
+    assert rc == 0
+    errs = " ".join(st["errors"])
+    assert "CSRF token" in errs and "upgrade" in errs
+    assert "Nonexistent" in errs and "certain" in errs
+    techs = {t["name"]: t for t in json.loads((run / "profile.json").read_text())
+             ["technologies"]}
+    w = techs["Werkzeug"]
+    assert w["confidence"] == "likely" and w["detected_confidence"] == "confirmed"
+    assert w["confidence_reason"].startswith("only the dev-server header")
+    assert techs["CSRF token"]["confidence"] == "likely"
+    assert "detected_confidence" not in techs["CSRF token"]
+    assert techs["Python"]["confidence"] == "confirmed"
+    md = (run / "APP-PROFILE.md").read_text()
+    row = next(ln for ln in md.splitlines() if ln.startswith("| Werkzeug |"))
+    assert "likely (detected: confirmed; only the dev-server header seen [exchange 1])" in row
+    # the overrides survive a re-run of the names emit
+    assert yaml.safe_load(names.read_text())["technology_overrides"][0]["name"] == "Werkzeug"

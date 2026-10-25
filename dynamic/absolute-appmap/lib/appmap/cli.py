@@ -577,7 +577,8 @@ def _write_atomic(path: Path, text: str) -> None:
 def cmd_profile(args) -> int:
     """Read-only on the runs (no run lock); writes only its own files, atomically."""
     from appmap.profile import build_profile
-    from appmap.profile.names import apply_profile_names, emit_profile_names
+    from appmap.profile.names import (apply_profile_names, apply_technology_overrides,
+                                      emit_profile_names, is_judged)
     from appmap.profile.render import render_app_profile
 
     runs = [Path(r) for r in args.run]
@@ -588,6 +589,7 @@ def cmd_profile(args) -> int:
         names_path = out / "profile-names.yaml"
         warnings = emit_profile_names(profile, names_path)
         applied = apply_profile_names(profile, names_path)
+        warnings += apply_technology_overrides(profile, names_path)
         _write_atomic(out / "profile.json",
                       json.dumps(profile, indent=2, ensure_ascii=False, default=str) + "\n")
         _write_atomic(out / "APP-PROFILE.md", render_app_profile(profile))
@@ -600,12 +602,14 @@ def cmd_profile(args) -> int:
               "features": len(features),
               "entities": len(profile.get("data_model") or []),
               "environments": len(profile.get("environments") or [])}
-    named = {k for k, v in (profile.get("feature_names") or {}).items() if v.get("name")}
+    judged = profile.get("feature_names") or {}
     nxt = None
-    if not profile.get("purpose") or any(f["key"] not in named for f in features):
+    if not profile.get("purpose") or not all(
+            is_judged(judged.get(f["key"]), f.get("name_suggestion") or "") for f in features):
         run_args = " ".join(f"--run {_q(r)}" for r in runs)
         out_arg = f" --out {_q(out)}" if args.out else ""
-        nxt = (f"fill {_q(names_path)} (purpose and feature names), then re-run: "
+        nxt = (f"fill {_q(names_path)} (purpose, and a name or description for every "
+               f"feature), then re-run: "
                f"appmap profile {run_args}{out_arg}")
     emit_status("profile", ok=True, status=profile["status"], counts=counts, errors=warnings,
                 next=nxt)

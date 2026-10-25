@@ -8,9 +8,16 @@ from pathlib import Path
 
 import pytest
 
-# Secrets each fixture server issued (sid cookies, CSRF tokens, JWTs), by built run directory,
-# so profile tests can scan their outputs for them after the server has stopped.
-ISSUED_SECRETS: dict[Path, set[str]] = {}
+# Secrets each fixture server issued, by built run directory and class ("sid", "csrf",
+# "jwt" - the latter with the bare signature too), so profile tests can scan their outputs
+# for them after the server has stopped.
+ISSUED_SECRETS: dict[Path, dict[str, set[str]]] = {}
+
+
+def _classify(secrets: set[str], csrf: set[str]) -> dict[str, set[str]]:
+    jwt = {s for s in secrets if s.count(".") == 2}
+    sigs = {j.rsplit(".", 1)[-1] for j in jwt}
+    return {"csrf": set(csrf), "jwt": jwt | sigs, "sid": secrets - csrf - jwt - sigs}
 
 
 def _built(name: str, roles_for, created_sql: str, tmp_path_factory) -> Path:
@@ -20,7 +27,7 @@ def _built(name: str, roles_for, created_sql: str, tmp_path_factory) -> Path:
     try:
         res = workflow(server, tmp_path_factory.mktemp(f"profile-{name}"),
                        roles_for(server.url), created_sql)
-        ISSUED_SECRETS[res["run"]] = set(server.secrets)
+        ISSUED_SECRETS[res["run"]] = _classify(set(server.secrets), set(server.csrf))
         return res["run"]
     finally:
         server.stop()

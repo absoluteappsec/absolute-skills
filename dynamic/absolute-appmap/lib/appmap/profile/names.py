@@ -1,5 +1,8 @@
 """``profile-names.yaml``: agent-written purpose and feature names, stable across re-runs.
 
+``technology_overrides`` lets the agent lower a detected technology's confidence with a
+reason; upgrades are refused with a warning (never more confident than the evidence).
+
 Features are keyed by their stable key. A name whose key no longer exists moves to ``stale``
 (never silently dropped) and returns if the key comes back. Each stub stores the
 ``suggestion`` it was generated with, so an untouched stub that vanishes is dropped rather
@@ -14,6 +17,7 @@ from pathlib import Path
 import yaml
 
 _FIELDS = ("name", "description", "how_it_works")
+CONFIDENCE_RANK = {"guessed": 0, "likely": 1, "confirmed": 2}
 
 
 class NamesFileError(ValueError):
@@ -101,8 +105,10 @@ def emit_profile_names(profile: dict, path: Path) -> list[str]:
         if not _untouched(entry):
             stale[key] = entry
     purpose = doc.get("purpose") if isinstance(doc.get("purpose"), str) else ""
+    overrides = doc.get("technology_overrides")
     out = {"purpose": purpose, "features": features + known_left,
-           "stale": list(stale.values()) + stale_left}
+           "stale": list(stale.values()) + stale_left,
+           "technology_overrides": overrides if isinstance(overrides, list) else []}
     tmp = path.with_name(path.name + ".tmp")
     try:
         tmp.write_text(yaml.safe_dump(out, sort_keys=False, allow_unicode=True))
@@ -130,3 +136,60 @@ def apply_profile_names(profile: dict, path: Path) -> int:
             names[key] = {f: entry[f] for f in _FIELDS}
             count += 1
     return count
+
+
+def is_judged(entry: dict | None, suggestion: str) -> bool:
+    """A feature counts as judged once it has a name other than the generated suggestion,
+    or a description (a pre-filled suggestion alone is not a judgment)."""
+    if not entry:
+        return False
+    name = entry.get("name") or ""
+    return bool((name and name != suggestion) or entry.get("description"))
+
+
+def apply_technology_overrides(profile: dict, path: Path) -> list[str]:
+    """Apply ``technology_overrides`` (downgrades only) to ``profile["technologies"]``.
+
+    A downgraded entry keeps the detector's level as ``detected_confidence`` and gets
+    ``confidence_reason``. Returns warnings for upgrades, unknown technologies, bad levels
+    and malformed entries; those entries change nothing."""
+    try:
+        doc = _load(path)
+    except NamesFileError:
+        return []
+    raw = doc.get("technology_overrides")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        return [f"{Path(path).name}: technology_overrides is not a list; ignored"]
+    warnings = []
+    techs = profile.get("technologies") or []
+    for item in raw:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            warnings.append(f"technology override {item!r}: needs a name; ignored")
+            continue
+        name, cat = item["name"], item.get("category")
+        level, reason = item.get("confidence"), item.get("reason")
+        where = f"technology override for {name!r}"
+        if level not in CONFIDENCE_RANK:
+            warnings.append(f"{where}: confidence {level!r} is not one of "
+                            f"{', '.join(CONFIDENCE_RANK)}; ignored")
+            continue
+        if not isinstance(reason, str) or not reason.strip():
+            warnings.append(f"{where}: a reason is required; ignored")
+            continue
+        matches = [t for t in techs if t.get("name") == name
+                   and (not cat or t.get("category") == cat)]
+        if not matches:
+            warnings.append(f"{where}: no such detected technology; ignored")
+            continue
+        for t in matches:
+            detected = t.get("detected_confidence") or t["confidence"]
+            if CONFIDENCE_RANK[level] > CONFIDENCE_RANK.get(detected, 0):
+                warnings.append(f"{where}: {level} would upgrade the detected {detected}; "
+                                "only downgrades are applied")
+            elif level != detected:
+                t["detected_confidence"] = detected
+                t["confidence"] = level
+                t["confidence_reason"] = reason.strip()
+    return warnings

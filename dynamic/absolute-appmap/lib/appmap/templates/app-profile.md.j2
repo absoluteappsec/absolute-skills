@@ -86,7 +86,7 @@ Nothing to describe.
 | Name | Category | Version(s) | Confidence | Evidence |
 |---|---|---|---|---|
 {% for t in technologies %}
-| {{ t.name | cell }} | {{ t.category | cell }} | {{ (t.versions | join(", ")) | cell }} | {{ t.confidence }} | {{ t.evidence | length }} |
+| {{ t.name | cell }} | {{ t.category | cell }} | {{ (t.versions | join(", ")) | cell }} | {{ t.confidence }}{% if t.get("detected_confidence") %} (detected: {{ t.detected_confidence }}; {{ t.confidence_reason | cell }}){% endif %} | {{ t.evidence | length }} |
 {% endfor %}
 {% if technologies_more %}
 
@@ -94,7 +94,8 @@ Nothing to describe.
 {% endif %}
 
 Confidence: `confirmed` (stated by the application itself), `likely` (strong indirect signal),
-`guessed` (weak signal). Evidence references are listed in profile.json.
+`guessed` (weak signal). Evidence references are listed in profile.json. "detected:" marks a
+confidence lowered by the profile author, with the reason.
 {% else %}
 No technologies were identified.
 {% endif %}

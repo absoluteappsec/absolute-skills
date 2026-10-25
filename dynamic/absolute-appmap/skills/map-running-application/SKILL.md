@@ -159,7 +159,8 @@ developers, or a test-generation step follows.
 
 `appmap profile --run <run>` (one `--run` per environment of the same application) writes
 `profile.json`, `APP-PROFILE.md` and a `profile-names.yaml` stub; you fill the purpose and
-feature names, descriptions and "how it works" with evidence refs, and re-run. Statuses:
+feature names, descriptions and "how it works" with evidence refs (and optional confidence
+downgrades), and re-run until `next` is `null`. Statuses:
 `profiled`, `partial` (something could not be determined), `error`.
 
 ---

@@ -320,8 +320,10 @@ $A profile --run "$RUN" --out /tmp/profile --include-observed-accounts         #
   could not determine. Descriptive only.
 - `profile-names.yaml` — `purpose` plus, per feature `key`, `name` / `description` /
   `how_it_works` (and the generated `suggestion`); `stale` keeps entries whose feature
-  disappeared. Fill it, rerun the same `profile` command; `next` is `null` once the purpose and
-  every feature name are set.
+  disappeared; `technology_overrides` (`name`, `category`, `confidence`, `reason`) lowers a
+  detected confidence — upgrades are refused with a warning. Fill it, rerun the same `profile`
+  command; `next` is `null` once the purpose is set and every feature has a name other than
+  its suggestion, or a description.
 
 With several `--run`s the runs are treated as environments of one application: top-level
 sections describe the first run, `other_runs` the rest, and `differences` lists technologies,

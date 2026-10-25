@@ -233,15 +233,22 @@ def _har_decoded(data: bytes) -> bytes:
     return b"\n".join(out)
 
 
-def assert_no_secrets(run: Path, secrets: set[str]) -> None:
-    """Review Focus 3: no password, raw sid cookie or JWT anywhere in the run directory —
-    neither verbatim nor base64-encoded, and not inside base64 HAR bodies."""
+def _needles(secrets: set[str]) -> dict[bytes, bytes]:
+    """Every byte form to search for (fixture passwords and ``secrets``, verbatim and base64)
+    mapped to the secret it encodes."""
     raw = {s.encode() for s in set(PASSWORDS) | secrets if s}
     assert len(raw) > len(PASSWORDS), "no session secret was captured from the fixture"
     needles = {n: n for n in raw}
     for n in raw:
         for form in _b64_forms(n):
             needles[form] = n
+    return needles
+
+
+def assert_no_secrets(run: Path, secrets: set[str]) -> None:
+    """Review Focus 3: no password, raw sid cookie or JWT anywhere in the run directory —
+    neither verbatim nor base64-encoded, and not inside base64 HAR bodies."""
+    needles = _needles(secrets)
     hits = []
     files = [p for p in run.rglob("*") if p.is_file()]
     assert any(p.suffix == ".har" for p in files)

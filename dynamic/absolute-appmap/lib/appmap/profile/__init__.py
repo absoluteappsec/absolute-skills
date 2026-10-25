@@ -90,7 +90,10 @@ def _run_sections(run_dir: Path, rd, mask: bool) -> dict:
     return {"sections": out, "facts": facts, "basics": b, "failed": failed}
 
 
-def _run_gaps(run_dir: Path, rid: str, got: dict) -> tuple[list, list]:
+_SCHEMA_TECHS = ("OpenAPI", "GraphQL")
+
+
+def _run_gaps(run_dir: Path, rid: str, got: dict, techs: list[dict]) -> tuple[list, list]:
     import json
 
     sections, b = got["sections"], got["basics"]
@@ -119,8 +122,14 @@ def _run_gaps(run_dir: Path, rid: str, got: dict) -> tuple[list, list]:
                     "reason": "crawl not finished: " + ", ".join(parts)})
     if not any(e["source"] in ("openapi", "graphql") for e in sections["data_model"]) \
             and not any(n == "data_model" for n, _ in got["failed"]):
-        warn.append(f"run {rid}: no API schema (OpenAPI/GraphQL) found; the data model is "
-                    "inferred from observed traffic")
+        captured = sorted({t["name"] for t in techs if t["name"] in _SCHEMA_TECHS
+                           and any(ev["kind"] == "schema" for ev in t["evidence"])})
+        if captured:
+            warn.append(f"run {rid}: the captured {'/'.join(captured)} schema has no entity "
+                        "types; the data model is inferred from observed traffic")
+        else:
+            warn.append(f"run {rid}: no API schema (OpenAPI/GraphQL) found; the data model "
+                        "is inferred from observed traffic")
     return cnd, warn
 
 
@@ -170,11 +179,12 @@ def build_profile(run_dirs: list[Path], *, include_observed_accounts: bool = Fal
     per_run, facts = [], []
     for d, rd in zip(dirs, rds):
         got = _run_sections(d, rd, mask)
-        cnd, warn = _run_gaps(d, rd.run_id, got)
+        techs = _technologies_safe(d, rd.run_id, could_not)
+        cnd, warn = _run_gaps(d, rd.run_id, got, techs)
         could_not += cnd
         warnings += warn
         per_run.append(got["sections"])
-        facts.append({**got["facts"], "technologies": _technologies_safe(d, rd.run_id, could_not)})
+        facts.append({**got["facts"], "technologies": techs})
 
     merged = multirun.merge(facts)
     warnings += merged["warnings"]
