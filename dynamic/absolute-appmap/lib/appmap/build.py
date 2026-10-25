@@ -25,8 +25,8 @@ from appmap import SCHEMA_VERSION
 from appmap.store import Store
 
 __all__ = ["derive_flows", "derive_value_links", "derive_preconditions", "emit_naming_stub",
-           "apply_names", "created_records", "export_json", "render_app_map", "build_map", "INTERNAL_TABLES",
-           "is_internal_meta_key"]
+           "apply_names", "created_records", "export_json", "render_app_map", "build_map",
+           "INTERNAL_TABLES", "is_internal_meta_key"]
 
 # Crawl-internal tables: never exported, documented as internal in SCHEMA.md.
 INTERNAL_TABLES = ("frontier", "frontier_links")

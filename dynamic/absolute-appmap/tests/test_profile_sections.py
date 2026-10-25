@@ -301,3 +301,83 @@ def test_coverage_ssr(ssr_built_run):
     assert set(out["unexercised"]) >= {"unexercised_endpoints", "unreached_routes"}
     assert out["approvals"]["pending"] >= 1 and out["approvals"]["denied"] >= 1
     assert set(out["approvals"]) == {"pending", "denied", "skipped"}
+
+
+# ------------------------------------------------------------ fix round 1
+def _stub_run(tmp_path, exchanges, run_id="20260101-000000"):
+    root = tmp_path / f"appmap-x-{run_id}"
+    (root / "bodies").mkdir(parents=True)
+    (root / "run.json").write_text(json.dumps({"run_id": run_id, "config": {}}))
+    s = Store(root / "appmap.sqlite")
+    s.init_schema()
+    for kw in exchanges:
+        s.add_exchange(None, "admin", "ui", **kw)
+    s.close()
+    return Store.open_readonly(root / "appmap.sqlite"), run_id
+
+
+def test_accounts_created_by_run_marker_and_signup(tmp_path):
+    m = "appmap-20260101-000000"
+    store, rid = _stub_run(tmp_path, [
+        dict(method="POST", url="http://x/register", status=302,
+             req_headers={"content-type": "application/x-www-form-urlencoded"},
+             req_body=f"username={m}-u&email={m}%40example.com&password=Zz9!"),
+        dict(method="POST", url="http://x/api/v1/members", status=201,
+             req_headers={"content-type": "application/json"},
+             req_body=json.dumps({"email": f"{m}@corp.example", "role": "x"})),
+        dict(method="POST", url="http://x/signup", status=302,
+             req_body="username=realperson&email=real.person%40corp.example"),
+        dict(method="POST", url="http://x/api/widgets", status=201,
+             req_body=json.dumps({"name": "w"})),
+    ])
+    plain = accounts(store, rid, mask=False)["created_by_run"]
+    masked = accounts(store, rid, mask=True)["created_by_run"]
+    store.close()
+    by = {c["endpoint"]: c for c in masked}
+    assert set(by) == {"/register", "/api/v1/members", "/signup"}
+    assert by["/register"]["username"] == f"{m}-u"            # run-generated: unmasked
+    assert by["/register"]["email"] == f"{m}@example.com"
+    assert by["/api/v1/members"]["email"] == f"{m}@corp.example"
+    assert by["/api/v1/members"]["username"] is None
+    assert by["/signup"]["username"] == "r***" and by["/signup"]["email"] == "r***@corp.example"
+    assert {c["endpoint"]: c for c in plain}["/signup"]["username"] == "realperson"
+    assert "Zz9" not in json.dumps(plain)
+
+
+def test_observed_rejects_token_like_values(tmp_path):
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r"
+    store, rid = _stub_run(tmp_path, [dict(
+        method="GET", url="http://x/api/me", status=200, content_type="application/json",
+        resp_body=json.dumps({"user": jwt, "login": "deadbeefcafe1234abcd",
+                              "username": "bcdfghjklmnpq", "email": "ok@corp.example",
+                              "x": {"user": "QUJDREVGR0hJSktMTU5PUFFSU1RVVldY"}}))])
+    out = accounts(store, rid, mask=False)["observed"]
+    store.close()
+    assert [o["value"] for o in out] == ["ok@corp.example"]
+
+
+def test_observed_marker_identity_unmasked(tmp_path):
+    m = "appmap-20260101-000000"
+    store, rid = _stub_run(tmp_path, [dict(
+        method="GET", url="http://x/api/users", status=200, content_type="application/json",
+        resp_body=json.dumps([{"username": f"{m}-u"}, {"username": "chris"}]))])
+    vals = {o["value"] for o in accounts(store, rid, mask=True)["observed"]}
+    store.close()
+    assert vals == {f"{m}-u", "c***"}
+
+
+def test_mailto_percent_decoded(tmp_path):
+    store, rid = _stub_run(tmp_path, [dict(
+        method="GET", url="http://x/c", status=200, content_type="text/html",
+        resp_body='<a href="mailto:a%2Bb%40corp.example">m</a>')])
+    vals = [o["value"] for o in accounts(store, rid, mask=False)["observed"]]
+    store.close()
+    assert vals == ["a+b@corp.example"]
+
+
+def test_created_records_capped(tmp_path):
+    store, rid = _stub_run(tmp_path, [
+        dict(method="POST", url=f"http://x/api/things/{i}", status=201) for i in range(120)])
+    out = data_setup(store, rid)
+    store.close()
+    assert len(out["created_records"]) == 100 and out["created_records_more"] == 20

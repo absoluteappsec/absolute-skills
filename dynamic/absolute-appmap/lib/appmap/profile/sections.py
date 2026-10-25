@@ -8,9 +8,9 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
-from appmap.build import created_records
+from appmap.build import created_records, marker_variants, run_marker
 from appmap.gaps import compute_gaps
 from appmap.probe.schemas import load_spec
 from appmap.profile.evidence import MAX_EVIDENCE_TEXT, _is_schema, _read_body
@@ -471,7 +471,13 @@ _OBSERVED_KEYS = {"username", "email", "user", "login"}
 _EMAIL = re.compile(r"^[^@\s<>\"']{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,}$")
 _NAME = re.compile(r"^[A-Za-z0-9][\w.@+-]{0,63}$")
 _MAILTO = re.compile(r"mailto:([^\"'<>\s?#&]{3,200})", re.I)
-_SIGNUP_PATH = re.compile(r"regist|sign[-_]?up|users?(/new)?$|accounts?(/new)?$", re.I)
+_SIGNUP_PATH = re.compile(
+    r"(?:^|/)(?:regist\w*|sign[-_]?up|join|users?|accounts?|members?|create-?account|"
+    r"new-?user)(?:/|$|\.)", re.I)
+_BODY_ID_KEY = re.compile(r"^(?:user[_-]?name|e[_-]?mail|login|user)$", re.I)
+_TOKENISH = (re.compile(r"^[\w-]{8,}\.[\w-]{8,}\.[\w-]{4,}$"), re.compile(r"^[0-9a-fA-F]{16,}$"),
+             re.compile(r"^[A-Za-z0-9+/]{20,}={0,2}$"))
+MAX_CREATED = 100
 _LIST_CAP = 5000
 _NOISE_OUTCOMES = {"not_tested"}
 
@@ -610,11 +616,12 @@ def data_setup(store: Store, run_id: str) -> dict:
     fixtures = bool(form_data.get("fixtures")) or (store.db_path.parent / "fixtures.yaml").exists()
     return {
         "preconditions": pre,
+        "created_records_more": max(len(records) - MAX_CREATED, 0),
         "created_records": [{
             "exchange_id": r["id"], "role": r["role"], "method": r["method"],
             "endpoint": r.get("path_pattern") or urlsplit(_redactor.url(r["url"] or "")).path,
             "status": r["status"], "marker": r.get("marker") or "",
-            "ref": _exref(run_id, r["id"])} for r in records],
+            "ref": _exref(run_id, r["id"])} for r in records[:MAX_CREATED]],
         "fixtures_used": fixtures,
         "seed_observations": _seed_observations(store, _created_ids(store, records)),
     }
@@ -628,6 +635,14 @@ def mask_identity(s: str) -> str:
     return (local[:1] + "***" + at + domain) if local else s
 
 
+def _tokenish(v: str) -> bool:
+    """Values that look like tokens rather than account names."""
+    part = v.split("@", 1)[0]
+    return (any(rx.match(part) for rx in _TOKENISH)
+            or (len(part) >= 12 and not re.search(r"[aeiouAEIOU]", part))
+            or _redactor.text(v) != v)
+
+
 def _identities(doc, depth: int = 0):
     if depth > 6:
         return
@@ -635,7 +650,8 @@ def _identities(doc, depth: int = 0):
         for k, v in doc.items():
             if isinstance(v, str) and str(k).lower() in _OBSERVED_KEYS \
                     and not _SENSITIVE_NAME.search(str(k)):
-                if _EMAIL.match(v) or (str(k).lower() != "email" and _NAME.match(v)):
+                if (_EMAIL.match(v) or (str(k).lower() != "email" and _NAME.match(v))) \
+                        and not _tokenish(v):
                     yield v
             elif isinstance(v, (dict, list)):
                 yield from _identities(v, depth + 1)
@@ -664,11 +680,48 @@ def _observed_identities(store: Store, run_id: str) -> list[tuple[str, int]]:
             doc = _loads_any(body)
             found += list(_identities(doc)) if doc is not None else []
         else:
-            found += [m for m in _MAILTO.findall(body) if _EMAIL.match(m)]
+            found += [m for m in (unquote(m) for m in _MAILTO.findall(body))
+                      if _EMAIL.match(m)]
         for v in found:
             if len(seen) < _OBSERVED_CAP:
                 seen.setdefault(v, x["id"])
     return list(seen.items())
+
+
+def _flat_pairs(doc, out: list, depth: int = 0) -> None:
+    if depth > 6:
+        return
+    if isinstance(doc, dict):
+        for k, v in doc.items():
+            if isinstance(v, str):
+                out.append((str(k), v))
+            else:
+                _flat_pairs(v, out, depth + 1)
+    elif isinstance(doc, list):
+        for v in doc[:50]:
+            _flat_pairs(v, out, depth + 1)
+
+
+def _body_identities(store: Store, exchange_id: int) -> list[tuple[str, str]]:
+    """Identity-keyed (key, value) pairs of a request body: JSON, urlencoded or multipart."""
+    x = store.conn.execute("SELECT req_body, req_body_path FROM exchanges WHERE id=?",
+                           (exchange_id,)).fetchone()
+    body = _read_body(store.db_path.parent, x["req_body"], x["req_body_path"]) if x else None
+    if not body:
+        return []
+    pairs: list[tuple[str, str]] = []
+    doc = _loads_any(body) if body.lstrip()[:1] in "{[" else None
+    if doc is not None:
+        _flat_pairs(doc, pairs)
+    else:
+        pairs += parse_qsl(body, keep_blank_values=False) if "Content-Disposition" not in body \
+            else re.findall(r'name="([^"]+)"\r?\n(?:[^\r\n]+\r?\n)*\r?\n([^\r\n]*)', body)
+    out = []
+    for k, v in pairs:
+        v = v.strip()
+        if _BODY_ID_KEY.match(k) and 0 < len(v) <= 120 and not _tokenish(v):
+            out.append((k.lower(), v))
+    return out
 
 
 def accounts(store: Store, run_id: str, *, mask: bool) -> dict:
@@ -682,12 +735,33 @@ def accounts(store: Store, run_id: str, *, mask: bool) -> dict:
               "reachable_routes": counts.get((r["name"], "route"), 0),
               "reachable_endpoints": counts.get((r["name"], "endpoint"), 0)}
              for r in conn.execute("SELECT name, login_type, auth_ok FROM roles ORDER BY name")]
-    created = [{"exchange_id": r["id"], "role": r["role"], "method": r["method"],
-                "endpoint": r.get("path_pattern") or urlsplit(r["url"] or "").path,
-                "ref": _exref(run_id, r["id"])}
-               for r in created_records(store)
-               if _SIGNUP_PATH.search(urlsplit(r["url"] or "").path.rstrip("/").rsplit("/", 1)[-1])]
-    observed = [{"value": mask_identity(v) if mask else v, "where": _exref(run_id, xid)}
+    marker = run_marker(store)
+    variants = marker_variants(store, marker) if marker else set()
+
+    def is_ours(v: str) -> bool:
+        return any(m and m in v for m in variants)
+
+    def shown(v: str | None) -> str | None:
+        if v is None:
+            return None
+        return v if (is_ours(v) or not mask) else mask_identity(v)
+
+    created = []
+    for r in created_records(store):
+        path = urlsplit(r["url"] or "").path
+        ids = _body_identities(store, r["id"])
+        if not ids:
+            continue
+        if not (any(is_ours(v) for _, v in ids) or _SIGNUP_PATH.search(path)):
+            continue
+        email = next((v for _, v in ids if _EMAIL.match(v)), None)
+        user = next((v for k, v in ids if v != email and not _EMAIL.match(v)), None)
+        created.append({
+            "exchange_id": r["id"],
+            "endpoint": r.get("path_pattern") or urlsplit(_redactor.url(r["url"] or "")).path,
+            "username": shown(user), "email": shown(email), "ref": _exref(run_id, r["id"])})
+    observed = [{"value": (v if (is_ours(v) or not mask) else mask_identity(v)),
+                 "where": _exref(run_id, xid)}
                 for v, xid in _observed_identities(store, run_id)]
     return {"roles": roles, "created_by_run": created, "observed": observed}
 
