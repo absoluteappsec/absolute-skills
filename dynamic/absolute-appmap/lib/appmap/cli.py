@@ -583,9 +583,8 @@ def cmd_profile(args) -> int:
     runs = [Path(r) for r in args.run]
     out = Path(args.out) if args.out else runs[0]
     try:
-        if args.out:
-            out.mkdir(parents=True, exist_ok=True)
         profile = build_profile(runs, include_observed_accounts=args.include_observed_accounts)
+        out.mkdir(parents=True, exist_ok=True)
         names_path = out / "profile-names.yaml"
         warnings = emit_profile_names(profile, names_path)
         applied = apply_profile_names(profile, names_path)

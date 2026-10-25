@@ -3,6 +3,10 @@
 Generated {{ p.generated_at }} (profile schema {{ p.profile_schema_version }}, status: {{ p.status }}).
 This document describes what was observed in the mapped run(s); it is descriptive only.
 
+{% if p.environments | length > 1 %}
+This profile has {{ p.environments | length }} environments. The sections below describe the first run, `{{ p.environments[0].run_id }}`{% if p.environments[0].base_urls %} ({{ p.environments[0].base_urls | join(", ") }}){% endif %}. See Environments for how the other runs differ, and `other_runs` in profile.json for their full sections.
+
+{% endif %}
 {% if production %}
 > **Handling notice:** at least one input run used the `production` profile. This profile and
 > the run directories it was built from may contain real production customer data, including
@@ -123,10 +127,10 @@ API groups:
 {% endif %}
 
 {% endif %}
-{% if layout.entry_points %}
+{% if layout.get("entry_points") %}
 Entry points by role:
 
-{% for role, urls in layout.entry_points.items() %}
+{% for role, urls in layout["entry_points"].items() %}
 - {{ role | cell }}: {% for u in urls[:5] %}`{{ u | cell }}`{% if not loop.last %}, {% endif %}{% endfor %}{% if urls | length > 5 %} (+{{ urls | length - 5 }} more){% endif %}
 
 {% endfor %}
@@ -200,11 +204,11 @@ Pre-existing data observed (ids not created by the run):
 {% endif %}
 
 {% endif %}
-{% if setup.fixtures_used %}
+{% if setup.get("fixtures_used") %}
 Form fixtures (`fixtures.yaml`) were used for this run.
 
 {% endif %}
-{% if not preconditions and not records and not seeds and not setup.fixtures_used %}
+{% if not preconditions and not records and not seeds and not setup.get("fixtures_used") %}
 No data setup was observed.
 
 {% endif %}
@@ -225,7 +229,7 @@ No data setup was observed.
 No roles recorded.
 
 {% endif %}
-{% if accounts.created_by_run %}
+{% if accounts.get("created_by_run") %}
 Accounts created during the run:
 
 {% for a in accounts.created_by_run[:25] %}
@@ -236,8 +240,8 @@ Accounts created during the run:
 {% endif %}
 
 {% endif %}
-{% if accounts.observed %}
-Identities observed in responses{% if production %} (masked){% endif %}:
+{% if accounts.get("observed") %}
+Identities observed in responses{% if p.get("observed_accounts_masked") %} (masked){% endif %}:
 
 {% for o in accounts.observed[:25] %}
 - `{{ o.value | cell }}`
@@ -308,12 +312,12 @@ Observed access outcome per feature and role:
 {% endif %}
 
 {% endif %}
-{% if coverage.unexercised %}
-Not exercised by the run: {% for k, v in coverage.unexercised.items() %}{{ k | replace("_", " ") }} {{ v }}{% if not loop.last %}; {% endif %}{% endfor %}.
+{% if coverage.get("unexercised") %}
+Not exercised by the run: {% for k, v in coverage["unexercised"].items() %}{{ k | replace("_", " ") }} {{ v }}{% if not loop.last %}; {% endif %}{% endfor %}.
 
 {% endif %}
-{% if coverage.approvals %}
-Approval queue: {{ coverage.approvals.pending }} pending, {{ coverage.approvals.denied }} denied, {{ coverage.approvals.skipped }} skipped.
+{% if coverage.get("approvals") %}
+Approval queue: {{ coverage["approvals"].pending }} pending, {{ coverage["approvals"].denied }} denied, {{ coverage["approvals"].skipped }} skipped.
 
 {% endif %}
 ## Could not determine

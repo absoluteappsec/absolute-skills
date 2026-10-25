@@ -7,6 +7,7 @@ than reported as stale.
 """
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
@@ -102,7 +103,12 @@ def emit_profile_names(profile: dict, path: Path) -> list[str]:
     purpose = doc.get("purpose") if isinstance(doc.get("purpose"), str) else ""
     out = {"purpose": purpose, "features": features + known_left,
            "stale": list(stale.values()) + stale_left}
-    path.write_text(yaml.safe_dump(out, sort_keys=False, allow_unicode=True))
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(yaml.safe_dump(out, sort_keys=False, allow_unicode=True))
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return []
 
 

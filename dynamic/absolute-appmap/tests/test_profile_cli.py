@@ -129,3 +129,92 @@ def test_rerun_keeps_names(ssr_built_run, tmp_path, capsys):
     assert yaml.safe_load(names.read_text())["features"][0]["name"] == "Renamed Feature"
     assert json.loads((run / "profile.json").read_text())["purpose"] == \
         "A project tracker for teams."
+
+
+def test_names_emit_is_atomic(ssr_built_run, tmp_path, capsys, monkeypatch):
+    import os
+
+    from appmap.profile import names
+
+    run = _copy_run(ssr_built_run, tmp_path / "run")
+    _profile(capsys, "--run", str(run))
+    path = run / "profile-names.yaml"
+    path.write_text("purpose: keep me\nfeatures: []\nstale: []\n")
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(os, "replace", boom)
+    profile = {"features": [{"key": "ft-x", "name_suggestion": "X"}]}
+    try:
+        names.emit_profile_names(profile, path)
+    except OSError:
+        pass
+    assert path.read_text() == "purpose: keep me\nfeatures: []\nstale: []\n"
+    assert not list(run.glob("*.tmp"))
+
+
+def test_multi_run_notice_and_differences(ssr_built_run, tmp_path, capsys):
+    a = _copy_run(ssr_built_run, tmp_path / "a")
+    b = _copy_run(ssr_built_run, tmp_path / "b")
+    meta = json.loads((b / "run.json").read_text())
+    meta["run_id"] = "second-env"
+    (b / "run.json").write_text(json.dumps(meta))
+    con = sqlite3.connect(b / "appmap.sqlite")
+    con.execute("INSERT INTO routes (pattern, host, kind) VALUES ('/only-in-b', 'h', 'page')")
+    con.execute("INSERT INTO endpoints (method, host, path_pattern, kind) "
+                "VALUES ('GET', 'h', '/api/only-in-b', 'rest')")
+    con.execute("UPDATE exchanges SET resp_headers = replace(resp_headers, "
+                "'Werkzeug/3.1.9', 'Werkzeug/9.9.9')")
+    con.execute("UPDATE role_access SET outcome='forbidden' WHERE role='alice' "
+                "AND item_kind='route' AND rowid=(SELECT min(rowid) FROM role_access "
+                "WHERE role='alice' AND item_kind='route' AND outcome='allowed')")
+    con.commit()
+    con.close()
+    rc, st = _profile(capsys, "--run", str(a), "--run", str(b))
+    assert rc == 0 and st["counts"]["environments"] == 2
+    md = (a / "APP-PROFILE.md").read_text()
+    first = json.loads((a / "run.json").read_text())["run_id"]
+    notice = md[:md.index("## Purpose")]
+    assert "2 environments" in notice and first in notice and "other_runs" in notice
+    env = md[md.index("## Environments"):md.index("## Coverage orientation")]
+    assert f"| `{first}` |" in env and "| `second-env` |" in env
+    assert "Route `/only-in-b` only in second-env" in env
+    assert "Endpoint `GET /api/only-in-b` only in second-env" in env
+    assert "Technology Werkzeug" in env and "9.9.9" in env
+    assert "Role alice" in env
+
+
+def test_partial_profile_renders(ssr_built_run, tmp_path, capsys):
+    run = _copy_run(ssr_built_run, tmp_path / "run")
+    (run / "run.json").write_text("{not json")
+    con = sqlite3.connect(run / "appmap.sqlite")
+    con.execute("DROP TABLE forms")
+    con.commit()
+    con.close()
+    rc, st = _profile(capsys, "--run", str(run))
+    assert rc == 0 and st["status"] == "partial"
+    md = (run / "APP-PROFILE.md").read_text()
+    assert md.index("## Could not determine") < md.index("## Where to dig deeper")
+    assert "run metadata" in md and "could not read" in md
+
+
+def test_masked_label_only_when_masked(ssr_built_run, tmp_path, capsys):
+    prod = _copy_run(ssr_built_run, tmp_path / "prod", production=True,
+                     identity="jane.doe@corp.example")
+    _profile(capsys, "--run", str(prod))
+    assert "(masked)" in (prod / "APP-PROFILE.md").read_text()
+    _profile(capsys, "--run", str(prod), "--include-observed-accounts")
+    md = (prod / "APP-PROFILE.md").read_text()
+    assert "jane.doe@corp.example" in md and "(masked)" not in md
+
+
+def test_next_roundtrips_paths_with_spaces(ssr_built_run, tmp_path, capsys):
+    import shlex
+
+    run = _copy_run(ssr_built_run, tmp_path / "my run dir")
+    out = tmp_path / "out dir"
+    rc, st = _profile(capsys, "--run", str(run), "--out", str(out))
+    words = shlex.split(st["next"])
+    assert str(out / "profile-names.yaml") in words
+    assert words[words.index("appmap"):][:4] == ["appmap", "profile", "--run", str(run)]
+    assert words[-2:] == ["--out", str(out)]

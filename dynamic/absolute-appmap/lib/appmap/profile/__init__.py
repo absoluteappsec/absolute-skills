@@ -184,6 +184,7 @@ def build_profile(run_dirs: list[Path], *, include_observed_accounts: bool = Fal
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "status": "partial" if could_not else "profiled",
         "warnings": warnings,
+        "observed_accounts_masked": mask,
         "could_not_determine": could_not,
         "environments": envs,
         "technologies": merged["technologies"],
