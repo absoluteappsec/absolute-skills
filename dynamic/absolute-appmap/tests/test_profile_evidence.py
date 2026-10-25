@@ -108,3 +108,15 @@ def test_yaml_schema_needs_yaml_or_text_type(tmp_path):
     s.close()
     schema_urls = [e.url for e in iter_evidence(root) if e.kind == "schema"]
     assert schema_urls == ["http://x/spec", "http://x/docs/api.yml", "http://x/notes"]
+
+
+def test_css_kind(tmp_path):
+    root, s = _run(tmp_path)
+    s.add_exchange(None, "r", "ui", method="GET", url="http://x/static/site.css", status=200,
+                   content_type="text/css", resp_body="/*! Bootstrap v5.3.2 */ a{}")
+    s.add_exchange(None, "r", "ui", method="GET", url="http://x/static/missing.css", status=404,
+                   content_type="text/html", resp_body="<html>Not Found</html>")
+    s.close()
+    kinds = [(e.kind, e.url) for e in iter_evidence(root) if e.kind != "header"]
+    assert kinds == [("css", "http://x/static/site.css"),
+                     ("error_page", "http://x/static/missing.css")]

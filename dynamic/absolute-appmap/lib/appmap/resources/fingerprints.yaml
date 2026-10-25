@@ -4,7 +4,7 @@
 # exactly one capture group, or null), confidence (confirmed | likely), implies (list of
 # {tech, category}, or null).
 #
-# Evidence kinds: header ("Name: value" lines), cookie (one cookie name), html, script,
+# Evidence kinds: header ("Name: value" lines), cookie (one cookie name), html, script, css,
 # source_map (the map's source paths), schema, spa, error_page, auth (login summary line:
 # "role=... login_type=... auth_ok=... fields=a,b token_headers=x,y").
 #
@@ -14,7 +14,13 @@
 # rules matching the same technology make it confirmed; implied technologies are likely.
 #
 # Version regexes must be anchored to a banner, header or path form (never a bare "v1.2" or
-# `version: "2"` anywhere in a bundle) - app code is full of such strings.
+# `version: "2"` anywhere in a bundle) - app code is full of such strings. Banner rules must
+# also exclude sibling packages that share a banner style (React's banner is reused by
+# scheduler/react-is; jQuery UI, Bootstrap Icons, @vue/* have their own banners).
+#
+# Performance: bodies are up to 2 MiB and may be hostile. Start patterns with a literal, never
+# use unbounded `[^>]+`/`[^"]*` scans inside tags, and use `[ \t]*` (not `\s*`) after `^` in
+# multi-line patterns so runs of newlines cannot cause quadratic backtracking.
 #
 # Categories: language, server_framework, frontend_framework, js_library, css_framework,
 # web_server, app_server, cdn_proxy, auth, api_style, third_party.
@@ -59,9 +65,16 @@ rules:
   - tech: Django REST Framework
     category: server_framework
     evidence: [html, error_page, schema]
-    match: 'Django REST framework</(?:a|title)>|/static/rest_framework/'
+    match: 'Django REST framework</(?:a|title)>'
     version: null
     confidence: confirmed
+    implies: [{tech: Django, category: server_framework}, {tech: Python, category: language}]
+  - tech: Django REST Framework
+    category: server_framework
+    evidence: [html, error_page]
+    match: '/static/rest_framework/'
+    version: null
+    confidence: likely
     implies: [{tech: Django, category: server_framework}, {tech: Python, category: language}]
   - tech: drf-spectacular
     category: server_framework
@@ -77,7 +90,7 @@ rules:
     category: server_framework
     evidence: [schema]
     # drf-spectacular's default session security scheme (`cookieAuth`, cookie `sessionid`).
-    match: '(?s)\bcookieAuth\b["'']?\s*:\s*\{?\s*["'']?type["'']?\s*:\s*["'']?apiKey["'']?\s*,?\s*["'']?in["'']?\s*:\s*["'']?cookie["'']?\s*,?\s*["'']?name["'']?\s*:\s*["'']?sessionid\b'
+    match: '(?s)cookieAuth\b["'']?\s*:\s*\{?\s*["'']?type["'']?\s*:\s*["'']?apiKey["'']?\s*,?\s*["'']?in["'']?\s*:\s*["'']?cookie["'']?\s*,?\s*["'']?name["'']?\s*:\s*["'']?sessionid\b'
     version: null
     confidence: likely
     implies: *drf
@@ -93,9 +106,16 @@ rules:
   - tech: Werkzeug
     category: app_server
     evidence: [error_page, html]
-    match: '// Werkzeug Debugger</title>|\?__debugger__=yes&amp;cmd=resource'
+    match: '// Werkzeug Debugger</title>'
     version: null
     confidence: confirmed
+    implies: [{tech: Flask, category: server_framework}, {tech: Python, category: language}]
+  - tech: Werkzeug
+    category: app_server
+    evidence: [error_page, html]
+    match: '\?__debugger__=yes&amp;cmd=resource'
+    version: null
+    confidence: likely
     implies: [{tech: Flask, category: server_framework}, {tech: Python, category: language}]
   - tech: Python
     category: language
@@ -167,16 +187,23 @@ rules:
   - tech: Laravel
     category: server_framework
     evidence: [error_page]
-    match: 'Illuminate\\\\?[A-Z]\w+|Whoops\\\\?Run\b|Laravel v\d'
-    version: '\bLaravel v(\d+\.\d+\.\d+)\b'
+    match: 'Laravel v\d'
+    version: 'Laravel v(\d+\.\d+\.\d+)\b'
     confidence: confirmed
+    implies: [{tech: PHP, category: language}]
+  - tech: Laravel
+    category: server_framework
+    evidence: [error_page]
+    match: 'Illuminate\\\\?[A-Z]\w{1,60}|Whoops\\\\?Run\b'
+    version: null
+    confidence: likely
     implies: [{tech: PHP, category: language}]
 
   # ---------------------------------------------------------------- Node.js / Express
   - tech: Express
     category: server_framework
     evidence: [header]
-    match: '(?im)^x-powered-by:\s*Express\b'
+    match: '(?im)^x-powered-by:[ \t]*Express\b'
     version: null
     confidence: confirmed
     implies: [{tech: Node.js, category: language}]
@@ -208,14 +235,14 @@ rules:
   - tech: ASP.NET
     category: server_framework
     evidence: [header]
-    match: '(?im)^x-aspnet-version:\s*\d'
-    version: '(?im)^x-aspnet-version:\s*(\d+\.\d+(?:\.\d+)*)'
+    match: '(?im)^x-aspnet-version:[ \t]*\d'
+    version: '(?im)^x-aspnet-version:[ \t]*(\d+\.\d+(?:\.\d+)*)'
     confidence: confirmed
     implies: [{tech: 'C#', category: language}]
   - tech: ASP.NET
     category: server_framework
     evidence: [header]
-    match: '(?im)^x-powered-by:\s*ASP\.NET\b'
+    match: '(?im)^x-powered-by:[ \t]*ASP\.NET\b'
     version: null
     confidence: confirmed
     implies: [{tech: 'C#', category: language}]
@@ -236,8 +263,8 @@ rules:
   - tech: ASP.NET MVC
     category: server_framework
     evidence: [header]
-    match: '(?im)^x-aspnetmvc-version:\s*\d'
-    version: '(?im)^x-aspnetmvc-version:\s*(\d+\.\d+(?:\.\d+)*)'
+    match: '(?im)^x-aspnetmvc-version:[ \t]*\d'
+    version: '(?im)^x-aspnetmvc-version:[ \t]*(\d+\.\d+(?:\.\d+)*)'
     confidence: confirmed
     implies: [{tech: ASP.NET, category: server_framework}, {tech: 'C#', category: language}]
 
@@ -245,8 +272,8 @@ rules:
   - tech: nginx
     category: web_server
     evidence: [header]
-    match: '(?im)^server:\s*nginx\b'
-    version: '(?im)^server:\s*nginx/(\d+\.\d+(?:\.\d+)?)'
+    match: '(?im)^server:[ \t]*nginx\b'
+    version: '(?im)^server:[ \t]*nginx/(\d+\.\d+(?:\.\d+)?)'
     confidence: confirmed
     implies: null
   - tech: nginx
@@ -259,8 +286,8 @@ rules:
   - tech: Apache HTTP Server
     category: web_server
     evidence: [header]
-    match: '(?im)^server:\s*Apache\b(?!-Coyote)'
-    version: '(?im)^server:\s*Apache/(\d+\.\d+(?:\.\d+)?)'
+    match: '(?im)^server:[ \t]*Apache\b(?!-Coyote)'
+    version: '(?im)^server:[ \t]*Apache/(\d+\.\d+(?:\.\d+)?)'
     confidence: confirmed
     implies: null
   - tech: Apache HTTP Server
@@ -273,21 +300,21 @@ rules:
   - tech: IIS
     category: web_server
     evidence: [header]
-    match: '(?im)^server:\s*Microsoft-IIS\b'
-    version: '(?im)^server:\s*Microsoft-IIS/(\d+\.\d+)'
+    match: '(?im)^server:[ \t]*Microsoft-IIS\b'
+    version: '(?im)^server:[ \t]*Microsoft-IIS/(\d+\.\d+)'
     confidence: confirmed
     implies: null
   - tech: gunicorn
     category: app_server
     evidence: [header]
-    match: '(?im)^server:\s*gunicorn\b'
-    version: '(?im)^server:\s*gunicorn/(\d+\.\d+(?:\.\d+)?)'
+    match: '(?im)^server:[ \t]*gunicorn\b'
+    version: '(?im)^server:[ \t]*gunicorn/(\d+\.\d+(?:\.\d+)?)'
     confidence: confirmed
     implies: [{tech: Python, category: language}]
   - tech: uvicorn
     category: app_server
     evidence: [header]
-    match: '(?im)^server:\s*uvicorn\b'
+    match: '(?im)^server:[ \t]*uvicorn\b'
     version: null
     confidence: confirmed
     implies: [{tech: Python, category: language}]
@@ -296,31 +323,54 @@ rules:
   - tech: Cloudflare
     category: cdn_proxy
     evidence: [header]
-    match: '(?im)^server:\s*cloudflare\b|^cf-ray:'
+    match: '(?im)^server:[ \t]*cloudflare\b'
+    version: null
+    confidence: confirmed
+    implies: null
+  - tech: Cloudflare
+    category: cdn_proxy
+    evidence: [header]
+    match: '(?im)^cf-ray:'
+    version: null
+    confidence: likely
+    implies: null
+  - tech: Amazon CloudFront
+    category: cdn_proxy
+    evidence: [header]
+    match: '(?im)^via:[^\n]*\(CloudFront\)|^x-cache:[^\n]*\bcloudfront\b'
     version: null
     confidence: confirmed
     implies: null
   - tech: Amazon CloudFront
     category: cdn_proxy
     evidence: [header]
-    match: '(?im)^via:[^\n]*\(CloudFront\)|^x-amz-cf-id:|^x-cache:[^\n]*\bcloudfront\b'
+    match: '(?im)^x-amz-cf-(?:id|pop):'
+    version: null
+    confidence: likely
+    implies: null
+  - tech: Fastly
+    category: cdn_proxy
+    evidence: [header]
+    match: '(?im)^(?:x-)?fastly-[a-z-]+:'
     version: null
     confidence: confirmed
     implies: null
   - tech: Fastly
     category: cdn_proxy
     evidence: [header]
-    match: '(?im)^(?:x-)?fastly-[a-z-]+:|^x-served-by:\s*cache-[a-z0-9-]+'
+    match: '(?im)^x-served-by:[ \t]*cache-[a-z0-9-]+'
     version: null
-    confidence: confirmed
+    confidence: likely
     implies: null
 
   # ---------------------------------------------------------------- front-end frameworks
   - tech: React
     category: frontend_framework
     evidence: [script]
-    match: '@license React\b'
-    version: '@license React v(\d+\.\d+\.\d+)'
+    # The "@license React" banner is shared by sibling packages (scheduler, react-is, ...):
+    # only banners naming a react / react-dom / jsx-runtime build file count.
+    match: '@license React(?: v\d+\.\d+\.\d+)?[ \t]*\r?\n[ \t]*\*[ \t]*react(?:-dom(?:-server)?|-jsx-(?:dev-)?runtime)?(?:\.[a-z]+)?\.(?:production|development|profiling)(?:\.min)?\.js'
+    version: '@license React v(\d+\.\d+\.\d+)[ \t]*\r?\n[ \t]*\*[ \t]*react(?:-dom(?:-server)?|-jsx-(?:dev-)?runtime)?(?:\.[a-z]+)?\.(?:production|development|profiling)(?:\.min)?\.js'
     confidence: confirmed
     implies: null
   - tech: React
@@ -340,22 +390,24 @@ rules:
   - tech: React
     category: frontend_framework
     evidence: [html]
-    match: 'data-reactroot|<script[^>]+\bsrc="[^"]*/react(?:-dom)?(?:@|/)\d'
-    version: '<script[^>]+\bsrc="[^"]*/react(?:-dom)?(?:@|/)(\d+\.\d+\.\d+)/'
+    match: 'data-reactroot|/react(?:-dom)?@\d+\.\d+\.\d+/|/react(?:-dom)?/\d+\.\d+\.\d+/umd/'
+    version: '/react(?:-dom)?(?:@|/)(\d+\.\d+\.\d+)/(?:umd/|dist/|cjs/)'
     confidence: likely
     implies: null
   - tech: Vue
     category: frontend_framework
     evidence: [script]
-    match: '(?m)^\s*\*\s*vue v\d+\.\d+\.\d+\s*$'
-    version: '(?m)^\s*\*\s*vue v(\d+\.\d+\.\d+)\s*$'
+    # Generic banner line ` * vue v3.4.38` (Vue 3 builds) or ` * Vue.js v2.7.16` (Vue 2). The
+    # exact `vue v` / `Vue.js v` words exclude siblings (vue-router, @vue/shared, vuex, pinia).
+    match: '(?m)^[ \t]*\*[ \t]*(?:vue|Vue\.js) v\d+\.\d+\.\d+[ \t]*\r?$'
+    version: '(?m)^[ \t]*\*[ \t]*(?:vue|Vue\.js) v(\d+\.\d+\.\d+)[ \t]*\r?$'
     confidence: confirmed
     implies: null
   - tech: Vue
     category: frontend_framework
     evidence: [html]
-    match: '<script[^>]+\bsrc="[^"]*/vue(?:@\d[^/"]*)?/dist/vue\.|<script[^>]+\bsrc="[^"]*/vue(?:\.global|\.runtime)?(?:\.prod)?(?:\.min)?\.js"'
-    version: '<script[^>]+\bsrc="[^"]*/vue@(\d+\.\d+\.\d+)/'
+    match: '/vue(?:@\d+\.\d+\.\d+)?/dist/vue\.|/vue(?:\.global|\.runtime)?(?:\.prod)?(?:\.min)?\.js["''?#]'
+    version: '/vue@(\d+\.\d+\.\d+)/dist/'
     confidence: likely
     implies: null
   - tech: Vue
@@ -375,8 +427,8 @@ rules:
   - tech: vue-router
     category: js_library
     evidence: [script]
-    match: '(?m)^\s*\*\s*vue-router v\d+\.\d+\.\d+\s*$'
-    version: '(?m)^\s*\*\s*vue-router v(\d+\.\d+\.\d+)\s*$'
+    match: '(?m)^[ \t]*\*[ \t]*vue-router v\d+\.\d+\.\d+[ \t]*\r?$'
+    version: '(?m)^[ \t]*\*[ \t]*vue-router v(\d+\.\d+\.\d+)[ \t]*\r?$'
     confidence: confirmed
     implies: [{tech: Vue, category: frontend_framework}]
   - tech: vue-router
@@ -403,30 +455,65 @@ rules:
   - tech: Next.js
     category: frontend_framework
     evidence: [html]
-    match: 'id="__NEXT_DATA__"|/_next/static/'
+    match: 'id="__NEXT_DATA__"'
     version: null
-    confidence: confirmed
+    confidence: likely
+    implies: [{tech: React, category: frontend_framework}]
+  - tech: Next.js
+    category: frontend_framework
+    evidence: [html]
+    match: '/_next/static/'
+    version: null
+    confidence: likely
     implies: [{tech: React, category: frontend_framework}]
   - tech: Next.js
     category: frontend_framework
     evidence: [header]
-    match: '(?im)^x-powered-by:\s*Next\.js\b'
+    match: '(?im)^x-powered-by:[ \t]*Next\.js\b'
     version: null
     confidence: confirmed
     implies: [{tech: React, category: frontend_framework}]
   - tech: Nuxt
     category: frontend_framework
     evidence: [html]
-    match: '__NUXT__\s*=|id="__nuxt"|/_nuxt/'
+    match: '__NUXT__[ \t]*='
     version: null
-    confidence: confirmed
+    confidence: likely
+    implies: [{tech: Vue, category: frontend_framework}]
+  - tech: Nuxt
+    category: frontend_framework
+    evidence: [html]
+    match: 'id="__nuxt"'
+    version: null
+    confidence: likely
+    implies: [{tech: Vue, category: frontend_framework}]
+  - tech: Nuxt
+    category: frontend_framework
+    evidence: [html]
+    match: '/_nuxt/'
+    version: null
+    confidence: likely
     implies: [{tech: Vue, category: frontend_framework}]
   - tech: SvelteKit
     category: frontend_framework
     evidence: [html]
-    match: 'data-sveltekit-[a-z-]+=|__sveltekit_[a-z0-9]+\s*=|/_app/immutable/'
+    match: 'data-sveltekit-[a-z-]{1,40}='
     version: null
-    confidence: confirmed
+    confidence: likely
+    implies: [{tech: Svelte, category: frontend_framework}]
+  - tech: SvelteKit
+    category: frontend_framework
+    evidence: [html]
+    match: '__sveltekit_[a-z0-9]{1,40}[ \t]*='
+    version: null
+    confidence: likely
+    implies: [{tech: Svelte, category: frontend_framework}]
+  - tech: SvelteKit
+    category: frontend_framework
+    evidence: [html]
+    match: '/_app/immutable/'
+    version: null
+    confidence: likely
     implies: [{tech: Svelte, category: frontend_framework}]
   - tech: Svelte
     category: frontend_framework
@@ -440,43 +527,43 @@ rules:
   - tech: jQuery
     category: js_library
     evidence: [script]
-    match: '/\*!\s*jQuery v\d'
-    version: '/\*!\s*jQuery v(\d+\.\d+\.\d+)'
+    match: '/\*![ \t]*jQuery v\d'
+    version: '/\*![ \t]*jQuery v(\d+\.\d+\.\d+)'
     confidence: confirmed
     implies: null
   - tech: jQuery
     category: js_library
     evidence: [html]
-    match: '<script[^>]+\bsrc="[^"]*/jquery(?:[-.@/]\d+\.\d+\.\d+)?(?:\.slim)?(?:\.min)?\.js'
-    version: '<script[^>]+\bsrc="[^"]*/jquery(?:-|@|/)(\d+\.\d+\.\d+)(?:/|\.slim|\.min|\.js)'
+    match: '/jquery(?:[-@/]\d+\.\d+\.\d+)?(?:/dist/jquery)?(?:\.slim)?(?:\.min)?\.js["''?#]'
+    version: '/jquery[-@/](\d+\.\d+\.\d+)(?:/dist/jquery)?(?:\.slim)?(?:\.min)?\.js["''?#]'
     confidence: likely
     implies: null
   - tech: Bootstrap
     category: css_framework
-    evidence: [script, html]
-    match: '\*\s*Bootstrap v\d+\.\d+\.\d+ \(https?://getbootstrap\.com/?\)'
-    version: '\*\s*Bootstrap v(\d+\.\d+\.\d+) \(https?://getbootstrap\.com/?\)'
+    evidence: [script, css]
+    match: '\*[ \t]*Bootstrap v\d+\.\d+\.\d+ \(https?://getbootstrap\.com/?\)'
+    version: '\*[ \t]*Bootstrap v(\d+\.\d+\.\d+) \(https?://getbootstrap\.com/?\)'
     confidence: confirmed
     implies: null
   - tech: Bootstrap
     category: css_framework
     evidence: [html]
-    match: '<(?:link|script)[^>]+\b(?:href|src)="[^"]*/bootstrap(?:@\d[^/"]*/dist/(?:css|js)/bootstrap|/\d+\.\d+\.\d+/(?:css|js)/bootstrap)?(?:\.bundle)?(?:\.min)?\.(?:css|js)"'
-    version: '<(?:link|script)[^>]+\b(?:href|src)="[^"]*/bootstrap(?:@|/)(\d+\.\d+\.\d+)/'
+    match: '/bootstrap(?:\.bundle)?(?:\.min)?\.(?:css|js)["''?#]'
+    version: '/bootstrap[@/](\d+\.\d+\.\d+)/(?:dist/)?(?:css|js)/bootstrap(?:\.bundle)?(?:\.min)?\.(?:css|js)["''?#]'
     confidence: likely
     implies: null
   - tech: Font Awesome
     category: css_framework
-    evidence: [script]
-    match: '\*\s*Font Awesome (?:Free|Pro) \d'
-    version: '\*\s*Font Awesome (?:Free|Pro) (\d+\.\d+\.\d+)'
+    evidence: [script, css]
+    match: '\*[ \t]*Font Awesome (?:Free|Pro) \d'
+    version: '\*[ \t]*Font Awesome (?:Free|Pro) (\d+\.\d+\.\d+)'
     confidence: confirmed
     implies: null
   - tech: Font Awesome
     category: css_framework
     evidence: [html]
-    match: '<(?:link|script)[^>]+\b(?:href|src)="[^"]*(?:/font-awesome/|/fontawesome-free@|/fontawesome/|kit\.fontawesome\.com/)'
-    version: '<(?:link|script)[^>]+\b(?:href|src)="[^"]*(?:/font-awesome/|/fontawesome-free@)(\d+\.\d+\.\d+)/'
+    match: '/font-awesome/\d|/fontawesome-free@\d|kit\.fontawesome\.com/|/font-?awesome(?:\.min)?\.(?:css|js)["''?#]'
+    version: '(?:/font-awesome/|/fontawesome-free@)(\d+\.\d+\.\d+)/'
     confidence: likely
     implies: null
 
@@ -507,7 +594,7 @@ rules:
   - tech: JWT bearer
     category: auth
     evidence: [schema]
-    match: '["'']?bearerFormat["'']?\s*:\s*["'']?JWT\b'
+    match: 'bearerFormat["'']?\s*:\s*["'']?JWT\b'
     version: null
     confidence: likely
     implies: null

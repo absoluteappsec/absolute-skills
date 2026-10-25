@@ -35,7 +35,7 @@ def sample_evidence(name: str) -> list[Evidence]:
                    headers=headers)]
         return out + [_ev("cookie", c, name, i + 1) for i, c in enumerate(cookies)]
     for suffix, kind in ((".error.html", "error_page"), (".html", "html"), (".js", "script"),
-                         (".map", "source_map"), (".schema.json", "schema"),
+                         (".map", "source_map"), (".css", "css"), (".schema.json", "schema"),
                          (".schema.yaml", "schema"), (".auth.txt", "auth")):
         if name.endswith(suffix):
             return [_ev(kind, raw, name)]
@@ -141,7 +141,14 @@ def test_no_false_version_from_app_code(rules):
     bundle = ('import Vue from "vue";import $ from "jquery";const version = "2"; var v="1.2";'
               'console.log("jQuery v" + v, "Bootstrap v" + version, React.version);'
               'export const meta = {version: "4.4.3", name: "vue-router"};')
-    techs = detect([_ev("script", bundle, "app.js")], rules)
+    # Sibling-package banners must not lend their versions to the main library.
+    siblings = ("/** @license React v0.20.2\n * scheduler.production.min.js\n */\n"
+                "/** @license React v16.13.1\n * react-is.production.min.js\n */\n"
+                "/*! jQuery UI - v1.13.2 - 2022-07-14 */\n/*! jQuery Migrate v3.4.1 */\n"
+                "/*!\n * Bootstrap Icons v1.11.1 (https://icons.getbootstrap.com/)\n */\n"
+                "/**\n* @vue/shared v3.4.38\n**/\n/*!\n * pinia v2.1.7\n */\n")
+    techs = detect([_ev("script", bundle, "app.js"), _ev("script", siblings, "vendor.js", 1)],
+                   rules)
     for t in techs:
         if t.category in ("js_library", "frontend_framework", "css_framework"):
             assert t.versions == [], t
@@ -167,3 +174,43 @@ def test_detect_time_bounded_on_capped_bodies(rules):
     t = time.monotonic()
     assert detect(evs, rules) == []
     assert time.monotonic() - t < 1.0
+
+
+@pytest.mark.parametrize("filler", ['<script src="', '<link href="', "\n", " ", "\t", '"', "*",
+                                    "/", "-", "a", "<", "/*! ", " * ", "data-sveltekit-",
+                                    "__NUXT__ ", "cookieAuth: ", "<address>Apache",
+                                    "@license React v1.2.3\n"])
+def test_detect_adversarial_bodies_bounded(rules, filler):
+    import time
+    body = (filler * (2 * 1024 * 1024 // len(filler) + 1))[:2 * 1024 * 1024]
+    evs = [_ev(kind, body, kind, i) for i, kind in
+           enumerate(("html", "script", "error_page", "source_map", "css", "schema", "header",
+                      "auth"))]
+    t = time.monotonic()
+    detect(evs, rules)
+    assert time.monotonic() - t < 2.0
+
+
+def test_single_indirect_marker_is_likely(rules):
+    lone = detect([_ev("html", '<script src="/_next/static/chunks/main-1a2b.js"></script>')], rules)
+    assert next(t for t in lone if t.name == "Next.js").confidence == "likely"
+    both = detect([_ev("html", '<script src="/_next/static/chunks/main-1a2b.js"></script>'
+                               '<script id="__NEXT_DATA__" type="application/json">{}</script>')],
+                  rules)
+    assert next(t for t in both if t.name == "Next.js").confidence == "confirmed"
+    for kind, text, tech in (("header", "CF-RAY: 8d1f2a3b4c5d6e7f-AMS", "Cloudflare"),
+                             ("header", "X-Served-By: cache-fra-eddf8230045-FRA", "Fastly"),
+                             ("html", '<link href="/_nuxt/entry.js">', "Nuxt"),
+                             ("html", '<link href="/_app/immutable/start.js">', "SvelteKit"),
+                             ("html", '<link href="/static/rest_framework/css/default.css">',
+                              "Django REST Framework")):
+        found = next(t for t in detect([_ev(kind, text)], rules) if t.name == tech)
+        assert found.confidence == "likely", tech
+
+
+def test_react_banner_anchored_to_react_files(rules):
+    for banner, version in (("/** @license React v17.0.2\n * react-dom.production.min.js\n */", "17.0.2"),
+                            ("/**\n * @license React\n * react.production.min.js\n */", None)):
+        react = next(t for t in detect([_ev("script", banner)], rules) if t.name == "React")
+        assert react.versions == ([version] if version else [])
+        assert react.confidence == "confirmed"

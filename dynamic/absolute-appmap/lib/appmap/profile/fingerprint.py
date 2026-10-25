@@ -22,7 +22,7 @@ from appmap.redact import Redactor
 CATEGORIES = ("language", "server_framework", "frontend_framework", "js_library",
               "css_framework", "web_server", "app_server", "cdn_proxy", "auth", "api_style",
               "third_party")
-EVIDENCE_KINDS = ("header", "cookie", "html", "script", "source_map", "schema", "spa",
+EVIDENCE_KINDS = ("header", "cookie", "html", "script", "css", "source_map", "schema", "spa",
                   "error_page", "auth")
 RULE_CONFIDENCE = ("confirmed", "likely")
 MAX_EVIDENCE = 3

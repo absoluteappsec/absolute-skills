@@ -16,7 +16,7 @@ from appmap.store import Store
 
 MAX_EVIDENCE_TEXT = 2 * 1024 * 1024  # per-body scan cap (2 MiB)
 
-Kind = Literal["header", "cookie", "html", "script", "source_map", "schema", "spa",
+Kind = Literal["header", "cookie", "html", "script", "css", "source_map", "schema", "spa",
                "error_page", "auth"]
 
 _ERROR_MARKERS = (
@@ -123,6 +123,9 @@ def _body_kind(row, body: str) -> str | None:
         return "source_map"
     if "javascript" in ct or "ecmascript" in ct or path.endswith((".js", ".mjs")):
         return "script"
+    if (row["status"] or 0) < 400 and ("text/css" in ct
+                                       or (path.endswith(".css") and "html" not in ct)):
+        return "css"
     if "html" in ct or body.lstrip()[:15].lower().startswith(("<!doctype html", "<html")):
         if (row["status"] or 0) >= 400 or any(m in body for m in _ERROR_MARKERS):
             return "error_page"
