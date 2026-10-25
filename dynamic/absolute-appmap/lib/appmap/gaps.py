@@ -8,9 +8,9 @@ so crawl and probe need not write any per-pass data.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict, dataclass, field
 
-from appmap.approvals import ApprovalQueue
 from appmap.store import Store
 
 DISCOVERY_SOURCES = ("bundle", "openapi", "graphql", "robots", "sitemap", "well_known",
@@ -70,19 +70,23 @@ def compute_gaps(store: Store) -> Gaps:
                     AND NOT EXISTS (SELECT 1 FROM states s WHERE s.route_pattern=r.pattern)
                   ORDER BY r.id"""):
         g.unreached_routes.append(dict(r))
-    queue = ApprovalQueue(store, store.db_path.parent / "approvals.yaml")
-    failures = queue.failures()
+    prefix = "approval_failed:"
+    failures = {r["key"][len(prefix):]: r["value"] for r in q(
+        "SELECT key, value FROM meta WHERE key LIKE ?", (prefix + "%",))}
     for r in q("""SELECT id, role, kind, url, action_path, status, source FROM frontier
                   WHERE status IN ('pending','failed') ORDER BY id"""):
         d = dict(r)
         d["action_path"] = json.loads(d["action_path"] or "[]")
         g.unexplored_actions.append(d)
-    # Approved actions that could not run are unexplored too (the reason is recorded).
-    for r in q("SELECT id, role, label FROM approvals WHERE decision='approve' ORDER BY id"):
-        if r["id"] in failures:
-            g.unexplored_actions.append({"kind": "approval", "id": r["id"], "role": r["role"],
-                                         "label": r["label"], "status": "failed",
-                                         "reason": failures[r["id"]]})
+    # Approved actions that have not run yet, or ran/failed with a recorded reason.
+    for r in q("""SELECT id, role, label, executed_event FROM approvals
+                  WHERE decision='approve' ORDER BY id"""):
+        if r["id"] in failures or r["executed_event"] is None:
+            d = {"kind": "approval", "id": r["id"], "role": r["role"], "label": r["label"],
+                 "status": "failed" if r["id"] in failures else "approved_pending"}
+            if r["id"] in failures:
+                d["reason"] = failures[r["id"]]
+            g.unexplored_actions.append(d)
     for r in q("""SELECT id, role, category, label, reasons, decision FROM approvals
                   WHERE decision IN ('pending','deny') ORDER BY id"""):
         d = dict(r)
@@ -113,9 +117,34 @@ def new_in_pass(store: Store) -> dict[str, int]:
     return {k: max(cur[k] - base[k], 0) for k in _ZERO}
 
 
-def start_new_pass(store: Store) -> int:
-    """Snapshot current counts as the baseline of the next pass and make it current."""
-    n = current_pass(store) + 1
+def record_activity(store: Store) -> None:
+    """Called after every crawl/probe invocation (incl. --approved-only)."""
+    store.set_meta("last_activity_ts", repr(time.time()))
+
+
+def _ts(store: Store, key: str) -> float:
+    try:
+        return float(store.get_meta(key) or 0)
+    except ValueError:
+        return 0.0
+
+
+def start_new_pass(store: Store) -> dict:
+    """Close the current pass and open the next.
+
+    Intended order: crawl/probe -> ``status --new-pass`` -> read ``new_in_prev_pass``
+    (the delta of the pass just closed; zero means the double-back converged).
+    Refuses (``advanced`` False, pass unchanged) when nothing has run since the current
+    pass began and the counts equal its baseline, so repeated calls cannot fake a stop.
+    """
+    cur = current_pass(store)
+    delta = new_in_pass(store)
+    base = {**_ZERO, **json.loads(store.get_meta(f"pass_{cur}_baseline") or "{}")}
+    active = _ts(store, "last_activity_ts") > _ts(store, f"pass_{cur}_baseline_ts")
+    if not active and current_counts(store) == base:
+        return {"advanced": False, "prev_pass": cur, "new_in_prev_pass": delta}
+    n = cur + 1
     store.set_meta(f"pass_{n}_baseline", json.dumps(current_counts(store)))
+    store.set_meta(f"pass_{n}_baseline_ts", repr(time.time()))
     store.set_meta("pass", str(n))
-    return n
+    return {"advanced": True, "prev_pass": cur, "new_in_prev_pass": delta}

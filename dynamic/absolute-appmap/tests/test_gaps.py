@@ -103,3 +103,36 @@ def test_status_gaps_line_precedes_status(make_cfg, tmp_path, capsys, monkeypatc
     assert [a["id"] for a in gaps["pending_approvals"]] == ["p1"]
     assert st["counts"]["gaps"]["pending_approvals"] == 1
     assert st["pending_approvals"] == 1 and "approvals" in st["next"] and "write" in st["next"]
+
+
+def test_new_pass_reports_closed_delta_and_refuses_double_call(make_cfg, tmp_path, capsys,
+                                                               monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    root = _run(make_cfg, tmp_path, capsys)
+    s = Store(root / "appmap.sqlite")
+    s.upsert_state("s1", "admin", "http://h/", route_pattern="/")
+    s.close()
+    _, _, st = _status(capsys, "--run", str(root), "--new-pass")
+    assert st["status"] == "new_pass" and st["counts"]["pass"] == 2
+    assert st["counts"]["prev_pass"] == 1
+    assert st["counts"]["new_in_prev_pass"]["states"] == 1
+    assert st["counts"]["new_in_pass"]["states"] == 0
+    # second call with nothing run since: refused, pass unchanged, delta still reported
+    _, _, st = _status(capsys, "--run", str(root), "--new-pass")
+    assert st["ok"] and st["status"] == "no_change" and st["counts"]["pass"] == 2
+    assert st["counts"]["new_in_prev_pass"]["states"] == 0
+    # activity (even with no new surface) lets the pass close with a genuine zero delta
+    s = Store(root / "appmap.sqlite")
+    from appmap.gaps import record_activity
+    record_activity(s)
+    s.close()
+    _, _, st = _status(capsys, "--run", str(root), "--new-pass")
+    assert st["status"] == "new_pass" and st["counts"]["pass"] == 3
+    assert st["counts"]["new_in_prev_pass"] == {"states": 0, "endpoints": 0, "routes": 0}
+
+
+def test_approved_pending_listed(tmp_path):
+    s = _store(tmp_path)
+    s.upsert_approval("a1", role="admin", label="Do", decision="approve")
+    a = compute_gaps(s).unexplored_actions
+    assert a[0]["status"] == "approved_pending" and a[0]["id"] == "a1"

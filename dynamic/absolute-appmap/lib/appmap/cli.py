@@ -254,6 +254,7 @@ def cmd_crawl(args) -> int:
         emit_status("crawl", ok=False, status="error", errors=[str(e)])
         return 1
     finally:
+        _record_activity(rd)
         _detach_log(handler)
     errors = list(stats.warnings)
     run = _q(rd.root)
@@ -380,6 +381,7 @@ def cmd_probe(args) -> int:
         emit_status("probe", ok=False, status="error", errors=[str(e)])
         return 1
     finally:
+        _record_activity(rd)
         _detach_log(handler)
     status = "in_progress" if counts.get("timed_out") else "done"
     again = f"appmap probe --run {run} --phase {args.phase}" + (
@@ -447,7 +449,20 @@ def cmd_approvals(args) -> int:
     return 0
 
 
+def _record_activity(rd) -> None:
+    """Stamp meta.last_activity_ts so ``status --new-pass`` can tell a pass actually ran."""
+    from appmap.gaps import record_activity
+    from appmap.store import Store
+
+    store = Store(rd.db_path)
+    try:
+        record_activity(store)
+    finally:
+        store.close()
+
+
 def cmd_status(args) -> int:
+    """Double-back order: crawl/probe -> ``status --new-pass`` -> read ``new_in_prev_pass``."""
     from appmap.approvals import ApprovalQueue
     from appmap.gaps import compute_gaps, current_pass, new_in_pass, start_new_pass
     from appmap.store import Store
@@ -461,8 +476,7 @@ def cmd_status(args) -> int:
     run = _q(rd.root)
     try:
         store.init_schema()
-        if args.new_pass:
-            start_new_pass(store)
+        closed = start_new_pass(store) if args.new_pass else None
         one = lambda sql: store.conn.execute(sql).fetchone()[0]  # noqa: E731
         appr = ApprovalQueue(store, rd.approvals_path).summary()
         pending_frontier = one("SELECT count(*) FROM frontier WHERE status='pending'")
@@ -478,6 +492,9 @@ def cmd_status(args) -> int:
             "new_in_pass": new_in_pass(store),
             "pending_frontier": pending_frontier,
         }
+        if closed:
+            counts["prev_pass"] = closed["prev_pass"]
+            counts["new_in_prev_pass"] = closed["new_in_prev_pass"]
         if args.gaps:
             gaps = compute_gaps(store)
             print(json.dumps({"gaps": gaps.to_dict()}), flush=True)
@@ -494,7 +511,9 @@ def cmd_status(args) -> int:
         nxt = f"appmap approvals --run {run} write"
     else:
         nxt = f"appmap build --run {run}"
-    emit_status("status", ok=True, status="new_pass" if args.new_pass else "reported",
+    if args.new_pass and not closed["advanced"]:
+        nxt = f"run crawl/probe first, then: appmap status --run {run} --new-pass"
+    emit_status("status", ok=True, status=("new_pass" if closed["advanced"] else "no_change") if closed else "reported",
                 counts=counts, pending_approvals=appr["pending"], next=nxt)
     return 0
 
