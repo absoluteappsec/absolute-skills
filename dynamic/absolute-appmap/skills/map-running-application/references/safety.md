@@ -96,7 +96,8 @@ executed twice.
   wherever it appears verbatim. Add app-specific secret formats with `redact_patterns`.
 - `<input type="password">` fields are secrets whatever they are named (an app may make
   `ssn` or `pin` a password input): every value the crawler types into one is learned as a
-  literal secret *before* the form is submitted (4+ chars) and scrubbed from every stored
+  literal secret *before* the form is submitted (4+ chars; digit-only values 8+, so short
+  PINs do not scrub every matching id, price or year) and scrubbed from every stored
   copy — inline bodies, `bodies/` files, HAR, events, params examples, multipart parts and
   urlencoded bodies — and the field's name is redacted like a password key in requests to
   that form's endpoint (names are remembered across invocations in the run's metadata). The

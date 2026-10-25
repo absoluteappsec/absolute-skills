@@ -172,6 +172,9 @@ class Crawler:
         # completes) and roles stopped because authentication failed (role -> reason).
         self._relogins: dict[str, int] = {}
         self.auth_failed: dict[str, str] = {}
+        # Roles whose liveness was confirmed only via the post-login landing page (role ->
+        # warning, once per role).
+        self._probe_notes: dict[str, str] = {}
         # True while the controls of a record this crawl just created are queued: held
         # actions are tagged created_by_run (usable as an approval rule match key).
         self._creating = False
@@ -206,6 +209,7 @@ class Crawler:
         stats = self.stats(status)
         self._auth_report(stats)
         stats.warnings += list(self._spa_skipped.values())
+        stats.warnings += list(self._probe_notes.values())
         log.info("crawl stopped: status=%s states=%d transitions=%d pending_approvals=%d",
                  status, stats.states, stats.transitions, stats.queued_approvals)
         return stats
@@ -913,19 +917,23 @@ class Crawler:
 
     async def _session_alive(self, sess: RoleSession, current: str) -> bool:
         """Load a page that needs the session (``auth_probe_urls``) in a separate tab:
-        alive unless it answers 401 or shows/redirects to the login form. Nothing to
-        probe, or the probe fails: not alive (the old behaviour: re-login)."""
+        alive unless it answers 401 or shows/redirects to the login form (the rendered
+        DOM is checked, so an SPA shell that renders its login form counts as lost).
+        Nothing to probe, or the probe fails: not alive (the old behaviour: re-login)."""
         role = sess.role.name
-        urls = auth_probe_urls(sess, self.store, sess.role.login.url, exclude=current)
+        urls = auth_probe_urls(sess, self.store, sess.role.login.url, profile=self.cfg.profile,
+                               exclude=current)
         if not urls:
             return False
         saved_guard, saved_last = self._guard, self._last_guard.get(role)
         prev_origin = self.recorder.origin_by_role.get(role)
+        prev_status = self.recorder.last_status.get(role)
         probe: Page | None = None
+        alive = False
         try:
             probe = await self._open_page(sess)
             self.recorder.origin_by_role[role] = "login"  # auth bookkeeping, not the map
-            for url in urls:
+            for url, source in urls:
                 self._arm_guard(role, "load", [{"type": "goto", "url": self._safe_url(url)}])
                 try:
                     resp = await probe.goto(url, wait_until="load")
@@ -937,8 +945,15 @@ class Crawler:
                     pass
                 alive = not await is_session_lost(sess, probe, resp.status if resp else None,
                                                   sess.role.login.url)
-                log.info("[%s] session liveness probe %s: %s", role, self.redactor.url(url),
-                         "alive" if alive else "lost")
+                log.info("[%s] session liveness probe (%s) %s: %s", role, source,
+                         self.redactor.url(url), "alive" if alive else "lost")
+                if alive and source == "landing" and role not in self._probe_notes:
+                    self._probe_notes[role] = (
+                        f"role {role}: a 401/login page was judged 'access denied' because "
+                        "the post-login landing page still loaded without a login form "
+                        "(no session-gated page seen yet to confirm with); check the "
+                        "access_denied observations")
+                    log.warning("%s", self._probe_notes[role])
                 return alive
             return False
         except Exception as exc:
@@ -955,7 +970,8 @@ class Crawler:
             self._guard = saved_guard
             if saved_last is not None:
                 self._last_guard[role] = saved_last
-            self.recorder.last_status[role] = None  # the item's own 401 was handled
+            # Alive: the item's own 401 was handled. Lost: keep it for session_lost.
+            self.recorder.last_status[role] = None if alive else prev_status
 
     def _record_denied(self, role: str, url: str, status: int | None) -> None:
         safe = self.redactor.url(url)

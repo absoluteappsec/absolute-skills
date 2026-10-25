@@ -239,6 +239,7 @@ class _Sent:
     shape: Any
     exchange_id: int | None
     denied: bool = False  # 401/login redirect while the session was confirmed alive
+    ctype: str | None = None
 
 
 @dataclass
@@ -253,8 +254,10 @@ class _Prober:
     re-login on a lost session), stored-exchange lookups and progress counters."""
 
     def __init__(self, client: DirectClient, sessions: dict[str, RoleSession], cfg: RunConfig,
-                 store: Store, queue: ApprovalQueue, deadline: float | None):
+                 store: Store, queue: ApprovalQueue, deadline: float | None,
+                 warnings: list[str] | None = None):
         self.client, self.sessions, self.cfg = client, sessions, cfg
+        self.warnings = warnings if warnings is not None else []
         self.store, self.queue, self.deadline = store, queue, deadline
         self.root = Path(store.db_path).parent
         self.login_url = run_login_url(cfg)
@@ -375,8 +378,9 @@ class _Prober:
             body = await resp.body()
         except Exception:
             body = None
-        return _Sent(status, final, _shape_of(body, resp.headers.get("content-type")),
-                     first[0] if first else None)
+        ctype = resp.headers.get("content-type")
+        return _Sent(status, final, _shape_of(body, ctype), first[0] if first else None,
+                     ctype=ctype)
 
     def _lost(self, role: str, sent: _Sent, req: _Req) -> bool:
         sess = self.sessions[role]
@@ -388,28 +392,46 @@ class _Prober:
     async def _session_alive(self, role: str, req: _Req) -> bool | None:
         """Confirm a candidate loss with a GET that needs the session (``auth_probe_urls``,
         sent as origin ``login``: auth bookkeeping, never a representative). True: alive
-        (the 401 meant "not yours"); False: lost; None: nothing to probe with."""
+        (the 401 meant "not yours"); False: lost; None: inconclusive (nothing to probe
+        with, or only the landing page, whose HTML a direct request gets either way: an
+        SPA shell is 200 even with an expired token)."""
         sess = self.sessions[role]
-        urls = auth_probe_urls(sess, self.store, self.login_url, exclude=req.url,
-                               prefer_evidence=True)
-        for url in urls:
+        urls = auth_probe_urls(sess, self.store, self.login_url, profile=self.cfg.profile,
+                               exclude=req.url, prefer_evidence=True)
+        for url, source in urls:
             sent = await self._fetch(role, _Req("GET", url), "login", None)
             if sent is None:
                 continue
-            alive = not (sent.status == 401 or _is_login_url(sent.final_url, self.login_url))
-            log.info("[%s] session liveness probe %s: %s", role, url,
-                     "alive" if alive else "lost")
-            return alive
+            if sent.status == 401 or _is_login_url(sent.final_url, self.login_url):
+                log.info("[%s] session liveness probe (%s) %s: lost", role, source, url)
+                return False
+            if source == "landing" and "html" in (sent.ctype or "").lower():
+                log.info("[%s] session liveness probe (landing) %s: inconclusive (HTML)",
+                         role, url)
+                return None
+            if source == "landing":
+                self._note(role, f"role {role}: a 401/login redirect was judged 'forbidden' "
+                                 "because the post-login landing page still answered (no "
+                                 "session-gated GET seen to confirm with)")
+            log.info("[%s] session liveness probe (%s) %s: alive", role, source, url)
+            return True
         return None
+
+    def _note(self, role: str, msg: str) -> None:
+        if msg not in self.warnings:
+            self.warnings.append(msg)
+            log.warning("%s", msg)
 
     def _denied(self, role: str, sent: _Sent, req: _Req) -> _Sent:
         sent.denied = True
+        rec = self.sessions[role].recorder
+        safe = rec.redactor.url(req.url) if rec is not None else req.url
         if self.client.events is not None:
             ev = self.client.events.emit("observation", role=role, kind="access_denied",
-                                         url=req.url, status=sent.status,
+                                         url=safe, status=sent.status,
                                          detail="denied with a live session")
             self.store.add_observation("access_denied", "denied with a live session",
-                                       req.url, role, ev.id)
+                                       safe, role, ev.id)
         return sent
 
     async def _relogin(self, role: str) -> bool:
@@ -624,11 +646,12 @@ def _schema_request(p: _Prober, ep, marker: str) -> _Req | None:
 async def api_replay(client: DirectClient, sessions: dict[str, RoleSession], cfg: RunConfig,
                      store: Store, queue: ApprovalQueue, role: str, *,
                      deadline: float | None = None, marker: str = "appmap",
-                     exercise: bool = True) -> dict[str, int]:
+                     exercise: bool = True,
+                     warnings: list[str] | None = None) -> dict[str, int]:
     """Vary ``role``'s captured traffic; with ``exercise``, also request endpoints that
     have no exchanges at all (schema/bundle only). Pass ``exercise`` for one role per run
     so held schema-only requests are queued once, not once per role."""
-    p = _Prober(client, sessions, cfg, store, queue, deadline)
+    p = _Prober(client, sessions, cfg, store, queue, deadline, warnings)
     skip = login_endpoint_ids(store, cfg) | approval_blocked_ids(store)
     for ep in list(store.conn.execute("SELECT * FROM endpoints ORDER BY id")):
         if not p.alive():
@@ -863,10 +886,11 @@ def _route_target(p: _Prober, route) -> tuple[str | None, Any, int | None]:
 
 async def cross_role_replay(client: DirectClient, sessions: dict[str, RoleSession],
                             cfg: RunConfig, store: Store, queue: ApprovalQueue, *,
-                            deadline: float | None = None) -> dict[str, int]:
+                            deadline: float | None = None,
+                            warnings: list[str] | None = None) -> dict[str, int]:
     """Request every endpoint's representative exchange and every route as every other
     role and record the ``role_access`` matrix (spec decision 10 for writes)."""
-    p = _Prober(client, sessions, cfg, store, queue, deadline)
+    p = _Prober(client, sessions, cfg, store, queue, deadline, warnings)
     m = _Matrix(p, [r.name for r in cfg.roles])
     skip = login_endpoint_ids(store, cfg)
     blocked = approval_blocked_ids(store)
@@ -985,7 +1009,8 @@ async def _run_active(cfg: RunConfig, rd: RunDir, roles: list[str] | None,
             for name in replay_roles:
                 steps.append(functools.partial(api_replay, client, sessions, cfg, rt.store,
                                                rt.queue, name, deadline=deadline,
-                                               marker=marker, exercise=name == exerciser))
+                                               marker=marker, exercise=name == exerciser,
+                                               warnings=result.warnings))
         if cfg.discovery.forced_browsing and probe_role in sessions:
             s = sessions[probe_role]
             steps.append(functools.partial(forced_browse, client, s.context.request, cfg,
@@ -993,7 +1018,7 @@ async def _run_active(cfg: RunConfig, rd: RunDir, roles: list[str] | None,
                                            deadline=deadline,
                                            extra_auth=s.auth_headers or None))
         steps.append(functools.partial(cross_role_replay, client, sessions, cfg, rt.store,
-                                       rt.queue, deadline=deadline))
+                                       rt.queue, deadline=deadline, warnings=result.warnings))
         for step in steps:
             if counts["timed_out"]:
                 break

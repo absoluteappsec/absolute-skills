@@ -43,8 +43,12 @@ app yourself to "help" the crawler.
   that answered only with a session); if the session is alive the page is recorded as a normal
   state with an `access_denied` observation and no re-login. Only a confirmed loss re-logs
   in; if the same URL still answers 401 after a successful re-login, it is recorded as denied
-  too, not counted toward the stop. The probe replay (`probe-endpoints`) does the same and
-  records such answers as `forbidden` in the role access matrix.
+  too, not counted toward the stop. The probe never re-sends an approved, held or logout-like
+  request. When only the landing page could confirm liveness, the crawl says so in `errors`
+  (`role X: a 401/login page was judged 'access denied' …`): spot-check the `access_denied`
+  observations. The probe replay (`probe-endpoints`) does the same and records such answers
+  as `forbidden` in the role access matrix; with direct requests an HTML landing page is
+  inconclusive (an SPA shell answers 200 with an expired token), so it re-logs in instead.
 
 ---
 

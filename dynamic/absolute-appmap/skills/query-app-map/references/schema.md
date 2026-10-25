@@ -66,7 +66,9 @@ across invocations). Run id, target, tool version and profile are in `run.json`.
 finished), `pass` (current double-back pass, absent = 1), `pass_<n>_baseline` (JSON counts
 `{"states","endpoints","routes"}` when pass n began), `pass_<n>_baseline_ts` and
 `last_activity_ts` (epoch seconds as text), `probe_active` (JSON progress of
-`appmap probe --phase active`).
+`appmap probe --phase active`), `redact_password_fields` (JSON `{"host/path": [field
+names]}`: `<input type=password>` names redacted like a password key in requests to that
+form endpoint; names only, never values).
 
 ### `roles`
 

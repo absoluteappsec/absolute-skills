@@ -154,10 +154,13 @@ def test_learn_secret_scrubs_short_plain_values_typed_into_password_inputs():
     r = Redactor([], [])
     assert not r.learn("Saturday")  # plain word: runtime learn ignores it
     assert r.learn_secret("Saturday")  # but a value typed into a password input is scrubbed
-    assert r.learn_secret("4821")
+    assert r.learn_secret("p1n!")
     assert not r.learn_secret("123")  # too short to scrub everywhere
-    out = r.text("<p>Saved pin 4821 on Saturday</p>")
-    assert "4821" not in out and "Saturday" not in out
+    assert not r.learn_secret("4821")  # digits only: needs 8+ (dates, ids, prices)
+    assert r.learn_secret("48213377")
+    out = r.text("<p>Saved p1n! and 48213377 on Saturday, order 4821</p>")
+    assert "p1n!" not in out and "48213377" not in out and "Saturday" not in out
+    assert "4821" in out
 
 
 def test_password_field_names_redacted_only_for_their_endpoint():

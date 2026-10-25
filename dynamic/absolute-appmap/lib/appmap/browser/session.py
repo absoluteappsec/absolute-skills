@@ -299,20 +299,32 @@ def _lands_on_login(location: str, base_url: str, login_url: str | None) -> bool
     return bool(_LOGIN_PATH.search(urlsplit(target).path or ""))
 
 
-def auth_probe_urls(sess: RoleSession, store, login_url: str | None, *,
+def auth_probe_urls(sess: RoleSession, store, login_url: str | None, *, profile: str,
                     exclude: str | None = None, prefer_evidence: bool = False,
-                    limit: int = 2) -> list[str]:
-    """URLs that answer only with a live session, for confirming a *candidate* session
-    loss (a 401 or a login-looking page may just mean "not yours"): the role's
-    post-login landing URL, and GETs this role got 2xx for on endpoints that also
-    answered 401 or a redirect to login (evidence the endpoint needs a session).
-    ``prefer_evidence`` puts the latter first (direct requests: an SPA shell answers 200
-    either way). Empty when nothing is known: the caller then treats the loss as real."""
+                    limit: int = 2) -> list[tuple[str, str]]:
+    """``(url, source)`` pairs that answer only with a live session, for confirming a
+    *candidate* session loss (a 401 or a login-looking page may just mean "not yours").
+    ``source`` is ``evidence`` (a GET this role got 2xx for, from crawl/replay traffic, on
+    an endpoint that also answered 401 or a redirect to login) or ``landing`` (the role's
+    post-login landing URL). ``prefer_evidence`` puts evidence first (direct requests: an
+    SPA shell answers 200 either way). Never a URL the destructive classifier holds, an
+    approved/login-flow exchange, or anything logout-like (query included). Empty when
+    nothing is known: the caller then treats the loss as real."""
+    from ..destructive import ActionDescriptor, classify
+
+    role = sess.role.name
+
     def usable(url: str | None) -> bool:
-        return bool(url) and url.startswith(("http://", "https://")) \
-            and "redacted" not in url and not _LOGOUT_PATH.search(urlsplit(url).path) \
-            and not (login_url and _path(url) == _path(login_url)) \
-            and not (exclude and url.split("#")[0] == exclude.split("#")[0])
+        if not url or not url.startswith(("http://", "https://")) or "redacted" in url \
+                or _LOGOUT_PATH.search(url.split("#")[0]) \
+                or (login_url and _path(url) == _path(login_url)) \
+                or (exclude and url.split("#")[0] == exclude.split("#")[0]):
+            return False
+        try:
+            return not classify(ActionDescriptor("click", "GET", url, "", "", False, role,
+                                                 "ui"), profile).held
+        except Exception:  # fail closed: never probe what cannot be classified
+            return False
 
     evidence: list[str] = []
     if store is not None:
@@ -337,19 +349,17 @@ def auth_probe_urls(sess: RoleSession, store, login_url: str | None, *,
                 marks = ",".join("?" * len(gated))
                 for (url,) in store.conn.execute(
                         f"SELECT url FROM exchanges WHERE role=? AND upper(method)='GET' "
-                        f"AND status BETWEEN 200 AND 299 AND endpoint_id IN ({marks}) "
-                        f"ORDER BY id DESC LIMIT 50", (sess.role.name, *gated)):
-                    if usable(url) and url not in evidence:
+                        f"AND origin IN ('ui','replay') AND status BETWEEN 200 AND 299 "
+                        f"AND endpoint_id IN ({marks}) ORDER BY id DESC LIMIT 50",
+                        (role, *gated)):
+                    if url not in evidence and usable(url):
                         evidence.append(url)
         except Exception:  # a probe list is best effort
             evidence = []
-    landing = [sess.landing_url] if usable(sess.landing_url) else []
-    ordered = evidence + landing if prefer_evidence else landing + evidence
-    out: list[str] = []
-    for u in ordered:
-        if u not in out:
-            out.append(u)
-    return out[:limit]
+    ev = [(u, "evidence") for u in evidence]
+    landing = [(sess.landing_url, "landing")] \
+        if usable(sess.landing_url) and sess.landing_url not in evidence else []
+    return (ev + landing if prefer_evidence else landing + ev)[:limit]
 
 
 async def ensure_authenticated(sess: RoleSession, page: Page, cfg: RunConfig,

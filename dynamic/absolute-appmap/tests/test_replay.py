@@ -188,8 +188,13 @@ async def test_forbidden_401_with_live_session_is_not_a_loss(browser, ssr_url, m
     for pid in (1, 2, 3):
         seed(cfg, rd, role="admin", method="GET", url=f"{ssr_url}/projects/{pid}/private",
              resp_body=b"<html><h1>Private notes</h1></html>")
+    # what a crawl leaves behind: alice saw /projects, anonymous was sent to login
+    seed(cfg, rd, role="alice", method="GET", url=ssr_url + "/projects")
+    seed(cfg, rd, role="anonymous", method="GET", url=ssr_url + "/projects", status=302,
+         resp_headers={"location": "/login"})
     assert all((await _auth(cfg, rd, cfg.roles, headed=False)).values())
-    await run_active(cfg, rd, budget_minutes=5, browser=browser)
+    res = await run_active(cfg, rd, budget_minutes=5, browser=browser)
+    assert not [w for w in res.warnings if "landing page" in w]  # evidence, not landing
     got = access(rd, "endpoint", "x.method='GET' AND x.path_pattern='/projects/{id}/private'")
     assert got["admin"] == "allowed" and got["alice"] == "forbidden"
     assert got["anonymous"] == "redirect_login"
@@ -198,6 +203,65 @@ async def test_forbidden_401_with_live_session_is_not_a_loss(browser, ssr_url, m
     assert sum(1 for e in events if e["type"] == "login" and e.get("role") == "alice") == 1
     assert [e for e in events if e["type"] == "observation" and e.get("role") == "alice"
             and e["data"].get("kind") == "access_denied"]
+
+
+def test_auth_probe_never_uses_approved_or_held_gets(ssr_url, make_cfg, run_dir, tmp_path):
+    """Fix round 1: a liveness probe must never re-send an approved (destructive) GET, a
+    GET the classifier holds, or a logout URL (query included), even with 2xx + 401
+    evidence on the same endpoint."""
+    from types import SimpleNamespace
+
+    from appmap.browser.session import auth_probe_urls
+
+    cfg = make_cfg(ssr_url, limits=FAST)
+    rd = run_dir(tmp_path, cfg)
+    for url, origin in ((ssr_url + "/projects/7/remove", "approved"),
+                        (ssr_url + "/items/9/delete", "ui"),
+                        (ssr_url + "/go?action=logout", "ui"),
+                        (ssr_url + "/dashboard", "login")):
+        seed(cfg, rd, role="alice", method="GET", url=url, origin=origin)
+        seed(cfg, rd, role="anonymous", method="GET", url=url, status=401)
+    seed(cfg, rd, role="alice", method="GET", url=ssr_url + "/projects", origin="ui")
+    seed(cfg, rd, role="anonymous", method="GET", url=ssr_url + "/projects", status=401)
+    sess = SimpleNamespace(role=SimpleNamespace(name="alice"), landing_url=None)
+    store = Store(rd.db_path)
+    try:
+        got = auth_probe_urls(sess, store, ssr_url + "/login", profile=cfg.profile, limit=10)
+    finally:
+        store.close()
+    assert [u for u, _ in got] == [ssr_url + "/projects"]
+
+
+async def test_spa_expiry_without_evidence_is_not_silently_forbidden(browser, spa_url, make_cfg,
+                                                                      run_dir, tmp_path):
+    """Fix round 1: a direct GET of an SPA's landing page answers 200 HTML whether or not
+    the token is valid, so with no session-gated evidence liveness is inconclusive: an
+    expired session re-logs in (bounded by C1) instead of turning every 401 into
+    ``forbidden``."""
+    from appmap.cli import _auth
+
+    cfg = make_cfg(spa_url, roles=spa_roles(spa_url), limits=FAST,
+                   discovery={"api_replay": False})
+    rd = run_dir(tmp_path, cfg)
+    seed(cfg, rd, role="admin", method="GET", url=spa_url + "/api/items",
+         resp_body=b'{"items": [{"id": 1, "title": "Item 1", "owner": "admin"}], '
+                   b'"next_cursor": "10"}', resp_ct="application/json")
+    assert all((await _auth(cfg, rd, cfg.roles, headed=False)).values())
+    from appmap.browser.session import state_path
+    for role in ("admin", "alice"):  # the app landed on a client route after login
+        p = state_path(rd, role)
+        st = json.loads(p.read_text())
+        st["appmap_landing_url"] = spa_url + "/items"
+        p.write_text(json.dumps(st))
+    urllib.request.urlopen(urllib.request.Request(spa_url + "/__expire", method="POST",
+                                                  data=b"")).read()
+    res = await run_active(cfg, rd, budget_minutes=5, browser=browser)
+    got = access(rd, "endpoint", "x.method='GET' AND x.path_pattern='/api/items'")
+    assert got["alice"] == "allowed"
+    events = [json.loads(line) for line in rd.events_path.read_text().splitlines()]
+    assert any(e["type"] == "session_lost" and e.get("role") == "alice" for e in events)
+    assert not [e for e in events if e["type"] == "observation"
+                and e["data"].get("kind") == "access_denied"]
 
 
 async def test_expired_session_relogin_after_forbidden(browser, ssr_url, make_cfg, run_dir,
@@ -212,6 +276,9 @@ async def test_expired_session_relogin_after_forbidden(browser, ssr_url, make_cf
          resp_body=b"<html><h1>Admin</h1></html>")
     seed(cfg, rd, role="admin", method="GET", url=ssr_url + "/projects/1/private",
          resp_body=b"<html><h1>Private notes</h1></html>")
+    seed(cfg, rd, role="alice", method="GET", url=ssr_url + "/projects")  # crawl evidence
+    seed(cfg, rd, role="anonymous", method="GET", url=ssr_url + "/projects", status=302,
+         resp_headers={"location": "/login"})
     assert all((await _auth(cfg, rd, cfg.roles, headed=False)).values())
     urllib.request.urlopen(urllib.request.Request(ssr_url + "/__expire", method="POST",
                                                   data=b"")).read()

@@ -447,7 +447,8 @@ async def test_forbidden_401_is_not_session_loss(browser, ssr_url, make_cfg, run
     assert q1(rd, "select count(*) from frontier where role='alice' and url like '%/private' "
                   "and status='done'") >= 2
     events = _events(rd)
-    assert sum(1 for e in events if e["type"] == "login") <= 2  # initial + at most one
+    assert sum(1 for e in events if e["type"] == "login") == 1  # the initial login only
+    assert any("landing page" in w for w in stats.warnings)  # liveness via landing: said
     assert not [e for e in events if e["type"] == "session_lost"]
     denied = [e for e in events if e["type"] == "observation"
               and e["data"].get("kind") == "access_denied"]

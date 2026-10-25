@@ -90,10 +90,12 @@ class Redactor:
     def learn_secret(self, value: str | None) -> bool:
         """Scrub ``value`` verbatim from now on: a value the crawler typed into an
         ``<input type=password>`` (whatever the field is named). Unlike ``learn`` there
-        is no plain-word filter; values shorter than ``MIN_SECRET_LEN`` are ignored (too
+        is no plain-word filter; values shorter than ``MIN_SECRET_LEN``, and digit-only
+        values shorter than ``MIN_LEARNED_LEN`` (ids, prices, years), are ignored (too
         common to scrub from every body; by-name redaction still covers them)."""
         if not isinstance(value, str) or len(value) < MIN_SECRET_LEN \
-                or "<redacted:" in value:
+                or "<redacted:" in value \
+                or (value.isdigit() and len(value) < MIN_LEARNED_LEN):
             return False
         if value not in self._variants:
             self._variants |= _variants(value)
