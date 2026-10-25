@@ -39,7 +39,7 @@ def q(rd, sql, *args):
 
 
 def seed(cfg, rd, *, role, method, url, status=200, req_body=None, req_ct=None,
-         resp_body=b"", resp_ct="text/html", origin="ui"):
+         resp_body=b"", resp_ct="text/html", origin="ui", source=None, resp_headers=None):
     """Record a captured exchange as if the crawler had seen it (no network)."""
     rt = build_runtime(cfg, rd)
     try:
@@ -48,8 +48,9 @@ def seed(cfg, rd, *, role, method, url, status=200, req_body=None, req_ct=None,
         return record_exchange(rt.store, rt.events, rt.redactor, rd, role=role, origin=origin,
                                method=method, url=url, req_headers=req_h,
                                req_body=req_body, status=status,
-                               resp_headers={"content-type": resp_ct}, resp_body=resp_body,
-                               duration_ms=1.0, caused_by=None, known_patterns=[])
+                               resp_headers={"content-type": resp_ct, **(resp_headers or {})},
+                               resp_body=resp_body, duration_ms=1.0, caused_by=None,
+                               known_patterns=[], source=source)
     finally:
         rt.store.close()
 
@@ -412,3 +413,47 @@ async def test_cross_role_sent_despite_own_exchange(browser, stub_server, make_c
     assert ("GET", "/api/docs/1") in srv.requests  # guest requested anonymous's object
     assert access(rd, "endpoint", "x.path_pattern='/api/docs/{id}'") == {
         "anonymous": "allowed", "guest": "allowed"}
+
+
+async def test_discovering_role_outcome_from_its_own_status(browser, stub_server, make_cfg,
+                                                            run_dir, tmp_path):
+    srv = stub_server(_members_app([]))
+    roles = [{"name": "anonymous", "login": {"type": "none"}},
+             {"name": "guest", "login": {"type": "none"}}]
+    cfg = make_cfg(srv.url, roles=roles, limits=FAST, discovery={"api_replay": False})
+    rd = run_dir(tmp_path, cfg)
+    # a forced-browsing hit: anonymous got 403, recorded as a passive/wordlist exchange
+    seed(cfg, rd, role="anonymous", method="GET", url=srv.url + "/backup", status=403,
+         origin="passive", source="wordlist")
+    seed(cfg, rd, role="anonymous", method="GET", url=srv.url + "/console", status=302,
+         origin="passive", source="wordlist",
+         resp_headers={"location": "/login?next=/console"})
+    await run_active(cfg, rd, budget_minutes=5, browser=browser)
+    assert access(rd, "endpoint", "x.path_pattern='/backup'")["anonymous"] == "forbidden"
+    assert access(rd, "endpoint", "x.path_pattern='/console'")["anonymous"] == "redirect_login"
+
+
+async def test_method_override_approval_blocks_post(browser, stub_server, make_cfg, run_dir,
+                                                    tmp_path):
+    srv = stub_server(_members_app([]))
+    roles = [{"name": "anonymous", "login": {"type": "none"}},
+             {"name": "guest", "login": {"type": "none"}}]
+    cfg = make_cfg(srv.url, roles=roles, limits=FAST)
+    rd = run_dir(tmp_path, cfg)
+    url = srv.url + "/projects/3"
+    seed(cfg, rd, role="anonymous", method="POST", url=url, req_body=b"name=x",
+         req_ct="application/x-www-form-urlencoded", resp_ct="application/json",
+         resp_body=b'{"ok": true}')
+    store = Store(rd.db_path)
+    store.upsert_approval("ap-0001", role="anonymous", category="delete", label="Remove",
+                          reasons=["label matches delete keyword"],
+                          action_path=[{"type": "goto", "url": url},
+                                       {"type": "submit", "form_label": "Remove",
+                                        "method": "DELETE", "action": url}],
+                          predicted_request={"method": "DELETE", "url": url},
+                          decision="pending")
+    store.close()
+    await run_active(cfg, rd, budget_minutes=5, browser=browser)
+    assert ("POST", "/projects/3") not in srv.requests
+    assert access(rd, "endpoint", "x.method='POST' AND x.path_pattern='/projects/{id}'") == {
+        "anonymous": "allowed", "guest": "not_tested"}

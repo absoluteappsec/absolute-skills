@@ -143,8 +143,17 @@ def _approvals(store: Store) -> list[tuple[str, str, str, str]]:
         if not url:
             continue
         parts = urlsplit(url)
-        out.append(((pr.get("method") or "GET").upper(), parts.netloc.lower(),
-                    parts.path or "/", f"{row['label'] or ''} {row['action_path'] or ''}"))
+        method = (pr.get("method") or "GET").upper()
+        text = f"{row['label'] or ''} {row['action_path'] or ''}"
+        out.append((method, parts.netloc.lower(), parts.path or "/", text))
+        try:
+            steps = json.loads(row["action_path"]) if row["action_path"] else []
+        except ValueError:
+            steps = []
+        if method not in ("GET", "POST") and any(
+                isinstance(st, dict) and st.get("type") == "submit" for st in steps or []):
+            # a form's hidden _method override (Rails/Laravel): the wire request is a POST
+            out.append(("POST", parts.netloc.lower(), parts.path or "/", text))
     return out
 
 
@@ -727,6 +736,20 @@ class _Matrix:
                          kind, item_id, r).fetchone() is None:
                 self.write(kind, item_id, r, "not_tested", None)
 
+    @staticmethod
+    def own_outcome(rep, login: str | None) -> str:
+        """The discovering role's outcome from its representative exchange: ``allowed``
+        for 2xx, otherwise what that exchange itself shows (e.g. a 403 wordlist hit)."""
+        status = rep["status"] or 0
+        if 200 <= status < 300:
+            return "allowed"
+        landed = rep["url"]
+        location = _header(rep["resp_headers"], "location")
+        if 300 <= status < 400 and location:
+            landed = urljoin(rep["url"], location)
+        return classify_outcome(0, None, status, landed, None, login,
+                                requested_url=rep["url"])
+
     async def item(self, kind: str, item_id: int, req: _Req, rep, *,
                    blocked: bool = False) -> None:
         """Fill ``role_access`` for one item. ``blocked`` items (approval-referenced) are
@@ -741,8 +764,8 @@ class _Matrix:
         for role in self.roles:
             if self.has_outcome(kind, item_id, role):
                 continue
-            if rep is not None and role == rep["role"]:
-                self.write(kind, item_id, role, "allowed", rep["id"])  # its own exchange
+            if rep is not None and role == rep["role"]:  # its own exchange is the evidence
+                self.write(kind, item_id, role, self.own_outcome(rep, login), rep["id"])
                 continue
             if blocked or role not in p.sessions:
                 self.write(kind, item_id, role, "not_tested", None)
