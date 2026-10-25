@@ -6,3 +6,4 @@ appmap-*/
 .superpowers/
 *.secrets.env
 appmap.secrets.env
+.worktrees/
