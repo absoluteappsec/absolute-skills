@@ -99,10 +99,23 @@ def spa_roles(url):
     ((200, None, 404, "http://h/admin", None, LOGIN), "not_found"),
     ((200, None, 302, "http://h/", None, LOGIN), "different_content"),
     ((200, None, 500, "http://h/x", None, LOGIN), "error"),
-    ((200, None, 400, "http://h/x", None, LOGIN), "error"),
+    ((200, None, 400, "http://h/x", None, LOGIN), "different_content"),
+    ((200, None, 422, "http://h/x", None, LOGIN), "different_content"),
+    ((200, None, 405, "http://h/x", None, LOGIN), "error"),
+    ((200, None, 502, "http://h/x", None, LOGIN), "error"),
 ])
 def test_classify_outcome(args, want):
     assert classify_outcome(*args) == want
+
+
+def test_classify_outcome_followed_redirect():
+    # a followed redirect to a different, non-login page is a denial, not "allowed"
+    assert classify_outcome(200, None, 200, "http://h/", None, LOGIN,
+                            requested_url="http://h/admin/reports") == "different_content"
+    assert classify_outcome(200, None, 200, "http://h/admin/reports/", None, LOGIN,
+                            requested_url="http://h/admin/reports") == "allowed"
+    assert classify_outcome(200, None, 200, "http://h/login", None, LOGIN,
+                            requested_url="http://h/admin/reports") == "redirect_login"
 
 
 async def test_alice_admin_access(browser, ssr_url, make_cfg, run_dir, tmp_path):
@@ -110,6 +123,8 @@ async def test_alice_admin_access(browser, ssr_url, make_cfg, run_dir, tmp_path)
     rd = run_dir(tmp_path, cfg)
     seed(cfg, rd, role="admin", method="GET", url=ssr_url + "/admin",
          resp_body=b"<html><h1>Admin</h1></html>")
+    seed(cfg, rd, role="admin", method="GET", url=ssr_url + "/admin/reports",
+         resp_body=b"<html><h1>Reports</h1></html>")
     store = Store(rd.db_path)
     store.upsert_route("/admin", ssr_url.split("//")[1], "page")
     store.close()
@@ -118,6 +133,9 @@ async def test_alice_admin_access(browser, ssr_url, make_cfg, run_dir, tmp_path)
     got = access(rd, "route", "x.pattern='/admin'")
     assert got == {"admin": "allowed", "alice": "forbidden", "anonymous": "redirect_login"}
     assert access(rd, "endpoint", "x.method='GET' AND x.path_pattern='/admin'") == got
+    # alice is redirected home (followed redirect): a denial, not "allowed"
+    assert access(rd, "endpoint", "x.method='GET' AND x.path_pattern='/admin/reports'") == {
+        "admin": "allowed", "alice": "different_content", "anonymous": "redirect_login"}
     # /projects was only seen in admin's login flow: tested with a fresh GET, not a replay
     assert access(rd, "endpoint", "x.method='GET' AND x.path_pattern='/projects'") == {
         "admin": "allowed", "alice": "allowed", "anonymous": "redirect_login"}
@@ -185,6 +203,18 @@ async def test_cross_role_put_not_held_delete_held(browser, spa_url, make_cfg, r
     held = access(rd, "endpoint", "x.method='DELETE'")
     assert set(held.values()) == {"not_tested"} and len(held) == 3
     assert rd.approvals_path.exists()
+    # the bearer tokens the roles used never reach the run directory
+    from appmap.browser.session import state_path
+    tokens = []
+    for role in ("admin", "alice"):
+        st = json.loads(state_path(rd, role).read_text())
+        tokens += [i["value"] for o in st.get("origins", []) for i in o.get("localStorage", [])
+                   if i["name"] == "token"]
+    assert tokens
+    for f in rd.root.rglob("*"):
+        if f.is_file():
+            data = f.read_bytes()
+            assert not any(t.encode() in data for t in tokens), f
 
 
 async def test_internal_flags_exercised(browser, spa_url, make_cfg, run_dir, tmp_path):
@@ -276,6 +306,24 @@ async def test_forced_browse_off_by_default(api, ssr_url, make_cfg, run_dir, tmp
         rt.store.close()
 
 
+async def test_forced_browse_refused_in_production(api, ssr_url, make_cfg, run_dir, tmp_path):
+    cfg = make_cfg(ssr_url, profile="production")
+    cfg.discovery.forced_browsing = True  # config validation rejects this; defence in depth
+    rd = run_dir(tmp_path, cfg)
+    rt = build_runtime(cfg, rd)
+    try:
+        counts = await forced_browse(None, api, cfg, rt.store, Frontier(rt.store), "anonymous")
+        assert counts["requests"] == 0
+    finally:
+        rt.store.close()
+
+
+def test_builtin_wordlist_has_no_setup_paths(make_cfg, ssr_url):
+    from appmap.probe.replay import load_wordlist
+    words = load_wordlist(make_cfg(ssr_url))
+    assert len(words) >= 150 and not {"install", "installer", "setup", "logout"} & set(words)
+
+
 def test_cli_probe_active(ssr_url, make_cfg, tmp_path, capsys):
     cfg = make_cfg(ssr_url, roles=[{"name": "anonymous", "login": {"type": "none"}}],
                    limits=FAST)
@@ -293,3 +341,74 @@ def test_cli_probe_active(ssr_url, make_cfg, tmp_path, capsys):
     assert main(["probe", "--run", str(run), "--phase", "active", "--budget-minutes", "0"]) == 0
     st = json.loads(capsys.readouterr().out.strip().splitlines()[-1].removeprefix("APPMAP_STATUS "))
     assert st["status"] == "in_progress" and "--phase active" in st["next"]
+
+
+def _members_app(log):
+    from werkzeug.wrappers import Request, Response
+
+    @Request.application
+    def app(request):
+        log.append((request.method, request.path))
+        return Response('{"ok": true}', mimetype="application/json")
+    return app
+
+
+async def test_approval_flagged_actions_never_replayed(browser, stub_server, make_cfg, run_dir,
+                                                       tmp_path):
+    srv = stub_server(_members_app([]))
+    roles = [{"name": "anonymous", "login": {"type": "none"}},
+             {"name": "guest", "login": {"type": "none"}}]
+    cfg = make_cfg(srv.url, roles=roles, limits=FAST)
+    rd = run_dir(tmp_path, cfg)
+    form = "application/x-www-form-urlencoded"
+    # an approved (crawl-flagged) action's exchange, benign-looking URL
+    seed(cfg, rd, role="anonymous", method="POST", url=srv.url + "/members/5",
+         req_body=b"name=x", req_ct=form, origin="approved", resp_ct="application/json",
+         resp_body=b'{"ok": true}')
+    # a captured POST whose URL an approval row references (any decision)
+    seed(cfg, rd, role="anonymous", method="POST", url=srv.url + "/teams/7",
+         req_body=b"name=y", req_ct=form, resp_ct="application/json", resp_body=b'{"ok": true}')
+    store = Store(rd.db_path)
+    store.upsert_approval("ap-0001", role="anonymous", category="delete", label="Remove member",
+                          reasons=["label matches delete keyword"], action_path=[],
+                          predicted_request={"method": "POST", "url": srv.url + "/teams/7"},
+                          decision="approve")
+    store.close()
+    # destructive only by its body (Rails-style method override)
+    seed(cfg, rd, role="anonymous", method="POST", url=srv.url + "/groups/9",
+         req_body=b"_method=delete&id=9", req_ct=form, resp_ct="application/json",
+         resp_body=b'{"ok": true}')
+    # logout: captured and schema-only
+    seed(cfg, rd, role="anonymous", method="GET", url=srv.url + "/signout")
+    seed_endpoint(cfg, rd, srv.url.split("//")[1], "GET", "/api/logout", "bundle")
+    srv.requests.clear()
+    await run_active(cfg, rd, budget_minutes=5, browser=browser)
+    sent = [r for r in srv.requests if r[0] not in ("OPTIONS", "HEAD")]
+    assert not [r for r in sent if r[1].startswith(("/members", "/teams", "/groups"))], sent
+    assert not [r for r in srv.requests if "sign" in r[1] or "logout" in r[1]]
+    for path in ("/members/{id}", "/teams/{id}", "/groups/{id}", "/signout"):
+        assert access(rd, "endpoint", "x.path_pattern=?", path)["guest"] == "not_tested", path
+    approvals = q(rd, "SELECT category, predicted_request FROM approvals")
+    assert not [a for a in approvals if a["category"] == "logout"]
+    urls = [json.loads(a["predicted_request"])["url"] for a in approvals]
+    assert urls.count(srv.url + "/teams/7") == 1  # not re-queued
+    assert srv.url + "/members/5" not in urls
+    assert [a["category"] for a in approvals
+            if json.loads(a["predicted_request"])["url"] == srv.url + "/groups/9"] == ["delete"]
+
+
+async def test_cross_role_sent_despite_own_exchange(browser, stub_server, make_cfg, run_dir,
+                                                    tmp_path):
+    srv = stub_server(_members_app([]))
+    roles = [{"name": "anonymous", "login": {"type": "none"}},
+             {"name": "guest", "login": {"type": "none"}}]
+    cfg = make_cfg(srv.url, roles=roles, limits=FAST, discovery={"api_replay": False})
+    rd = run_dir(tmp_path, cfg)
+    for role in ("anonymous", "guest"):  # both saw /api/docs/{id}, for different objects
+        seed(cfg, rd, role=role, method="GET",
+             url=srv.url + ("/api/docs/1" if role == "anonymous" else "/api/docs/2"),
+             resp_ct="application/json", resp_body=b'{"ok": true}')
+    await run_active(cfg, rd, budget_minutes=5, browser=browser)
+    assert ("GET", "/api/docs/1") in srv.requests  # guest requested anonymous's object
+    assert access(rd, "endpoint", "x.path_pattern='/api/docs/{id}'") == {
+        "anonymous": "allowed", "guest": "allowed"}

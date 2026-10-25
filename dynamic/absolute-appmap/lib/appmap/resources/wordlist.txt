@@ -81,9 +81,6 @@ config.yml
 configuration
 settings
 settings.json
-setup
-install
-installer
 .env
 .env.local
 .env.production

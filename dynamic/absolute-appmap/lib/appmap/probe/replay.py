@@ -49,7 +49,8 @@ _LOGIN_SEG = re.compile(r"^(?:log-?in|sign[-_]?in|signin)(?:\.\w+)?$", re.I)
 _LOGIN_PATH = re.compile(r"(?:^|/)(?:log-?in|sign[-_]?in)(?:/|$|\.)", re.I)
 _REDACTED = "<redacted:"
 # Captured traffic api_replay varies (its own replay/schema/cross_role output is not).
-_CAPTURED = ("ui", "approved", "passive", "bundle")
+# Exchanges of approved (destructive) actions are never used: see approval_blocked_ids.
+_CAPTURED = ("ui", "passive", "bundle")
 PROGRESS_KEY = "probe_active"
 MAX_RELOGINS = 2
 WARM_UP_TIMEOUT_MS = 10000
@@ -73,21 +74,28 @@ def _is_login_url(url: str, login_url: str | None) -> bool:
 
 
 def classify_outcome(baseline_status: int, baseline_shape: dict | None, resp_status: int,
-                     resp_url: str, resp_shape: dict | None, login_url: str | None) -> str:
-    """Access outcome of one replay compared with the discovering role's exchange.
+                     resp_url: str, resp_shape: dict | None, login_url: str | None,
+                     *, requested_url: str | None = None) -> str:
+    """Access outcome of one replay compared with the discovering role's exchange
+    (ruling R20).
 
     ``resp_url`` is where the response ended up (the redirect target, or the requested
-    URL). Pass ``login_url=None`` when the item itself is the login page; without a login
-    URL, paths like ``/login`` or ``/users/sign_in`` count as the login page."""
+    URL). With ``requested_url``, landing on a different (non-login) path means the
+    request was redirected away: ``different_content``. Pass ``login_url=None`` when the
+    item itself is the login page; without a login URL, paths like ``/login`` or
+    ``/users/sign_in`` count as the login page. 400/422 mean authorization passed and the
+    input was rejected: ``different_content``."""
     if resp_status == 401 or _is_login_url(resp_url, login_url):
         return "redirect_login"
     if resp_status == 403:
         return "forbidden"
     if resp_status in (404, 410):
         return "not_found"
-    if resp_status <= 0 or resp_status >= 500:
+    if resp_status <= 0 or resp_status >= 500 or resp_status == 405:
         return "error"
-    if 300 <= resp_status < 400:
+    if 300 <= resp_status < 400 or resp_status in (400, 422):
+        return "different_content"
+    if requested_url and resp_url and _path_of(resp_url) != _path_of(requested_url):
         return "different_content"
     if 200 <= resp_status < 300:
         if 200 <= (baseline_status or 0) < 300 and baseline_shape is not None \
@@ -120,6 +128,54 @@ def login_endpoint_ids(store: Store, cfg: RunConfig) -> set[int]:
             "HAVING sum(origin='login' AND upper(method) NOT IN ('GET','HEAD','OPTIONS')) > 0 "
             "AND sum(origin!='login') = 0"):
         ids.add(eid)
+    return ids
+
+
+def _approvals(store: Store) -> list[tuple[str, str, str, str]]:
+    """(METHOD, host, path, text) of every approval with a predicted request URL."""
+    out = []
+    for row in store.conn.execute("SELECT label, action_path, predicted_request FROM approvals"):
+        try:
+            pr = json.loads(row["predicted_request"]) if row["predicted_request"] else {}
+        except ValueError:
+            pr = {}
+        url = (pr or {}).get("url")
+        if not url:
+            continue
+        parts = urlsplit(url)
+        out.append(((pr.get("method") or "GET").upper(), parts.netloc.lower(),
+                    parts.path or "/", f"{row['label'] or ''} {row['action_path'] or ''}"))
+    return out
+
+
+def _approval_matches(approvals, method: str, host: str, pattern: str,
+                      graphql_op: str = "", graphql_type: str | None = None) -> bool:
+    for a_method, a_host, a_path, text in approvals:
+        if a_method != method.upper() or a_host != host:
+            continue
+        if normalize_path(a_path, [pattern]) != pattern:
+            continue
+        # A GraphQL URL hosts many operations: block the named one, and every
+        # non-query operation when the approval does not say which one it was.
+        if graphql_op and graphql_op not in text and (graphql_type or "query") == "query":
+            continue
+        return True
+    return False
+
+
+def approval_blocked_ids(store: Store) -> set[int]:
+    """Endpoints never replayed (ruling R20): captured with origin ``approved``, or
+    referenced by any approval row (whatever its decision). Replay re-classifies by
+    method/URL/body only and would lose the crawl's label/confirm/context signals."""
+    ids = {eid for (eid,) in store.conn.execute(
+        "SELECT DISTINCT endpoint_id FROM exchanges WHERE origin='approved' "
+        "AND endpoint_id IS NOT NULL")}
+    approvals = _approvals(store)
+    if approvals:
+        for ep in store.conn.execute("SELECT * FROM endpoints"):
+            if _approval_matches(approvals, ep["method"], ep["host"], ep["path_pattern"],
+                                 ep["graphql_op"], ep["graphql_type"]):
+                ids.add(ep["id"])
     return ids
 
 
@@ -233,14 +289,15 @@ class _Prober:
     def request_of(self, ex, kind: str = "rest", op: str = "") -> _Req:
         body = self.stored_body(ex["req_body"], ex["req_body_path"])
         ctype = _header(ex["req_headers"], "content-type")
-        ctx = body.decode("utf-8", "replace") if body and kind == "graphql_op" else ""
+        ctx = body.decode("utf-8", "replace") if body else ""  # classify sees the body
         return _Req(ex["method"].upper(), ex["url"], body or None, ctype if body else None,
                     op, ctx)
 
     def rep_exchange(self, endpoint_id: int, role: str | None = None,
                      origins: tuple[str, ...] | None = None):
         """Representative exchange: 2xx first, then UI traffic, then oldest."""
-        sql = "SELECT * FROM exchanges WHERE endpoint_id=? AND origin NOT IN ('login','cross_role')"
+        sql = ("SELECT * FROM exchanges WHERE endpoint_id=? "
+               "AND origin NOT IN ('login','cross_role','approved')")
         args: list = [endpoint_id]
         if role is not None:
             sql += " AND role=?"
@@ -267,8 +324,8 @@ class _Prober:
             flag = Flag(True, "delete", ["request could not be classified"])
         if not flag.held:
             return False
-        if not enqueue:
-            return True
+        if not enqueue or flag.category == "logout":
+            return True  # logout items are skipped outright, never queued (R20)
         step: dict[str, Any] = {"type": "request", "method": req.method, "url": req.url,
                                 "origin": origin}
         if req.body is not None:
@@ -385,6 +442,11 @@ async def _install_guard(sess: RoleSession, cfg: RunConfig) -> None:
             pass
         if flag.held and not (flag.category == "data_create" and from_login):
             await route.abort("blockedbyclient")
+            msg = (f"warm-up: held {request.method} request aborted ({flag.category}); "
+                   "not queued (the crawl covers page loads)")
+            log.info("[%s] %s: %s", role, msg, request.url)
+            if rec is not None:
+                rec.events.emit("error", role=role, url=request.url, message=msg)
             return
         await route.fallback()
 
@@ -505,8 +567,8 @@ def _schema_request(p: _Prober, ep, marker: str) -> _Req | None:
                     op, doc)
     if method == "GET":
         return _Req("GET", url)
-    body = {r["name"]: _example(r, marker) for r in by_loc.get("body", [])}
-    return _Req(method, url, json.dumps(body).encode(), "application/json")
+    body = json.dumps({r["name"]: _example(r, marker) for r in by_loc.get("body", [])})
+    return _Req(method, url, body.encode(), "application/json", context=body)
 
 
 async def api_replay(client: DirectClient, sessions: dict[str, RoleSession], cfg: RunConfig,
@@ -517,7 +579,7 @@ async def api_replay(client: DirectClient, sessions: dict[str, RoleSession], cfg
     have no exchanges at all (schema/bundle only). Pass ``exercise`` for one role per run
     so held schema-only requests are queued once, not once per role."""
     p = _Prober(client, sessions, cfg, store, queue, deadline)
-    skip = login_endpoint_ids(store, cfg)
+    skip = login_endpoint_ids(store, cfg) | approval_blocked_ids(store)
     for ep in list(store.conn.execute("SELECT * FROM endpoints ORDER BY id")):
         if not p.alive():
             break
@@ -580,6 +642,9 @@ async def forced_browse(client: DirectClient, api, cfg: RunConfig, store: Store,
     and are queued for every role."""
     counts = {"requests": 0, "wordlist_found": 0, "queued": 0, "timed_out": 0}
     if not cfg.discovery.forced_browsing:
+        return counts
+    if cfg.profile == "production":  # config validation rejects this too (defence in depth)
+        log.warning("forced browsing refused: not allowed with profile production")
         return counts
     fb = with_source(client, "wordlist", attribute=False)
     scope = client.gate.scope
@@ -662,16 +727,10 @@ class _Matrix:
                          kind, item_id, r).fetchone() is None:
                 self.write(kind, item_id, r, "not_tested", None)
 
-    def own_ok(self, endpoint_id: int | None, role: str) -> int | None:
-        if endpoint_id is None:
-            return None
-        row = self.p._q("SELECT id FROM exchanges WHERE endpoint_id=? AND role=? AND "
-                        "origin!='login' AND status BETWEEN 200 AND 299 ORDER BY id LIMIT 1",
-                        endpoint_id, role).fetchone()
-        return row[0] if row else None
-
-    async def item(self, kind: str, item_id: int, req: _Req, rep,
-                   endpoint_id: int | None) -> None:
+    async def item(self, kind: str, item_id: int, req: _Req, rep, *,
+                   blocked: bool = False) -> None:
+        """Fill ``role_access`` for one item. ``blocked`` items (approval-referenced) are
+        never sent: every role but the discovering one gets ``not_tested``."""
         p = self.p
         base_status = rep["status"] if rep is not None else 0
         base_shape = None
@@ -683,15 +742,9 @@ class _Matrix:
             if self.has_outcome(kind, item_id, role):
                 continue
             if rep is not None and role == rep["role"]:
-                self.write(kind, item_id, role, classify_outcome(
-                    base_status, base_shape, base_status, rep["url"], base_shape, login),
-                    rep["id"])
+                self.write(kind, item_id, role, "allowed", rep["id"])  # its own exchange
                 continue
-            own = self.own_ok(endpoint_id, role)
-            if own is not None:
-                self.write(kind, item_id, role, "allowed", own)
-                continue
-            if role not in p.sessions:
+            if blocked or role not in p.sessions:
                 self.write(kind, item_id, role, "not_tested", None)
                 continue
             if not req.usable:
@@ -709,7 +762,8 @@ class _Matrix:
                     sent = await p.fetch(role, req, "cross_role")
                     self.cache[key] = (("error", None) if sent is None else (
                         classify_outcome(base_status, base_shape, sent.status, sent.final_url,
-                                         sent.shape, login), sent.exchange_id))
+                                         sent.shape, login, requested_url=req.url),
+                        sent.exchange_id))
             self.write(kind, item_id, role, *self.cache[key])
 
 
@@ -750,6 +804,8 @@ async def cross_role_replay(client: DirectClient, sessions: dict[str, RoleSessio
     p = _Prober(client, sessions, cfg, store, queue, deadline)
     m = _Matrix(p, [r.name for r in cfg.roles])
     skip = login_endpoint_ids(store, cfg)
+    blocked = approval_blocked_ids(store)
+    approvals = _approvals(store)
     for ep in list(store.conn.execute("SELECT * FROM endpoints ORDER BY id")):
         if not p.alive():
             return p.counts
@@ -760,13 +816,13 @@ async def cross_role_replay(client: DirectClient, sessions: dict[str, RoleSessio
             # Only login-flow traffic (or none): a plain GET is still a fresh request.
             url = _get_url(p, ep["host"], ep["path_pattern"]) \
                 if ep["method"] == "GET" and ep["kind"] in ("page", "rest") else None
-            if url is None:
+            if url is None or ep["id"] in blocked:
                 m.untested("endpoint", ep["id"])
             else:
-                await m.item("endpoint", ep["id"], _Req("GET", url), None, ep["id"])
+                await m.item("endpoint", ep["id"], _Req("GET", url), None)
             continue
         await m.item("endpoint", ep["id"], p.request_of(rep, ep["kind"], ep["graphql_op"]),
-                     rep, ep["id"])
+                     rep, blocked=ep["id"] in blocked)
     for route in list(store.conn.execute("SELECT * FROM routes ORDER BY id")):
         if not p.alive():
             return p.counts
@@ -774,10 +830,12 @@ async def cross_role_replay(client: DirectClient, sessions: dict[str, RoleSessio
         if _LOGIN_SEG.match(last):
             continue
         url, rep, eid = _route_target(p, route)
-        if url is None:
+        is_blocked = eid in blocked or _approval_matches(approvals, "GET", route["host"],
+                                                         route["pattern"])
+        if url is None or (is_blocked and rep is None):
             m.untested("route", route["id"])
             continue
-        await m.item("route", route["id"], _Req("GET", url), rep, eid)
+        await m.item("route", route["id"], _Req("GET", url), rep, blocked=is_blocked)
     return p.counts
 
 

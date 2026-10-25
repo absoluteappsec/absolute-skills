@@ -167,6 +167,14 @@ def create_app() -> Flask:
             return page("Forbidden", "<p>Admins only</p>", request.user, status=403)
         return page("Admin", "<p>Admin console</p>", request.user)
 
+    @app.get("/admin/reports")
+    def admin_reports():
+        if (r := need_login()):
+            return r
+        if USERS[request.user]["role"] != "admin":
+            return redirect("/")  # denial by redirecting non-admins home
+        return page("Reports", "<p>Admin reports</p>", request.user)
+
     @app.route("/account/password", methods=["GET", "POST"])
     def account_password():
         if (r := need_login()):
