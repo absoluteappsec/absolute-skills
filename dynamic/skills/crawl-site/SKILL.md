@@ -11,15 +11,17 @@ This skill is a procedure for you, the agent. There is no special tooling: use t
 
 ## Ground rules (never break these)
 
-1. **Authorization first.** Before any request, confirm with the user that they own or are authorized to test the site, and agree the scope (hosts and paths). Stay inside it; note but never visit out-of-scope links.
-2. **Never perform destructive actions without asking.** Before clicking or submitting anything that deletes, deactivates, changes a password or email, pays, transfers, sends email/SMS/messages, invites, or logs out, stop and list it for the user. Do it only if they say yes, one batch at a time. When unsure, ask.
-3. **Credentials stay out of files and chat.** Use credentials only to log in. Never write passwords, session cookies or tokens into `SITE-MAP.md` or echo them back. Write `<redacted>` instead.
+1. **Authorization first.** Before any request, confirm with the user that they own or are authorized to test the site, and agree the scope (hosts and paths). Stay inside it; note but never visit out-of-scope links. **Block out-of-scope requests the page makes on its own** (analytics, telemetry, CDNs, third-party scripts) from the very first page load — e.g. route/abort every request whose host is not in scope — unless the user says to allow specific hosts. Record the blocked hosts.
+2. **Never perform destructive actions without asking.** Before clicking or submitting anything that deletes, deactivates, changes a password or email, changes permissions/roles, creates an account, issues API tokens or keys, pays, transfers, sends email/SMS/messages, invites, or logs out, stop and list it for the user. This includes plain GET links that change data (e.g. `…/delete/`, `…/complete/` links with no confirmation). Do it only if they say yes, one batch at a time; standing decisions the user gives up front count. When unsure, ask.
+3. **Credentials stay out of files and chat.** Use credentials only to log in; read them from where the user put them (e.g. environment variables), never type them into chat. Never write passwords, session cookies, tokens or API keys into `SITE-MAP.md`, scripts, network logs, scratch files, or chat — redact login request bodies and auth headers/cookies before saving any network capture, and write `<redacted>` instead. Delete saved browser sessions (storage-state files) when you finish, and check your work directory for the passwords before reporting.
 4. **Be gentle.** One page at a time, a short pause between actions. If you see errors pile up (429, 5xx), slow down or stop and tell the user. Production sites: ask before submitting any form at all.
 5. **Generated test data is labelled.** When you fill forms, use values containing a marker such as `sitemap-test-<date>` so records can be found and cleaned up later. List every record you create.
 
 ## Step 1 — Set up
 
 Ask (or confirm from the request): base URL(s), in-scope hosts/paths, anything to avoid (e.g. `/logout`, admin user pages), whether it's staging or production, and the roles to crawl with how to log in as each (the user types credentials or tells you where they are — don't store them).
+
+**Logging in:** after submitting the login form, confirm success by something only a logged-in user sees (a logout link, the username, a page that redirected you before). If it fails, retry at most once (lockouts are real), then continue without that role and report it — say what the page showed (e.g. "Login failed" message) without repeating the credentials.
 
 Create `SITE-MAP.md` in the working directory (or where the user says) with a header: site, date, scope, roles, environment.
 
@@ -32,7 +34,7 @@ For each role (start with anonymous if there is one), log in, then explore bread
 - **Interactive controls:** menus, tabs, buttons, cards and anything clickable. Click non-destructive ones; note what they reveal or what request they send.
 - **Forms:** record fields (name, type, required, options), the action/method, and what happens on submit. Fill with sensible labelled test data and submit unless rule 2 applies. Record validation errors you hit — they describe the rules.
 - **Network:** watch the network log. Record each distinct API call: method, path (replace ids with `{id}`), what triggered it, status, and the shape of the response (field names, not full data). Note GraphQL operation names.
-- **Free extras:** check `robots.txt`, `sitemap.xml`, and common API docs paths (`/openapi.json`, `/swagger.json`, `/schema/`, `/swagger-ui/`, `/api/docs/`). Record what you find.
+- **Free extras:** check `robots.txt`, `sitemap.xml`, and common API docs paths (`/openapi.json`, `/swagger.json`, `/schema/`, `/swagger-ui/`, `/api/docs/`). A framework debug/404 page that lists URL patterns (e.g. Django `DEBUG=True`) is a full route list — visit those routes. Scan loaded JavaScript for `fetch(`/`axios`/route definitions to find API calls and routes the UI never triggers. Record what you find.
 - **Errors and tells:** note error pages, debug pages, framework banners, server headers — useful for the summary.
 
 Don't revisit near-identical pages endlessly: for lists and detail pages, sample a few items, then move on. Keep going until no new pages, routes, forms or API calls appear.
