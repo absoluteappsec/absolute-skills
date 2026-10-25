@@ -26,7 +26,8 @@ def test_cache_dir_honors_xdg(monkeypatch, tmp_path):
 
 
 def test_subcommands_registered_with_handlers():
-    names = {"init", "auth", "crawl", "probe", "approvals", "build", "status", "query"}
+    names = {"init", "auth", "crawl", "probe", "approvals", "build", "status", "query",
+             "profile"}
     sub = next(a for a in build_parser()._actions if a.dest == "command")
     assert set(sub.choices) == names == set(cli.HANDLERS)
     assert cli.LOCKED <= names

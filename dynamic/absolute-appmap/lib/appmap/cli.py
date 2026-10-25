@@ -101,6 +101,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also report coverage gaps (JSON line before APPMAP_STATUS)")
     p.add_argument("--new-pass", action="store_true",
                    help="start the next pass: snapshot current counts as its baseline")
+    p = sub.add_parser("profile", help="describe the application (stack, features, data "
+                                       "model) from one or more finished runs; read-only")
+    p.add_argument("--run", action="append", required=True,
+                   help="run directory (repeat for several environments of one application)")
+    p.add_argument("--out", help="output directory (default: the first run directory)")
+    p.add_argument("--include-observed-accounts", action="store_true",
+                   help="do not mask observed usernames/emails of production runs")
     _add_query_parser(sub)
     return parser
 
@@ -556,6 +563,57 @@ def cmd_build(args) -> int:
     return 0
 
 
+def _write_atomic(path: Path, text: str) -> None:
+    import os
+
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def cmd_profile(args) -> int:
+    """Read-only on the runs (no run lock); writes only its own files, atomically."""
+    from appmap.profile import build_profile
+    from appmap.profile.names import apply_profile_names, emit_profile_names
+    from appmap.profile.render import render_app_profile
+
+    runs = [Path(r) for r in args.run]
+    out = Path(args.out) if args.out else runs[0]
+    try:
+        if args.out:
+            out.mkdir(parents=True, exist_ok=True)
+        profile = build_profile(runs, include_observed_accounts=args.include_observed_accounts)
+        names_path = out / "profile-names.yaml"
+        warnings = emit_profile_names(profile, names_path)
+        applied = apply_profile_names(profile, names_path)
+        _write_atomic(out / "profile.json",
+                      json.dumps(profile, indent=2, ensure_ascii=False, default=str) + "\n")
+        _write_atomic(out / "APP-PROFILE.md", render_app_profile(profile))
+    except Exception as e:
+        log.exception("profile failed")
+        emit_status("profile", ok=False, status="error", errors=[f"{type(e).__name__}: {e}"])
+        return 1
+    features = profile.get("features") or []
+    counts = {"technologies": len(profile.get("technologies") or []),
+              "features": len(features),
+              "entities": len(profile.get("data_model") or []),
+              "environments": len(profile.get("environments") or [])}
+    named = {k for k, v in (profile.get("feature_names") or {}).items() if v.get("name")}
+    nxt = None
+    if not profile.get("purpose") or any(f["key"] not in named for f in features):
+        run_args = " ".join(f"--run {_q(r)}" for r in runs)
+        out_arg = f" --out {_q(out)}" if args.out else ""
+        nxt = (f"fill {_q(names_path)} (purpose and feature names), then re-run: "
+               f"appmap profile {run_args}{out_arg}")
+    emit_status("profile", ok=True, status=profile["status"], counts=counts, errors=warnings,
+                next=nxt)
+    log.info("profile: %s (%d feature names applied)", counts, applied)
+    return 0
+
+
 def cmd_query(args) -> int:
     from appmap.query import (DEFAULT_SQL_LIMIT, QueryError, format_table, run_recipe,
                               run_sql_limited)
@@ -677,8 +735,8 @@ def cmd_status(args) -> int:
 LOCKED = {"auth", "crawl", "probe", "approvals", "build"}
 
 HANDLERS = {"init": cmd_init, "auth": cmd_auth, "crawl": cmd_crawl, "probe": cmd_probe,
-            "approvals": cmd_approvals, "build": cmd_build, "status": cmd_status,
-            "query": cmd_query}
+            "approvals": cmd_approvals, "build": cmd_build, "profile": cmd_profile,
+            "status": cmd_status, "query": cmd_query}
 
 
 def _usage_error(parser: argparse.ArgumentParser, message: str) -> int:

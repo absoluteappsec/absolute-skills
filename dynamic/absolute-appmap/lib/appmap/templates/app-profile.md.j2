@@ -1,0 +1,345 @@
+# Application profile
+
+Generated {{ p.generated_at }} (profile schema {{ p.profile_schema_version }}, status: {{ p.status }}).
+This document describes what was observed in the mapped run(s); it is descriptive only.
+
+{% if production %}
+> **Handling notice:** at least one input run used the `production` profile. This profile and
+> the run directories it was built from may contain real production customer data, including
+> PII. Observed usernames and email addresses are masked unless the profile was generated with
+> `--include-observed-accounts`. Treat these files as sensitive engagement data: store them
+> encrypted, share them only with people authorized for this engagement, and delete them when
+> the engagement ends.
+
+{% endif %}
+## Purpose
+
+{% if p.purpose %}
+{{ p.purpose }}
+{% else %}
+Not yet described. Fill `purpose` in `profile-names.yaml`, then re-run `appmap profile`.
+{% endif %}
+
+## Main features
+
+{% if features %}
+{% for f in features %}
+### {{ f.title }}
+
+{% if f.description %}
+{{ f.description }}
+
+{% endif %}
+- Roles: {{ f.roles | join(", ") or "none observed" }}
+- Entry points: {% for r in f.routes %}`{{ r | cell }}`{% if not loop.last %}, {% endif %}{% else %}none observed{% endfor %}{% if f.routes_more %} (+{{ f.routes_more }} more){% endif %}
+
+{% endfor %}
+{% if features_more %}
+… {{ features_more }} more features — see profile.json
+
+{% endif %}
+{% else %}
+No features were derived from this run.
+
+{% endif %}
+## How it works
+
+{% if features %}
+{% for f in features %}
+### {{ f.title }}
+
+{% if f.how_it_works %}
+{{ f.how_it_works }}
+
+{% endif %}
+{% if f.endpoints %}
+Endpoints: {% for e in f.endpoints %}`{{ e | cell }}`{% if not loop.last %}, {% endif %}{% endfor %}{% if f.endpoints_more %} (+{{ f.endpoints_more }} more){% endif %}
+
+{% endif %}
+{% if f.forms %}
+Forms:
+{% for fm in f.forms %}
+- {{ fm.method }} `{{ fm.action | cell }}`{% if fm.purpose %} — {{ fm.purpose | cell }}{% endif %}
+
+{% endfor %}
+{% if f.forms_more %}
+- … {{ f.forms_more }} more — see profile.json
+{% endif %}
+
+{% endif %}
+{% if not f.how_it_works and not f.endpoints and not f.forms %}
+No further detail observed.
+
+{% endif %}
+{% endfor %}
+{% else %}
+Nothing to describe.
+
+{% endif %}
+## Technology stack
+
+{% if technologies %}
+| Name | Category | Version(s) | Confidence | Evidence |
+|---|---|---|---|---|
+{% for t in technologies %}
+| {{ t.name | cell }} | {{ t.category | cell }} | {{ (t.versions | join(", ")) | cell }} | {{ t.confidence }} | {{ t.evidence | length }} |
+{% endfor %}
+{% if technologies_more %}
+
+… {{ technologies_more }} more — see profile.json
+{% endif %}
+
+Confidence: `confirmed` (stated by the application itself), `likely` (strong indirect signal),
+`guessed` (weak signal). Evidence references are listed in profile.json.
+{% else %}
+No technologies were identified.
+{% endif %}
+
+## Layout
+
+{% if areas %}
+| Area | Routes | Endpoints | Roles |
+|---|---|---|---|
+{% for a in areas %}
+| `{{ a.prefix | cell }}` | {{ a.routes | length }} | {{ a.endpoints | length }} | {{ a.roles | join(", ") | cell }} |
+{% endfor %}
+{% if areas_more %}
+
+… {{ areas_more }} more — see profile.json
+{% endif %}
+
+{% else %}
+No areas recorded.
+
+{% endif %}
+{% if api_groups %}
+API groups:
+
+{% for g in api_groups %}
+- `{{ g.resource | cell }}`: {{ g.endpoints | length }} endpoint(s)
+{% endfor %}
+{% if api_groups_more %}
+- … {{ api_groups_more }} more — see profile.json
+{% endif %}
+
+{% endif %}
+{% if layout.entry_points %}
+Entry points by role:
+
+{% for role, urls in layout.entry_points.items() %}
+- {{ role | cell }}: {% for u in urls[:5] %}`{{ u | cell }}`{% if not loop.last %}, {% endif %}{% endfor %}{% if urls | length > 5 %} (+{{ urls | length - 5 }} more){% endif %}
+
+{% endfor %}
+
+{% endif %}
+## Data model & types
+
+{% if entities %}
+{% for e in entities %}
+### {{ e.name }}
+
+Source: {{ e.source }}; id format: {{ e.id_format }}; endpoints: {{ e.endpoints | length }}.
+
+{% if e.fields %}
+| Field | Type | Required | Constraints | Example |
+|---|---|---|---|---|
+{% for f in e.fields %}
+| {{ f.name | cell }} | {{ f.type | cell }} | {{ "yes" if f.required else "no" }} | {{ f.constraint_text | cell }} | {{ f.example_redacted | cell }} |
+{% endfor %}
+{% if e.fields_more %}
+
+… {{ e.fields_more }} more fields — see profile.json
+{% endif %}
+
+{% endif %}
+{% endfor %}
+{% if entities_more %}
+… {{ entities_more }} more entities — see profile.json
+
+{% endif %}
+{% else %}
+No data model could be derived.
+
+{% endif %}
+## Data setup
+
+{% if preconditions %}
+Values some flows need from earlier requests:
+
+{% for pc in preconditions %}
+- `{{ pc.flow_key | cell }}` needs {% for r in pc.requires %}`{{ r.json_path | cell }}` from `{{ r.endpoint | cell }}` (used in {{ r.consumer_location }}){% if not loop.last %}; {% endif %}{% endfor %}
+
+{% endfor %}
+{% if preconditions_more %}
+- … {{ preconditions_more }} more — see profile.json
+{% endif %}
+
+{% endif %}
+{% if records %}
+Records created by the run:
+
+| Role | Request | Status | Marker |
+|---|---|---|---|
+{% for r in records %}
+| {{ r.role | cell }} | {{ r.method }} `{{ r.endpoint | cell }}` | {{ r.status }} | {{ r.marker | cell }} |
+{% endfor %}
+{% if records_more %}
+
+… {{ records_more }} more — see profile.json
+{% endif %}
+
+{% endif %}
+{% if seeds %}
+Pre-existing data observed (ids not created by the run):
+
+{% for s in seeds %}
+- `{{ s.resource | cell }}`: {{ s.count }} record(s), ids {{ s.id_min }}–{{ s.id_max }}
+{% endfor %}
+{% if seeds_more %}
+- … {{ seeds_more }} more — see profile.json
+{% endif %}
+
+{% endif %}
+{% if setup.fixtures_used %}
+Form fixtures (`fixtures.yaml`) were used for this run.
+
+{% endif %}
+{% if not preconditions and not records and not seeds and not setup.fixtures_used %}
+No data setup was observed.
+
+{% endif %}
+## Test accounts
+
+{% if roles %}
+| Role | Login | Authenticated | Reachable routes | Reachable endpoints |
+|---|---|---|---|---|
+{% for r in roles %}
+| {{ r.name | cell }} | {{ r.login_type or "?" }} | {{ "yes" if r.auth_ok else ("no" if r.auth_ok is not none else "not run") }} | {{ r.reachable_routes }} | {{ r.reachable_endpoints }} |
+{% endfor %}
+{% if roles_more %}
+
+… {{ roles_more }} more — see profile.json
+{% endif %}
+
+{% else %}
+No roles recorded.
+
+{% endif %}
+{% if accounts.created_by_run %}
+Accounts created during the run:
+
+{% for a in accounts.created_by_run[:25] %}
+- `{{ (a.username or a.email or "") | cell }}` via `{{ a.endpoint | cell }}`
+{% endfor %}
+{% if accounts.created_by_run | length > 25 %}
+- … {{ accounts.created_by_run | length - 25 }} more — see profile.json
+{% endif %}
+
+{% endif %}
+{% if accounts.observed %}
+Identities observed in responses{% if production %} (masked){% endif %}:
+
+{% for o in accounts.observed[:25] %}
+- `{{ o.value | cell }}`
+{% endfor %}
+{% if accounts.observed | length > 25 %}
+- … {{ accounts.observed | length - 25 }} more — see profile.json
+{% endif %}
+
+{% endif %}
+## Environments
+
+| Run | Base URLs | Profile | Started | Tool version |
+|---|---|---|---|---|
+{% for e in p.environments %}
+| `{{ e.run_id }}` | {{ e.base_urls | join(", ") | cell }} | {{ e.profile or "?" }} | {{ e.started_at or "?" }} | {{ e.tool_version or "?" }} |
+{% endfor %}
+
+{% if diffs %}
+Differences between environments (only what is not shared by every run):
+
+{% for d in diffs.technologies %}
+- Technology {{ d.name | cell }}: {% for rid, vs in d.versions_by_environment.items() %}{{ rid }}: {{ (vs | join(", ")) or "no version" }}{% if not loop.last %}; {% endif %}{% endfor %}{% if d.missing_in %}; not seen in {{ d.missing_in | join(", ") }}{% endif %}
+
+{% endfor %}
+{% if diffs.technologies_more %}
+- … {{ diffs.technologies_more }} more technology differences — see profile.json
+{% endif %}
+{% for d in diffs.routes %}
+- Route `{{ d.pattern | cell }}` only in {{ d.present_in | join(", ") }}
+{% endfor %}
+{% if diffs.routes_more %}
+- … {{ diffs.routes_more }} more route differences — see profile.json
+{% endif %}
+{% for d in diffs.endpoints %}
+- Endpoint `{{ d.method }} {{ d.path_pattern | cell }}` only in {{ d.present_in | join(", ") }}
+{% endfor %}
+{% if diffs.endpoints_more %}
+- … {{ diffs.endpoints_more }} more endpoint differences — see profile.json
+{% endif %}
+{% for d in diffs.role_access %}
+- Role {{ d.role | cell }}: {% for rid, v in d.per_environment.items() %}{{ rid }}: {{ v.reachable_routes }} routes / {{ v.reachable_endpoints }} endpoints{% if not loop.last %}; {% endif %}{% endfor %}
+
+{% endfor %}
+{% if diffs.role_access_more %}
+- … {{ diffs.role_access_more }} more role differences — see profile.json
+{% endif %}
+{% if not (diffs.technologies or diffs.routes or diffs.endpoints or diffs.role_access) %}
+- No differences found.
+{% endif %}
+
+{% endif %}
+## Coverage orientation
+
+{% if grid_rows %}
+Observed access outcome per feature and role:
+
+| Feature |{% for r in grid_roles %} {{ r | cell }} |{% endfor %}
+
+|---|{% for r in grid_roles %}---|{% endfor %}
+
+{% for row in grid_rows %}
+| {{ row.feature | cell }} |{% for c in row.cells %} {{ c }} |{% endfor %}
+
+{% endfor %}
+{% if grid_more %}
+
+… {{ grid_more }} more — see profile.json
+{% endif %}
+
+{% endif %}
+{% if coverage.unexercised %}
+Not exercised by the run: {% for k, v in coverage.unexercised.items() %}{{ k | replace("_", " ") }} {{ v }}{% if not loop.last %}; {% endif %}{% endfor %}.
+
+{% endif %}
+{% if coverage.approvals %}
+Approval queue: {{ coverage.approvals.pending }} pending, {{ coverage.approvals.denied }} denied, {{ coverage.approvals.skipped }} skipped.
+
+{% endif %}
+## Could not determine
+
+{% if could_not %}
+{% for c in could_not %}
+- {{ c.item | cell }} (run `{{ c.run_id }}`): {{ c.reason | cell }}
+{% endfor %}
+{% if could_not_more %}
+- … {{ could_not_more }} more — see profile.json
+{% endif %}
+{% else %}
+Nothing was left undetermined.
+{% endif %}
+{% if p.warnings %}
+
+Notes:
+
+{% for w in p.warnings %}
+- {{ w | cell }}
+{% endfor %}
+{% endif %}
+
+## Where to dig deeper
+
+- `profile.json`: the full machine-readable profile, including evidence references.
+- `APP-MAP.md` and `appmap.sqlite` in each run directory: routes, endpoints, forms and flows.
+- `appmap query` (recipes such as `flows`, `role-matrix`, `endpoint-shape`, or read-only `sql`) for specifics.
+- `profile-names.yaml`: edit the purpose and feature names and descriptions, then re-run `appmap profile`.
