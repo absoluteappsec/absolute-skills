@@ -8,8 +8,11 @@ description: Use during an appmap run, after appmap init, to log in every config
 Every role must hold a working session before probing and crawling. `appmap auth` logs each
 role in, records the outcome in the `roles` table (`auth_ok`), and saves the session (cookies,
 localStorage, sessionStorage) to `~/.cache/absolute-appmap/sessions/<run_id>/<role>.json` —
-never into the run directory. Later commands reuse it and re-login `form` roles automatically when
-a session is lost.
+never into the run directory. Later commands reuse it. When a session is lost mid-crawl or
+mid-probe, `form` roles are re-logged in automatically; a `manual` role would need the operator
+again, and that re-login prompts on the terminal — which is why `crawl` and `probe` are run with
+stdin closed when a manual role exists (see `crawl-application`), so a lost manual session fails
+fast instead of waiting.
 
 Conventions (`appmap` = the plugin's `scripts/appmap` wrapper, run by absolute path; the
 `APPMAP_STATUS` contract) are in `../map-running-application/SKILL.md`.
@@ -54,6 +57,10 @@ operator runs it in their own terminal:
 2. Tell them: a browser window opens at the login page; log in as `<role>` (complete SSO/MFA);
    when the app shows the logged-in page, return to the terminal and press Enter; then paste you
    the final `APPMAP_STATUS` line.
+4. **Ask the operator to confirm they actually reached the logged-in page before pressing
+   Enter.** A manual login is recorded as successful (`auth_ok = 1`) whenever Enter is pressed —
+   the CLI cannot verify it — so the operator's confirmation is the only check. If they are unsure,
+   repeat the login.
 3. A `form` role blocked by MFA or a CAPTCHA can be logged in the same way once:
    `appmap auth --run <run> --role <role> --manual-login`. (Without `--role`, `--manual-login`
    turns every form and manual role into a manual login.)
@@ -67,7 +74,8 @@ operator type in the browser — but never type credentials on their behalf.
 
 Run `appmap query --run <run> sql "SELECT name, login_type, auth_ok FROM roles ORDER BY name"`.
 
-Every role must show `auth_ok = 1` (`none` roles count as authenticated). `0` = the last login
+Every role must show `auth_ok = 1` (`none` roles count as authenticated; `manual` roles count as
+authenticated once Enter was pressed, so rely on the operator's confirmation from Step 3). `0` = the last login
 failed; `NULL` = never attempted.
 
 ---
@@ -80,11 +88,13 @@ operator.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Fails immediately | Env var not set in this environment | Operator sets it; rerun that role |
-| Fails after ~10 s | Wrong login `url`, or a relative `url` such as `/login` | Use the absolute login page URL |
+| Fails immediately (`login failed: … invalid URL` error event in `events.jsonl`) | Relative login `url` such as `/login` | Use the absolute login page URL (`https://host/login`) |
+| Fails after ~5–10 s | Wrong login `url` (no password field there), or success never detected | Check the URL; see the next rows |
 | Fields not found / wrong field filled | Non-standard login form | Add `username_selector`, `password_selector`, `submit_selector` to the role's `login` |
 | "Succeeds" but the app is still anonymous | Login stays on the same URL | Add `success_selector` (an element only visible when logged in) |
 | MFA prompt, CAPTCHA, SSO redirect | Not scriptable | Step 3 (manual), or `type: manual` in the config |
 | `storage_state` fails | File missing or expired | Ask the operator for a fresh state file |
+| `crawl`/`probe` hangs after printing `[appmap] Log in as role …` | A manual role's session expired and the command is waiting for Enter | Stop the command; re-authenticate that role with the operator (Step 3); rerun with stdin closed (`</dev/null`) |
 
 Edit the config file in place (it is re-read on every command), then rerun
 `appmap auth --run <run> --role <role>`.

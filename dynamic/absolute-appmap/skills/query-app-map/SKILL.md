@@ -20,7 +20,9 @@ operator asks for.
 `appmap` means the plugin's `scripts/appmap` wrapper (run by absolute path); every command ends
 with an `APPMAP_STATUS {json}` line (contract in
 `../map-running-application/references/methodology.md`). The `sqlite3` command-line tool works
-too; `appmap query` adds read-only enforcement, a statement timeout and the recipes.
+too — always open the map read-only, `sqlite3 -readonly <run>/appmap.sqlite`, so nothing can
+change the evidence; `appmap query` adds read-only enforcement, a statement timeout and the
+recipes.
 
 ---
 

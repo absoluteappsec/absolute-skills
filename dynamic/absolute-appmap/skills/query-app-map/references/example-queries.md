@@ -1,7 +1,7 @@
 # Example queries
 
 Run any of these with `appmap query --run <run> sql "<statement>"` (add `--format table` for
-aligned output) or with `sqlite3 <run>/appmap.sqlite`. Replace literals such as `'admin'`,
+aligned output) or with `sqlite3 -readonly <run>/appmap.sqlite` (always read-only). Replace literals such as `'admin'`,
 `42` or `'st-…'` with your values. Recipes (`appmap query --run <run> <recipe>`) cover the most
 common questions; their SQL is in `schema.md` → "Query recipes".
 

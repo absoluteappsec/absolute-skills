@@ -89,9 +89,12 @@ held, **your recommendation and reason** — and ask for a decision per item or 
 - Offer batch rules only as an option, spelled out exactly, e.g. "approve every delete whose URL
   contains `appmap-20261024-120000`" →
   `{match: {category: delete, url_contains: appmap-20261024-120000}, decision: approve}`.
-  Rules apply only to items still pending (also to items queued later in the run); match keys
-  are `category`, `role`, `url_contains`, `label_contains` (all must match); the first matching
-  rule wins.
+  Match keys are `category`, `role`, `url_contains`, `label_contains` (all must match); the
+  first matching rule wins; rules never change an item that already has a decision.
+- **Tell the human explicitly, before they agree to a rule:** a rule also decides matching items
+  that are queued **later** in this run — they will be approved (and executed by the next
+  `--approved-only` crawl) without being shown individually. Offer per-item decisions instead if
+  they would rather see each one.
 - Never present your recommendation as the decision; wait for the human's answer.
 
 ---

@@ -1,4 +1,5 @@
 """scripts/validate.py: structural checks over the plugin's skills, commands and manifest."""
+import json
 import shutil
 import subprocess
 import sys
@@ -102,3 +103,77 @@ def test_validate_catches_name_mismatch(plugin_copy):
     res = run_validate(plugin_copy)
     assert res.returncode == 1
     assert "review-approvals" in res.stdout
+
+
+def test_validate_catches_wrapper_variable_invocation(plugin_copy):
+    _append(plugin_copy / "README.md", "\n```bash\n$A explode --run x\n```\n")
+    res = run_validate(plugin_copy)
+    assert res.returncode == 1
+    assert "explode" in res.stdout
+
+
+def test_validate_catches_long_description(plugin_copy):
+    p = plugin_copy / "skills" / "build-app-map" / "SKILL.md"
+    text = p.read_text(encoding="utf-8")
+    p.write_text(text.replace("description: Use ", "description: Use " + "x" * 1100 + " ", 1),
+                 encoding="utf-8")
+    res = run_validate(plugin_copy)
+    assert res.returncode == 1
+    assert "description too long" in res.stdout
+
+
+def test_validate_accepts_quoted_description(plugin_copy):
+    p = plugin_copy / "skills" / "build-app-map" / "SKILL.md"
+    lines = p.read_text(encoding="utf-8").split("\n")
+    i = next(n for n, ln in enumerate(lines) if ln.startswith("description: "))
+    desc = lines[i][len("description: "):]
+    lines[i] = 'description: "' + desc.replace('"', "'") + ': quoted"'
+    p.write_text("\n".join(lines), encoding="utf-8")
+    res = run_validate(plugin_copy)
+    assert res.returncode == 0, res.stdout
+
+
+def test_validate_catches_plugin_json_missing_key(plugin_copy):
+    p = plugin_copy / ".claude-plugin" / "plugin.json"
+    data = json.loads(p.read_text(encoding="utf-8"))
+    del data["homepage"]
+    p.write_text(json.dumps(data), encoding="utf-8")
+    res = run_validate(plugin_copy)
+    assert res.returncode == 1
+    assert "plugin.json missing key: homepage" in res.stdout
+
+
+def test_validate_catches_command_without_arguments(plugin_copy):
+    p = plugin_copy / "commands" / "appmap-resume.md"
+    p.write_text(p.read_text(encoding="utf-8").replace("$ARGUMENTS", "the run"), encoding="utf-8")
+    res = run_validate(plugin_copy)
+    assert res.returncode == 1
+    assert "$ARGUMENTS" in res.stdout
+
+
+def _marketplace_layout(tmp_path, source: str, name: str = "absolute-appmap") -> Path:
+    root = tmp_path / "skills-repo"
+    plugin = root / "dynamic" / "absolute-appmap"
+    shutil.copytree(ROOT, plugin, ignore=_IGNORE)
+    (root / ".claude-plugin").mkdir()
+    (root / ".claude-plugin" / "marketplace.json").write_text(json.dumps(
+        {"name": "absolute-skills", "owner": {"name": "Absolute AppSec"},
+         "plugins": [{"name": name, "source": source, "description": "x"}]}), encoding="utf-8")
+    return plugin
+
+
+def test_validate_accepts_matching_marketplace(tmp_path):
+    res = run_validate(_marketplace_layout(tmp_path, "./dynamic/absolute-appmap"))
+    assert res.returncode == 0, res.stdout
+
+
+def test_validate_catches_marketplace_source_mismatch(tmp_path):
+    res = run_validate(_marketplace_layout(tmp_path, "./dynamic/elsewhere"))
+    assert res.returncode == 1
+    assert "marketplace.json" in res.stdout
+
+
+def test_validate_catches_marketplace_missing_plugin(tmp_path):
+    res = run_validate(_marketplace_layout(tmp_path, "./dynamic/absolute-appmap", name="other"))
+    assert res.returncode == 1
+    assert "does not list plugin" in res.stdout

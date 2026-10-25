@@ -4,3 +4,5 @@ appmap-*/
 *.secrets.yaml
 .pytest_cache/
 .superpowers/
+*.secrets.env
+appmap.secrets.env

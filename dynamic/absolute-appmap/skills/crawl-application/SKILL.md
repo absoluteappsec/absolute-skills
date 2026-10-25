@@ -1,6 +1,6 @@
 ---
 name: crawl-application
-description: Use during an appmap run to crawl the running application in the browser for every role - follow links, click controls, open menus and tabs, submit forms with generated data, explore SPA client routes and states - by running appmap crawl budget by budget until the frontier is exhausted, handling in_progress, limit_reached and paused_circuit correctly, and writing fixtures.yaml when forms keep failing validation. Triggers on "crawl the app", "continue the crawl", "the crawl stopped", "forms keep failing validation", "the circuit breaker tripped".
+description: Use during an appmap run, for an existing run directory (to start a new mapping use map-running-application), to crawl the running application in the browser for every role - follow links, click controls, open menus and tabs, submit forms with generated data, explore SPA client routes and states - by running appmap crawl budget by budget until the frontier is exhausted, handling in_progress, limit_reached and paused_circuit correctly, and writing fixtures.yaml when forms keep failing validation. Triggers on "crawl the app", "continue the crawl", "the crawl stopped", "forms keep failing validation", "the circuit breaker tripped".
 ---
 
 ## Purpose
@@ -17,6 +17,11 @@ domain data (fixtures) when generated data keeps failing.
 Conventions (`appmap` = the plugin's `scripts/appmap` wrapper, run by absolute path; the
 `APPMAP_STATUS` contract) are in `../map-running-application/SKILL.md`.
 
+**Hard rules:** `paused_circuit` → stop and tell the operator. A CAPTCHA, bot challenge or WAF
+block (`observations` of kind `captcha` or `rate_limited`, a login that needs a challenge) is never
+worked around — stop that part of the crawl and escalate to the operator. Never click through the
+app yourself to "help" the crawler.
+
 ---
 
 ## Step 1 — Start the Crawl
@@ -29,6 +34,11 @@ Conventions (`appmap` = the plugin's `scripts/appmap` wrapper, run by absolute p
   fixed time, pick a budget a few minutes below that limit.
 - Roles without a saved session are logged in first; `manual` roles must have been
   authenticated by the operator beforehand (`authenticate-roles`).
+- **When the config has a `manual` role, run the crawl with stdin closed:**
+  `appmap crawl --run <run> </dev/null`. If that role's session is lost mid-crawl, the re-login
+  then fails fast (a `login failed` warning in `errors`) instead of waiting for an Enter that never
+  comes. If a crawl ever hangs after printing `[appmap] Log in as role …`, stop it and
+  re-authenticate that role with the operator.
 
 ---
 
@@ -81,10 +91,10 @@ approval) — those show up as observations or approvals instead.
 
 ## Step 4 — Hand Off
 
-When `done`: if `pending_approvals > 0` the queue will be reviewed in `review-approvals`; the
-orchestrator continues with `probe-endpoints` (active) first. The `next` field may suggest
-`appmap approvals --run <run> write` or `appmap probe --run <run> --phase active`; follow the
-orchestrator's order.
+When `done`: if `pending_approvals > 0`, this is the first approval checkpoint — run
+`review-approvals` now (a drained crawl pass), then continue with `probe-endpoints` (active);
+approvals are reviewed again after the active probe. The `next` field suggests
+`appmap approvals --run <run> write` or `appmap probe --run <run> --phase active` accordingly.
 
 Quick sanity check of what the crawl found:
 `appmap status --run <run>` (counts) and

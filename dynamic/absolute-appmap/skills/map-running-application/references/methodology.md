@@ -87,9 +87,10 @@ the run; reaching it gives `limit_reached`, which counts as a stop condition for
 | 7 | `appmap status --run <run> --new-pass`, `appmap status --run <run> --gaps` | (this skill) | stop rule met |
 | 8 | `appmap build --run <run>` | `build-app-map` | `complete` with names applied |
 
-Approval checkpoints: held actions are queued while the crawl continues elsewhere. Review them at
-the end of Step 4 or Step 5 (whichever reports `pending_approvals > 0` first) and again whenever a
-later pass adds more. Logout actions are held and never executed, even when approved.
+Approval checkpoints: held actions are queued while the crawl continues elsewhere. Review them
+(Step 6, `review-approvals`) **when a crawl pass drains** (crawl reports `done` with
+`pending_approvals > 0`, end of Step 4) and **again after the active probe** (end of Step 5), plus
+whenever a later pass adds more. Logout actions are held and never executed, even when approved.
 
 ## Double back
 
@@ -130,18 +131,24 @@ every command (keep that file in place). To resume:
 
 1. Read `<run>/run.json` (`status`, `profile`, `roles`, `authorization`) and run
    `appmap status --run <run>`.
-2. Choose the step:
+2. Choose the step: go down the table and take the **first** row whose evidence matches.
 
-| Evidence | Continue at |
+| Evidence (first match wins, top to bottom) | Continue at |
 |---|---|
 | `run.json` status `initialized` or `auth_failed` | Step 2 |
+| `run.json` status `authenticated` | Step 3 (passive probe; skip to Step 4 if the operator or `crawl.log` shows it already finished) |
 | `run.json` status `paused_circuit` | Ask the operator whether the target is healthy; then Step 4 |
-| `counts.pending_frontier > 0` | Step 4 (rerun crawl) |
+| `run.json` status `in_progress`, or `counts.pending_frontier > 0` | Step 4 (rerun crawl) |
 | `counts.approvals.pending > 0` | Step 6 |
 | `counts.approvals.approved_unexecuted > 0` | Step 6 (`crawl --approved-only`) |
 | `role_access` empty (`appmap query --run <run> role-matrix` returns no rows) | Step 5 |
 | `run.json` status `complete` | Step 8 review, or Step 7 if the operator wants more coverage |
 | otherwise | Step 7 |
+
+`run.json` status is written by `init`, `auth`, `crawl` and `build` only. `probe` does not write
+it, so a probe that stopped with `paused_circuit` or `in_progress` is visible only in
+`crawl.log` (search it for `probe` and `circuit`) or from the operator — ask before assuming the probe
+finished, and rerun that probe phase if in doubt (already-sent active requests are not repeated).
 
 Saved sessions live in `~/.cache/absolute-appmap/sessions/<run_id>/`. If they have expired
 (login failures in `errors`), rerun Step 2 for those roles first.

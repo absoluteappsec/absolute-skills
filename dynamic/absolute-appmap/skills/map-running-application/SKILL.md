@@ -38,6 +38,9 @@ their structured status, and decide.
 5. Do not widen scope, switch to `production`, or enable forced browsing without the operator.
 6. Run directories may contain production customer data. Handle them as sensitive (see
    `references/safety.md`).
+7. A CAPTCHA, bot challenge or WAF block (an `observations` row of kind `captcha`, a login that
+   needs one, or `rate_limited` observations) is never worked around: stop that part of the run
+   and escalate to the operator (manual login, an allow-listed source, or excluding the area).
 
 ---
 
@@ -91,7 +94,9 @@ Invoke skill: `crawl-application`
 `appmap crawl --run <run>` explores every role in the browser, budget by budget (default 8
 minutes per invocation). Rerun while `status == "in_progress"`. Watch form failures between
 invocations and add fixtures when the same forms keep failing validation. `limit_reached` ends
-crawling for the run; `paused_circuit` stops everything.
+crawling for the run; `paused_circuit` stops everything. When the crawl reports `done` with
+`pending_approvals > 0`, run the Step 6 approval review now (first checkpoint), then continue
+with Step 5.
 
 ---
 
@@ -101,13 +106,15 @@ Invoke skill: `probe-endpoints` (active half)
 
 `appmap probe --run <run> --phase active` replays captured API calls with variations, exercises
 schema-only endpoints, runs forced browsing if enabled, and replays everything as every role to
-fill the access matrix. Rerun while `in_progress`.
+fill the access matrix. Rerun while `in_progress`. Then review approvals again (second
+checkpoint, Step 6) if `pending_approvals > 0`.
 
 ---
 
 ## Step 6 — Review Approvals With the Human
 
-Invoke skill: `review-approvals` — whenever `pending_approvals > 0`.
+Invoke skill: `review-approvals` — at the two checkpoints (a crawl pass drained in Step 4; the
+active probe finished in Step 5) and whenever a later pass leaves `pending_approvals > 0`.
 
 You review the held actions, recommend (confirm, downgrade, add missed ones, with reasons),
 present the batch to the human grouped by category, record **their** decisions, apply them, run
@@ -125,7 +132,7 @@ Follow "Double back" in `references/methodology.md`:
 2. **Stop** when all three numbers are zero, or `prev_pass` is 3 or more, or a crawl reported
    `limit_reached`.
 3. Otherwise run `appmap status --run <run> --gaps` and read the `{"gaps": …}` line. Decide which
-   gaps are actionable (better fixtures, a missed role, a newly approved action, endpoints only
+   gaps are actionable (better fixtures — only helps forms not yet attempted, a missed role, a newly approved action, endpoints only
    seen in bundles/schemas) and run one targeted pass (crawl, probe active, approvals). If none is
    actionable, stop.
 4. Go back to 1. If it reports `status: "no_change"`, nothing ran since the pass began: run the

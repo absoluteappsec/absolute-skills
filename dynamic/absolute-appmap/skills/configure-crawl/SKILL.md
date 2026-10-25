@@ -41,7 +41,15 @@ Rules:
 
 ## Step 2 — Interview for the Rest of the Config
 
-Ask only what you cannot infer; propose defaults and let the operator correct them.
+**If you were given an existing config file, review it instead of re-interviewing:** read it,
+summarize target, scope, profile, roles/login types and limits for the operator, check it against
+the table below and `config-reference.md` (absolute login URLs, env-var names only, logout covered
+by `deny_patterns`), and propose only the specific changes needed. Edit it only with the
+operator's agreement — never overwrite it with a fresh config. Step 1 still applies: an
+`authorization.confirmed_by` already in the file is not a confirmation for this run until the
+operator confirms it now. Then go to Step 4.
+
+Otherwise, ask only what you cannot infer; propose defaults and let the operator correct them.
 
 | Topic | What to settle |
 |---|---|
@@ -67,9 +75,13 @@ Ask only what you cannot infer; propose defaults and let the operator correct th
    keys anyway).
 3. Tell the operator exactly which variables to set and where, without asking for the values:
    either export them in the environment your commands run in, or put `export NAME=value` lines
-   in a git-ignored file only they edit (e.g. `.appmap-secrets.env`, mode 600) that you load with
-   `. ./.appmap-secrets.env &&` before each `appmap` command. Never print, read back or echo the
-   values.
+   in a file named `appmap.secrets.env` (mode 600) that only they edit, and that you load with
+   `. ./appmap.secrets.env &&` before each `appmap` command.
+   - Before anyone writes to it, check it cannot be committed: `git check-ignore appmap.secrets.env`
+     must print the name (inside a git repository). If it does not, ask the operator whether to
+     add `appmap.secrets.env` to `.gitignore`; do not create the file until it is ignored (or the
+     directory is not a repository).
+   - Never print, `cat`, read back or echo the file or the values.
 4. Check presence without revealing values, e.g. `test -n "$APPMAP_ADMIN_PASS" && echo set`.
 
 ---

@@ -30,6 +30,10 @@ import re
 import shlex
 import sys
 
+if sys.version_info < (3, 11):
+    sys.exit(f"validate.py needs Python 3.11+ (this is {sys.version.split()[0]}); "
+             "run it with the plugin's venv or python3.11+")
+
 ROOT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else \
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 errors = []
@@ -149,6 +153,19 @@ def check_invocation(where, sub, rest):
 
 
 MENTION = re.compile(r"(?:(?<=scripts/)|(?<![\w./-]))appmap[ \t]+([a-z][a-z-]*)")
+# Shell variables holding the wrapper path (``A=.../scripts/appmap``) are invocations too: ``$A crawl``.
+WRAPPER_VAR = re.compile(r"\b([A-Za-z_]\w*)=[\"']?\S*scripts/appmap\b")
+
+
+def mention_re(text):
+    names = sorted(set(WRAPPER_VAR.findall(text)))
+    if not names:
+        return MENTION
+    alt = "|".join(re.escape(n) for n in names)
+    return re.compile(MENTION.pattern[:-len(r"appmap[ \t]+([a-z][a-z-]*)")]
+                      + r"(?:appmap|\$\{?(?:" + alt + r")\}?\"?)[ \t]+([a-z][a-z-]*)")
+
+
 FENCE = re.compile(r"^```[^\n]*\n(.*?)^```", re.M | re.S)
 INLINE = re.compile(r"`([^`\n]+)`")
 
@@ -164,9 +181,11 @@ def code_segments(text):
 
 def check_mentions(path):
     where = rel(path)
-    for seg in code_segments(read(path)):
+    text = read(path)
+    mention = mention_re(text)
+    for seg in code_segments(text):
         seg = re.sub(r"\s#\s.*$", "", seg)  # shell comment
-        matches = list(MENTION.finditer(seg))
+        matches = list(mention.finditer(seg))
         for n, mm in enumerate(matches):
             sub = mm.group(1)
             if sub not in SUBCOMMANDS:
@@ -215,7 +234,7 @@ for path in skills:
     else:
         if len(desc) > 1024:
             errors.append(f"{r}: description too long ({len(desc)} > 1024)")
-        if not desc.startswith(("Use when", "Use during")):
+        if not desc.strip("'\"").startswith(("Use when", "Use during")):
             errors.append(f"{r}: description must start with 'Use when' or 'Use during'")
         if desc[0] not in "'\"" and (": " in desc or " #" in desc):
             errors.append(f"{r}: unquoted description contains ': ' or ' #' (invalid plain YAML)")
@@ -276,7 +295,9 @@ if os.path.exists(market) and plugin_name:
     try:
         mk = json.loads(read(market))
         entry = next((p for p in mk.get("plugins", []) if p.get("name") == plugin_name), None)
-        if entry is not None:
+        if entry is None:
+            errors.append(f"marketplace.json: does not list plugin {plugin_name!r}")
+        else:
             target = os.path.normpath(os.path.join(os.path.dirname(market), "..",
                                                    entry.get("source", "")))
             if target != os.path.normpath(ROOT):
