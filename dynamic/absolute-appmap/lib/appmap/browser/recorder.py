@@ -45,7 +45,7 @@ class TrafficRecorder:
         self._pending: set[asyncio.Task] = set()
         self._gate_tasks: dict[Page, asyncio.Task] = {}
         self._orphans: dict[str, list[tuple[float, str]]] = {}  # per role/context
-        self._routed_marks: dict[tuple[str, str], list[float]] = {}
+        self._admit_tokens: dict[tuple[str, str], list[float]] = {}
         self._roles: dict[BrowserContext, str] = {}
         self._safe: set[Page] = set()        # armed before any request could start
         self._quarantine: set[Page] = set()  # unarmed pages whose requests are refused
@@ -75,23 +75,24 @@ class TrafficRecorder:
         if not self.gate.scope.allows(url):
             await self.gate.admit(method, url, role=role, found_on=found_on)  # records link
             return False
-        if not ev.get("redirectedRequestId") and await self._routed(method, url):
-            return True
+        redirected = bool(ev.get("redirectedRequestId"))
         if ev.get("resourceType") in _CDP_STATIC_TYPES:
+            return True
+        if not redirected and not self._claim(method, url):
             return True
         return await self.gate.admit(method, url, role=role, found_on=found_on)
 
-    async def _routed(self, method: str, url: str) -> bool:
-        """Did the route handler already see (and admit) this request? Consumes the mark."""
-        for _ in range(15):
-            now = time.monotonic()
-            marks = [t for t in self._routed_marks.get((method, url), []) if now - t < 5.0]
-            if marks:
-                marks.pop(0)
-                self._routed_marks[(method, url)] = marks
-                return True
-            await asyncio.sleep(0.01)
-        return False
+    def _claim(self, method: str, url: str) -> bool:
+        """True if the caller must admit this request; False if the other gate (route
+        handler or CDP, whichever runs first) already did. Never awaits, so it is atomic."""
+        key, now = (method, url), time.monotonic()
+        tokens = [t for t in self._admit_tokens.get(key, []) if now - t < 5.0]
+        if tokens:
+            tokens.pop(0)
+            self._admit_tokens[key] = tokens
+            return False
+        self._admit_tokens[key] = tokens + [now]
+        return True
 
     # -- redirect hops (CDP) -------------------------------------------------
     # Chromium follows redirects internally without re-running Playwright route handlers,
@@ -161,7 +162,6 @@ class TrafficRecorder:
 
     async def _route(self, route: Route, request: Request, role: str) -> None:
         url = request.url
-        self._routed_marks.setdefault((request.method, url), []).append(time.monotonic())
         # Fetch interception only applies to requests that start after Fetch.enable, so a
         # request already in flight on a page that was not armed up front (popup, or a page
         # from plain context.new_page()) could follow a redirect chain out of scope. Fail
@@ -187,8 +187,8 @@ class TrafficRecorder:
             await route.continue_()
             return
         try:
-            admitted = await self.gate.admit(request.method, url, role=role,
-                                             found_on=self._found_on(request))
+            admitted = (not self._claim(request.method, url)) or await self.gate.admit(
+                request.method, url, role=role, found_on=self._found_on(request))
         except CircuitOpen as exc:
             self.events.emit("error", role=role, message=str(exc), url=url)
             admitted = False
