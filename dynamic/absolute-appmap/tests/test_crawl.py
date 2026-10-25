@@ -1,0 +1,218 @@
+import asyncio
+import json
+import urllib.request
+
+import pytest
+
+from appmap.cli import main
+from appmap.crawl import CrawlStats, run_crawl
+from appmap.store import Store
+
+# Fast, deterministic limits for fixture crawls.
+FAST = {"max_requests_per_second": 200, "quiet_window_ms": 150,
+        "max_states_per_route_pattern": 3}
+
+
+@pytest.fixture(autouse=True)
+def _cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+
+def q(rd, sql, *args):
+    store = Store(rd.db_path)
+    try:
+        return [dict(r) for r in store.conn.execute(sql, args)]
+    finally:
+        store.close()
+
+
+def q1(rd, sql, *args):
+    return next(iter(q(rd, sql, *args)[0].values()))
+
+
+async def test_ssr_crawl_admin_and_alice(browser, ssr_url, make_cfg, run_dir, tmp_path):
+    cfg = make_cfg(ssr_url, limits=FAST)
+    rd = run_dir(tmp_path, cfg)
+    stats = await run_crawl(cfg, rd, roles=["admin", "alice", "anonymous"], budget_minutes=5,
+                            browser=browser)
+    assert isinstance(stats, CrawlStats)
+    assert stats.status == "done"
+    pages = {r["pattern"] for r in q(rd, "select pattern from routes")}
+    assert {"/", "/projects", "/projects/{id}", "/projects/new", "/admin",
+            "/account/password"} <= pages
+    assert q1(rd, "select count(*) from approvals where category='delete'") >= 1  # project delete held
+    assert q1(rd, "select count(*) from approvals where category='logout'") >= 1
+    assert q1(rd, "select count(*) from approvals where category='credential_change'") >= 1
+    assert q1(rd, "select count(*) from exchanges where url like '%/delete%'") == 0  # never executed
+    assert q1(rd, "select count(*) from exchanges where url like '%/logout%'") == 0
+    # admin-only page reached by admin, not linked for alice
+    admin_states = {r["role"] for r in q(rd, "select role from states where route_pattern='/admin'")}
+    assert "admin" in admin_states and "alice" not in admin_states
+    # a successful create-project submission produced a transition with locators + exchanges
+    subs = q(rd, "select * from transitions where action_type='submit'")
+    assert subs and all(t["locator_set_id"] for t in subs)
+    assert any(json.loads(t["exchange_ids"] or "[]") for t in subs)
+    assert q1(rd, "select count(*) from forms where succeeded=1") >= 1
+    assert q1(rd, "select count(*) from fields") >= 3
+    # artifacts written for states, DOM redacted of password values
+    st = q(rd, "select * from states where screenshot is not null")
+    assert st and all((rd.root / s["screenshot"]).exists() for s in st)
+    assert all((rd.root / s["dom_snapshot"]).exists() for s in st)
+    for p in rd.artifacts_dir.glob("*.html"):
+        assert "admin-pw-Fx1" not in p.read_text() and "alice-pw-Fx2" not in p.read_text()
+    # list sampling: of 25 linked projects only `cap` are visited per role (+1: the project
+    # the create form redirected to)
+    n = q1(rd, "select count(*) from frontier where role='admin' and kind='url' "
+               "and url like '%/projects/%' and url not like '%/new'")
+    assert n <= FAST["max_states_per_route_pattern"] + 1
+    assert stats.queued_approvals == q1(rd, "select count(*) from approvals where decision='pending'")
+    assert rd.approvals_path.exists()
+    # out-of-scope redirect target recorded as an external link, never requested
+    assert q1(rd, "select count(*) from external_links where url like 'https://external.invalid%'") >= 1
+
+
+async def test_spa_crawl_states_and_list_sampling(browser, spa_url, make_cfg, run_dir, tmp_path):
+    roles = [{"name": "admin", "login": {
+        "type": "form", "url": f"{spa_url}/", "username_env": "APPMAP_ADMIN_USER",
+        "password_env": "APPMAP_ADMIN_PASS", "success_selector": "text=Signed in as"}}]
+    cfg = make_cfg(spa_url, roles=roles, limits=FAST)
+    rd = run_dir(tmp_path, cfg)
+    stats = await run_crawl(cfg, rd, roles=["admin"], budget_minutes=5, browser=browser)
+    assert stats.status == "done"
+    detail = q(rd, "select * from states where route_pattern='/items/{id}'")
+    assert 1 <= len(detail) <= FAST["max_states_per_route_pattern"]
+    # card clicks (div with a click listener only) are sampled, not all 100 items
+    clicks = q(rd, "select t.* from transitions t join states s on s.id=t.to_state "
+                   "where t.action_type='click' and s.route_pattern='/items/{id}'")
+    assert 1 <= len(clicks) <= FAST["max_states_per_route_pattern"]
+    assert all(t["locator_set_id"] for t in clicks)
+    assert q1(rd, "select count(*) from locators where locator_set_id=?", clicks[0]["locator_set_id"]) >= 1
+    sse = q(rd, "select kind from endpoints where path_pattern='/api/events'")
+    assert sse and sse[0]["kind"] == "sse"
+    # logout and delete buttons are held, never clicked
+    cats = {r["category"] for r in q(rd, "select category from approvals")}
+    assert {"logout", "delete"} <= cats
+    assert q1(rd, "select count(*) from exchanges where req_body like '%DeleteItem%'") == 0
+    # the inferred (non-<form>) item form was submitted
+    assert q1(rd, "select count(*) from exchanges where method='POST' and url like '%/api/items'") >= 1
+
+
+async def test_budget_checkpoint_and_resume(browser, ssr_url, make_cfg, run_dir, tmp_path):
+    cfg = make_cfg(ssr_url, limits=FAST)
+    rd = run_dir(tmp_path, cfg)
+    s1 = await run_crawl(cfg, rd, roles=["admin"], budget_minutes=0.02, browser=browser)
+    assert s1.status == "in_progress"
+    pending = q1(rd, "select count(*) from frontier where status='pending'")
+    done_before = q1(rd, "select count(*) from frontier where status!='pending'")
+    assert pending > 0 and done_before >= 1
+    s2 = await run_crawl(cfg, rd, roles=["admin"], budget_minutes=5, browser=browser)
+    assert s2.status == "done"
+    assert q1(rd, "select count(*) from frontier where status='pending'") == 0
+    assert q1(rd, "select count(*) from states") == q1(rd, "select count(distinct id) from states")
+    # resumed, not restarted: the seed page was visited once across both runs
+    assert q1(rd, "select count(*) from frontier where role='admin' and url=?", ssr_url + "/") == 1
+    assert s2.states >= s1.states
+
+
+async def test_session_expiry_mid_crawl(browser, ssr_url, make_cfg, run_dir, tmp_path):
+    cfg = make_cfg(ssr_url, limits=FAST)
+    rd = run_dir(tmp_path, cfg)
+
+    async def expire_after_first_state():
+        while True:
+            await asyncio.sleep(0.01)
+            try:
+                if q1(rd, "select count(*) from states") >= 1:
+                    break
+            except Exception:  # schema not created yet
+                continue
+        await asyncio.to_thread(urllib.request.urlopen, urllib.request.Request(
+            ssr_url + "/__expire", method="POST", data=b""))
+
+    expirer = asyncio.ensure_future(expire_after_first_state())
+    stats = await run_crawl(cfg, rd, roles=["admin"], budget_minutes=5, browser=browser)
+    await expirer
+    assert stats.status == "done"
+    types = [json.loads(line)["type"] for line in rd.events_path.read_text().splitlines()]
+    assert "session_lost" in types
+    assert types.count("login") >= 2  # initial login + re-login after expiry
+    admin = q(rd, "select * from states where role='admin' and route_pattern='/admin'")
+    assert admin and "Admin" in (admin[0]["title"] or "")
+    assert q1(rd, "select count(*) from exchanges where role='admin' and status=200 "
+                  "and url like '%/admin'") >= 1
+
+
+async def test_confirm_dialog_dismissed_and_queued(browser, stub_server, make_cfg, run_dir,
+                                                   tmp_path):
+    html = ("<html><head><title>Dialogs</title></head><body>"
+            "<button onclick=\"if (confirm('Sure?')) fetch('/api/thing', {method: 'POST'})\">"
+            "Proceed</button>"
+            "<button onclick=\"alert('hello'); document.title='alerted'\">Greet</button>"
+            "</body></html>")
+    srv = stub_server({"/": lambda r: __import__("werkzeug").Response(html, mimetype="text/html"),
+                       "/api/thing": lambda r: "ok"})
+    cfg = make_cfg(srv.url, roles=[{"name": "anonymous", "login": {"type": "none"}}],
+                   limits=FAST)
+    rd = run_dir(tmp_path, cfg)
+    stats = await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=2, browser=browser)
+    assert stats.status == "done"
+    assert ("POST", "/api/thing") not in srv.requests
+    held = q(rd, "select * from approvals where label='Proceed'")
+    assert held and held[0]["category"] == "delete"
+    assert "confirm" in held[0]["reasons"]
+    assert q1(rd, "select count(*) from frontier where status='queued_approval'") >= 1
+    events = [json.loads(line) for line in rd.events_path.read_text().splitlines()]
+    dialogs = {e["data"]["dialog_type"] for e in events if e["type"] == "dialog"}
+    assert {"confirm", "alert"} <= dialogs
+
+
+def _status(capsys) -> dict:
+    last = capsys.readouterr().out.strip().splitlines()[-1]
+    assert last.startswith("APPMAP_STATUS ")
+    return json.loads(last.removeprefix("APPMAP_STATUS "))
+
+
+def test_cli_init_auth_crawl(ssr_url, make_cfg, tmp_path, capsys):
+    cfg = make_cfg(ssr_url, limits=FAST, roles=[
+        {"name": "alice", "login": {"type": "form", "url": f"{ssr_url}/login",
+                                    "username_env": "APPMAP_ALICE_USER",
+                                    "password_env": "APPMAP_ALICE_PASS"}}])
+    out = tmp_path / "runs"
+    assert main(["init", "--config", str(cfg.source_path), "--out", str(out)]) == 0
+    st = _status(capsys)
+    assert st["ok"] and st["command"] == "init"
+    run = next(out.iterdir())
+    assert st["next"] == f"appmap auth --run {run}"
+    meta = json.loads((run / "run.json").read_text())
+    assert meta["config_path"] == str(cfg.source_path.resolve())
+
+    assert main(["auth", "--run", str(run)]) == 0
+    st = _status(capsys)
+    assert st["ok"] and st["status"] == "authenticated" and st["counts"]["roles_ok"] == 1
+
+    assert main(["crawl", "--run", str(run), "--budget-minutes", "0.02"]) == 0
+    st = _status(capsys)
+    assert st["ok"] and st["status"] == "in_progress"
+    assert st["next"] == f"appmap crawl --run {run}"
+    assert main(["crawl", "--run", str(run), "--role", "alice"]) == 0
+    st = _status(capsys)
+    assert st["ok"] and st["status"] == "done" and st["counts"]["states"] > 0
+    assert st["pending_approvals"] >= 1  # logout + project delete
+    log = (run / "crawl.log").read_text()
+    assert "crawl" in log and "alice-pw-Fx2" not in log
+    assert json.loads((run / "run.json").read_text())["status"] == "done"
+
+
+def test_cli_parser_flags():
+    from appmap.cli import build_parser
+    p = build_parser()
+    a = p.parse_args(["crawl", "--run", "R"])
+    assert a.budget_minutes == 8 and a.approved_only is False and a.role is None
+    a = p.parse_args(["auth", "--run", "R", "--role", "admin", "--manual-login"])
+    assert a.manual_login and a.role == "admin"
+
+
+def test_cli_missing_run_dir_reports_error(tmp_path, capsys):
+    assert main(["crawl", "--run", str(tmp_path / "nope")]) == 1
+    st = _status(capsys)
+    assert not st["ok"] and st["errors"]

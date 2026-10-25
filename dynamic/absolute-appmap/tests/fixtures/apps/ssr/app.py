@@ -31,7 +31,8 @@ def create_app() -> Flask:
         admin_link = '<a href="/admin">Admin</a> ' if user and USERS[user]["role"] == "admin" else ""
         nav = ('<a href="/">Home</a> <a href="/projects">Projects</a> <a href="/about">About</a> '
                + admin_link
-               + ('<a href="/logout">Logout</a>' if user else '<a href="/login">Login</a>'))
+               + ('<a href="/account/password">Account</a> <a href="/logout">Logout</a>'
+                  if user else '<a href="/login">Login</a>'))
         html = (f"<!doctype html><html><head><title>{escape(title)}</title></head><body>"
                 f"<nav>{nav}</nav><h1>{escape(title)}</h1>{body}</body></html>")
         return Response(html, status=status, mimetype="text/html")

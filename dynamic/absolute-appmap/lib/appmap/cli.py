@@ -1,11 +1,18 @@
 """appmap command-line entry point."""
 import argparse
+import asyncio
 import json
+import logging
 import sys
+from dataclasses import replace
+from pathlib import Path
 
 from appmap import __version__
 
 COMMANDS = ["init", "auth", "crawl", "probe", "approvals", "build", "status", "query"]
+IMPLEMENTED = {"init", "auth", "crawl"}
+
+log = logging.getLogger("appmap.cli")
 
 
 def emit_status(
@@ -35,9 +42,206 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="appmap", description="Web application crawler and mapper")
     parser.add_argument("--version", action="version", version=f"appmap {__version__}")
     sub = parser.add_subparsers(dest="command")
+    p = sub.add_parser("init", help="create a run directory from a config file")
+    p.add_argument("--config", required=True, help="run configuration YAML")
+    p.add_argument("--out", default=".", help="parent directory for the run directory")
+    p = sub.add_parser("auth", help="log in each role and save its session")
+    p.add_argument("--run", required=True, help="run directory")
+    p.add_argument("--role", help="only this role")
+    p.add_argument("--manual-login", action="store_true",
+                   help="log in by hand in a headed browser (SSO/MFA), then press Enter")
+    p = sub.add_parser("crawl", help="browser crawl (resumable; stops at the budget)")
+    p.add_argument("--run", required=True, help="run directory")
+    p.add_argument("--role", help="only this role")
+    p.add_argument("--budget-minutes", type=float, default=8.0,
+                   help="stop cleanly after this long (default 8); rerun to resume")
+    p.add_argument("--approved-only", action="store_true",
+                   help="only execute actions approved in approvals.yaml")
     for name in COMMANDS:
-        sub.add_parser(name, help=f"{name} (not yet implemented)")
+        if name not in IMPLEMENTED:
+            sub.add_parser(name, help=f"{name} (not yet implemented)")
     return parser
+
+
+# -- run-directory plumbing ------------------------------------------------------
+class _RedactingFormatter(logging.Formatter):
+    def __init__(self, redactor):
+        super().__init__("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        self._redactor = redactor
+
+    def format(self, record: logging.LogRecord) -> str:
+        return self._redactor.text(super().format(record))
+
+
+def _attach_log(rd, redactor) -> logging.Handler:
+    """Append a human-oriented, redacted log to <run>/crawl.log."""
+    handler = logging.FileHandler(rd.log_path, encoding="utf-8")
+    handler.setFormatter(_RedactingFormatter(redactor))
+    root = logging.getLogger("appmap")
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    return handler
+
+
+def _detach_log(handler: logging.Handler | None) -> None:
+    if handler is not None:
+        logging.getLogger("appmap").removeHandler(handler)
+        handler.close()
+
+
+def _open_run(path: str):
+    from appmap.config import load_config
+    from appmap.rundir import open_run_dir
+
+    rd = open_run_dir(Path(path))
+    try:
+        meta = json.loads((rd.root / "run.json").read_text())
+    except (OSError, ValueError) as e:
+        raise ValueError(f"{rd.root}: run.json missing or unreadable ({e}); run 'appmap init'")
+    cfg_path = meta.get("config_path")
+    if not cfg_path:
+        raise ValueError(f"{rd.root}/run.json has no config_path; run 'appmap init'")
+    return rd, load_config(Path(cfg_path)), meta
+
+
+def _write_meta(rd, cfg, meta: dict, status: str) -> None:
+    from appmap.rundir import write_run_meta
+
+    write_run_meta(rd, cfg, status=status, extra={"config_path": meta["config_path"]})
+
+
+# -- commands -------------------------------------------------------------------
+def cmd_init(args) -> int:
+    from appmap.config import ConfigError, load_config
+    from appmap.crawl import make_redactor
+    from appmap.rundir import create_run_dir, write_run_meta
+    from appmap.store import Store
+
+    cfg_path = Path(args.config).resolve()
+    try:
+        cfg = load_config(cfg_path)
+    except ConfigError as e:
+        emit_status("init", ok=False, status="config_error", errors=[str(e)])
+        return 1
+    rd = create_run_dir(cfg, Path(args.out).absolute())
+    handler = _attach_log(rd, make_redactor(cfg))
+    try:
+        store = Store(rd.db_path)
+        store.init_schema()
+        store.close()
+        write_run_meta(rd, cfg, status="initialized", extra={"config_path": str(cfg_path)})
+        log.info("init: run %s for %s (profile %s, roles %s)", rd.run_id, cfg.base_urls,
+                 cfg.profile, [r.name for r in cfg.roles])
+    finally:
+        _detach_log(handler)
+    print(rd.root)
+    emit_status("init", ok=True, status="initialized",
+                counts={"roles": len(cfg.roles)}, next=f"appmap auth --run {rd.root}")
+    return 0
+
+
+async def _auth(cfg, rd, roles, headed: bool) -> dict[str, bool]:
+    from playwright.async_api import async_playwright
+
+    from appmap.browser.session import login, open_role_session
+    from appmap.crawl import build_runtime
+
+    rt = build_runtime(cfg, rd)
+    results: dict[str, bool] = {}
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=not headed)
+            try:
+                for role in roles:
+                    sess = await open_role_session(browser, cfg, rd, role, rt.recorder)
+                    try:
+                        results[role.name] = await login(sess, cfg, rt.events)
+                        log.info("auth: role %s (%s) -> %s", role.name, role.login.type,
+                                 "ok" if results[role.name] else "FAILED")
+                    finally:
+                        await rt.recorder.drain()
+                        await sess.context.close()
+                        rt.recorder.finalize_har(role.name)
+            finally:
+                await browser.close()
+    finally:
+        rt.store.close()
+    return results
+
+
+def cmd_auth(args) -> int:
+    from appmap.crawl import make_redactor, select_roles
+
+    try:
+        rd, cfg, meta = _open_run(args.run)
+        roles = select_roles(cfg, [args.role] if args.role else None)
+    except Exception as e:
+        emit_status("auth", ok=False, status="error", errors=[str(e)])
+        return 1
+    if args.manual_login:
+        roles = [replace(r, login=replace(r.login, type="manual")) for r in roles]
+    headed = any(r.login.type == "manual" for r in roles)
+    handler = _attach_log(rd, make_redactor(cfg))
+    try:
+        results = asyncio.run(_auth(cfg, rd, roles, headed))
+        ok = bool(results) and all(results.values())
+        _write_meta(rd, cfg, meta, "authenticated" if ok else "auth_failed")
+    except Exception as e:
+        log.exception("auth failed")
+        emit_status("auth", ok=False, status="error", errors=[str(e)])
+        return 1
+    finally:
+        _detach_log(handler)
+    failed = [n for n, v in results.items() if not v]
+    emit_status("auth", ok=ok, status="authenticated" if ok else "auth_failed",
+                counts={"roles": len(results), "roles_ok": len(results) - len(failed)},
+                errors=[f"role {n}: login failed" for n in failed],
+                next=f"appmap crawl --run {rd.root}" if ok else None)
+    return 0 if ok else 1
+
+
+def cmd_crawl(args) -> int:
+    from appmap.crawl import make_redactor, run_crawl, select_roles
+
+    try:
+        rd, cfg, meta = _open_run(args.run)
+        names = [r.name for r in select_roles(cfg, [args.role] if args.role else None)]
+    except Exception as e:
+        emit_status("crawl", ok=False, status="error", errors=[str(e)])
+        return 1
+    handler = _attach_log(rd, make_redactor(cfg))
+    try:
+        stats = asyncio.run(run_crawl(cfg, rd, roles=names, budget_minutes=args.budget_minutes,
+                                      approved_only=args.approved_only))
+        _write_meta(rd, cfg, meta, stats.status)
+    except Exception as e:
+        log.exception("crawl failed")
+        emit_status("crawl", ok=False, status="error", errors=[str(e)])
+        return 1
+    finally:
+        _detach_log(handler)
+    errors = list(stats.warnings)
+    again = f"appmap crawl --run {rd.root}" + (f" --role {args.role}" if args.role else "")
+    nxt = {
+        "in_progress": again,
+        "done": (f"appmap approvals --run {rd.root} write" if stats.queued_approvals
+                 else f"appmap probe --run {rd.root} --phase active"),
+        "limit_reached": f"appmap build --run {rd.root}",
+        "paused_circuit": None,
+    }[stats.status]
+    ok = stats.status != "paused_circuit"
+    if not ok:
+        errors.append("circuit breaker tripped (too many 429/5xx responses); "
+                      "check the target before resuming")
+    emit_status("crawl", ok=ok, status=stats.status,
+                counts={"states": stats.states, "transitions": stats.transitions,
+                        "forms": stats.forms, "exchanges": stats.exchanges,
+                        "queued_approvals": stats.queued_approvals},
+                pending_approvals=stats.queued_approvals, errors=errors, next=nxt)
+    return 0 if ok else 1
+
+
+HANDLERS = {"init": cmd_init, "auth": cmd_auth, "crawl": cmd_crawl}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -49,9 +253,12 @@ def main(argv: list[str] | None = None) -> int:
     if not args.command:
         parser.print_help()
         return 2
-    emit_status(args.command, ok=False, status="not_implemented",
-                errors=[f"'{args.command}' is not implemented yet"])
-    return 1
+    handler = HANDLERS.get(args.command)
+    if handler is None:
+        emit_status(args.command, ok=False, status="not_implemented",
+                    errors=[f"'{args.command}' is not implemented yet"])
+        return 1
+    return handler(args)
 
 
 if __name__ == "__main__":
