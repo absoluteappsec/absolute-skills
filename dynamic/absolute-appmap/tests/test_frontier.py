@@ -53,3 +53,17 @@ def test_action_path_round_trips(tmp_path):
     assert item.kind == "action" and item.action_path == path and item.depth == 2
     assert item.url == ""  # stored non-NULL (ruling R6)
     assert store.conn.execute("SELECT url FROM frontier").fetchone()[0] == ""
+
+
+def test_set_action_path_clash_keeps_existing_row(tmp_path, caplog):
+    f, store = _frontier(tmp_path)
+    base = [{"type": "goto", "url": "http://x/"}, {"type": "click", "locators": [], "label": "S"}]
+    marked = [base[0], {**base[1], "mutating": True}]
+    f.push("r", "action", action_path=base, depth=1, source="ui")
+    f.push("r", "action", action_path=marked, depth=1, source="ui")
+    first = f.id_of("r", "action", action_path=base)
+    assert f.set_action_path(first, marked) is False
+    assert "already exists" in caplog.text
+    other = f.push("r", "action", action_path=[base[0]], depth=0, source="ui")
+    assert other and f.set_action_path(f.id_of("r", "action", action_path=[base[0]]),
+                                       [{**base[0], "mutating": True}]) is True

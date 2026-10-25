@@ -11,9 +11,13 @@ outcome, so an item interrupted by a crash is retried on resume.
 from __future__ import annotations
 
 import json
+import logging
+import sqlite3
 from dataclasses import dataclass, field
 
 from .store import Store
+
+log = logging.getLogger("appmap.frontier")
 
 STATUSES = ("pending", "done", "skipped", "queued_approval", "failed")
 
@@ -107,10 +111,17 @@ class Frontier:
         row = self.store.conn.execute("SELECT status FROM frontier WHERE id=?", (item_id,)).fetchone()
         return None if row is None else row[0]
 
-    def set_action_path(self, item_id: int, action_path: list[dict]) -> None:
-        """Annotate an item's path (e.g. ``mutating`` steps); identity is not re-checked."""
-        self.store.conn.execute("UPDATE OR IGNORE frontier SET action_path=? WHERE id=?",
-                                (_path_json(action_path), item_id))
+    def set_action_path(self, item_id: int, action_path: list[dict]) -> bool:
+        """Annotate an item's path (e.g. ``mutating`` steps). If another item already has
+        the annotated path, that row carries the annotation: warn and return False."""
+        try:
+            self.store.conn.execute("UPDATE frontier SET action_path=? WHERE id=?",
+                                    (_path_json(action_path), item_id))
+            return True
+        except sqlite3.IntegrityError:
+            log.warning("frontier item %d: annotated path already exists as another item; "
+                        "kept the existing row", item_id)
+            return False
 
     def pending_count(self, role: str | None = None) -> int:
         if role is None:

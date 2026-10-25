@@ -142,9 +142,11 @@ class Crawler:
         self._installed: set = set()
         self._confirm_seen = False
         self._approved_mode = False  # set while executing approved actions (Task 17)
-        # network guard state while an item is processed: label/context of the triggering
-        # action and the held requests it aborted (flag, method, url)
+        # Network guard attribution: the action (or page load) requests are charged to.
+        # ``_guard`` is set while an item runs; ``_last_guard[role]`` keeps the most recent
+        # one so requests fired later (timers, popups, workers) are still attributed.
         self._guard: dict | None = None
+        self._last_guard: dict[str, dict] = {}
 
     # -- driver --------------------------------------------------------------
     async def run(self, roles: list[str], *, budget_minutes: float,
@@ -229,6 +231,10 @@ class Crawler:
         role = sess.role.name
         if sess.context not in self._installed:
             self._installed.add(sess.context)
+            # Registered after the recorder's route, so it runs first for every request of
+            # the role context: all pages, popups and workers, during and between actions.
+            await sess.context.route(
+                "**/*", lambda route, request: self._guard_route(route, request, role))
             page = await self.recorder.new_page(sess.context)
             await install(page)
         else:
@@ -240,32 +246,52 @@ class Crawler:
             await self._on_dialog(dialog, role, page)
 
         page.on("dialog", on_dialog)
-        # Page routes run before the recorder's context route.
-        await page.route("**/*", lambda route, request: self._guard_route(route, request, role))
         return page
 
     async def _guard_route(self, route, request, role: str) -> None:
-        """Network-level destructive guard (ruling R17): a non-GET request issued while an
-        item is processed is classified as a ``request``; held ones are aborted."""
-        g = self._guard
-        if g is None or self._approved_mode or request.method in _SAFE_METHODS:
+        """Network-level destructive guard (ruling R17). Every non-GET request of the role
+        context is classified as a ``request`` attributed to the current (or most recent)
+        action or page load; held ones are aborted and queued for approval."""
+        if (self._approved_mode or request.method in _SAFE_METHODS
+                or self.recorder.origin_by_role.get(role) == "login"):  # re-login flow
             await route.fallback()
             return
-        flag = classify(ActionDescriptor("request", request.method, request.url, g["label"],
-                                         g["context"], False, role, "ui"), self.cfg.profile)
+        g = self._guard or self._last_guard.get(role)
+        if g is None:  # nothing processed yet: charge it to the page that sent it
+            try:
+                origin = request.frame.url
+            except Exception:  # worker / not-yet-attached popup
+                origin = request.headers.get("referer") or request.url
+            g = {"kind": "load", "label": "", "context": "", "state": None, "item": None,
+                 "path": [{"type": "goto", "url": self._safe_url(origin)}], "hits": []}
+        try:
+            flag = classify(ActionDescriptor("request", request.method, request.url, g["label"],
+                                             g["context"], False, role, "ui"), self.cfg.profile)
+        except Exception:  # fail closed
+            flag = Flag(True, "delete", ["request could not be classified"])
         if not flag.held:
             await route.fallback()
             return
+        await route.abort("blockedbyclient")
         url = self.redactor.url(request.url)
         g["hits"].append((flag, request.method, url))
         self.events.emit("error", role=role, url=url,
                          message=f"held {request.method} request aborted ({flag.category}); "
-                                 "needs approval")
-        await route.abort("blockedbyclient")
+                                 "queued for approval")
+        label = g["label"] if g["kind"] == "action" else f"{request.method} {url} (page load)"
+        self._enqueue(role, g["state"], label, flag, g["path"],
+                      {"method": request.method, "url": url})
+        if g is not self._guard and g["item"] is not None:
+            self.frontier.mark(g["item"], "queued_approval")  # fired after its item finished
 
-    def _arm_guard(self, label: str = "", context: str = "") -> list:
-        """Attribute subsequent requests to a new triggering action; returns its hit list."""
-        self._guard = {"label": label, "context": context, "hits": []}
+    def _arm_guard(self, role: str, kind: str, path: list[dict], *, label: str = "",
+                   context: str = "", state: str | None = None,
+                   item: int | None = None) -> list:
+        """Attribute subsequent non-GET requests to ``path`` (an action or a page load);
+        returns the list the guard appends aborted (flag, method, url) hits to."""
+        self._guard = {"kind": kind, "label": label, "context": context, "state": state,
+                       "item": item, "path": path, "hits": []}
+        self._last_guard[role] = self._guard
         return self._guard["hits"]
 
     async def _on_dialog(self, dialog: Dialog, role: str, page: Page) -> None:
@@ -282,16 +308,21 @@ class Crawler:
 
     # -- item processing -----------------------------------------------------
     async def _process(self, sess: RoleSession, page: Page, item: FrontierItem) -> str:
-        role = sess.role.name
         try:
-            return await self._process_guarded(sess, page, item)
+            outcome = await self._process_guarded(sess, page, item)
+            g = self._guard
+            if g is not None and g["kind"] == "action" and g["hits"]:
+                outcome = "queued_approval"  # its request fired late (timer) and was held
+            return outcome
         finally:
             self._guard = None
 
     async def _process_guarded(self, sess: RoleSession, page: Page, item: FrontierItem) -> str:
         role = sess.role.name
+        entry = ([{"type": "goto", "url": item.url}] if item.kind == "url"
+                 else item.action_path[:-1])
         for attempt in (1, 2):
-            self._arm_guard()
+            self._arm_guard(role, "load", entry, item=item.id)
             try:
                 if item.kind == "url":
                     return await self._do_url(sess, page, item)
@@ -356,7 +387,7 @@ class Crawler:
         if flag.held:  # never restore toward an action that will not be performed
             self._enqueue(role, None, self._step_label(step), flag, path, self._predicted(step))
             return "queued_approval"
-        restore_hits = self._arm_guard("restore")
+        restore_hits = self._guard["hits"]
         await self._replay(page, restore)
         if restore_hits:
             raise _Fail("restoring the action path issued a request that needs approval; "
@@ -367,7 +398,8 @@ class Crawler:
         self._confirm_seen = False
         mark = self._exchange_mark()
         result = None
-        hits = self._arm_guard(self._step_label(step), step.get("context", ""))
+        hits = self._arm_guard(role, "action", path, label=self._step_label(step),
+                               context=step.get("context", ""), state=src.id, item=item.id)
         if step["type"] == "click":
             loc = await self._resolve(page, step["locators"])
             ev = self.events.emit("click", role=role, label=step.get("label", ""),
@@ -398,9 +430,7 @@ class Crawler:
             raise _Fail(f"unknown action step type {step.get('type')!r}")
         await self.recorder.drain()
         await self._close_popups(page)
-        if hits:  # the action fired a destructive request: aborted, hold the action
-            flag, method, url = hits[0]
-            self._enqueue(role, src.id, label, flag, path, {"method": method, "url": url})
+        if hits:  # the action fired a destructive request: aborted and queued by the guard
             return "queued_approval"
         if self._confirm_seen:
             confirm = Flag(True, "delete", ["action opened a confirm() dialog (dismissed)"])
@@ -413,7 +443,6 @@ class Crawler:
             step["mutating"] = True
             self.frontier.set_action_path(item.id, path)
         await self._check_lost(sess, page)
-        self._arm_guard("expand")
         dst = await self._record_state(page, role)
         self.store.add_transition(src.id, dst.id, role, step["type"], label,
                                   self._locset(locs), ev.id, ids)
