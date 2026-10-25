@@ -202,3 +202,7 @@ async def browser():
         b = await pw.chromium.launch()
         yield b
         await b.close()
+
+
+# Session-scoped built fixture-app runs shared by the profile tests (ruling P2).
+from profile_helpers import spa_built_run, ssr_built_run  # noqa: E402,F401
