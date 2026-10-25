@@ -59,3 +59,56 @@ async def test_expand_reveals_skips_destructive(browser):
     is_open = await page.evaluate("document.querySelector('details').open")
     await ctx.close()
     assert n == 2 and hit is None and is_open
+
+
+async def test_same_label_rows_not_merged(browser):
+    ctx = await browser.new_context()
+    page = await ctx.new_page()
+    await page.set_content(
+        "<table>" + "".join(f"<tr><td>r{i}</td><td><button id=b{i}>Edit</button></td></tr>"
+                            for i in range(3)) + "</table>"
+        '<a href="/a">Same</a><a href="/b">Same</a>')
+    from appmap.browser.locators import resolve
+    found = await enumerate_clickables(page)
+    edits = [c for c in found if c.label == "Edit"]
+    assert len(edits) == 3
+    ids = set()
+    for c in edits:
+        loc = await resolve(page, c.locators)
+        assert loc is not None
+        ids.add(await loc.get_attribute("id"))
+    assert ids == {"b0", "b1", "b2"}
+    assert len([c for c in found if c.label == "Same"]) == 2
+    await ctx.close()
+
+
+async def test_native_button_without_cursor_or_listener(browser):
+    ctx = await browser.new_context()
+    page = await ctx.new_page()
+    await page.set_content('<form><button type=submit>Go</button><select><option>a</option></select></form>')
+    tags = {c.tag for c in await enumerate_clickables(page)}
+    await ctx.close()
+    assert {"button", "select"} <= tags
+
+
+async def test_cap_warns_and_still_finds_button(browser, caplog):
+    ctx = await browser.new_context()
+    page = await ctx.new_page()
+    await page.set_content("<div></div>" * 2100 + "<button>Late</button>")
+    with caplog.at_level("WARNING"):
+        found = await enumerate_clickables(page)
+    await ctx.close()
+    assert any(c.label == "Late" for c in found)
+    assert "cap" in caplog.text
+
+
+async def test_expand_reveals_guard_uses_href_and_title(browser):
+    ctx = await browser.new_context()
+    page = await ctx.new_page()
+    await page.set_content(
+        '<a href="/logout" aria-expanded="false" onclick="window.a=1;return false"><svg></svg></a>'
+        '<button aria-expanded="false" title="Delete" onclick="window.b=1"><svg></svg></button>')
+    n = await expand_reveals(page)
+    hit = await page.evaluate("[window.a, window.b]")
+    await ctx.close()
+    assert n == 0 and hit == [None, None]
