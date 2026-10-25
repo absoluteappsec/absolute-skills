@@ -486,7 +486,7 @@ def cmd_build(args) -> int:
         store.close()
         _detach_log(handler)
     nxt = None if args.names else \
-        f"appmap build --run {run} --names {_q(rd.root / 'names.yaml')}"
+        f"edit {_q(rd.root / 'names.yaml')}, then re-run: appmap build --run {run}"
     emit_status("build", ok=True, status="complete", counts=counts, pending_approvals=pending,
                 next=nxt)
     return 0

@@ -220,8 +220,7 @@ No observations.
 
 {% if records.rows %}
 Successful (2xx/3xx) state-changing requests whose URL or body carries the run marker
-`{{ records.marker }}` (or its first {{ records.hint | length }} characters, `{{ records.hint }}`,
-where a field was too short for the whole marker). Use them for post-run cleanup.
+`{{ records.marker }}`{% if records.variants %} or one of this run's truncations of it ({% for v in records.variants %}`{{ v }}`{% if not loop.last %}, {% endif %}{% endfor %}; fields too short for the whole marker){% endif %}. Use them for post-run cleanup.
 
 | Exchange | Role | Request | Status | Location |
 |---|---|---|---|---|

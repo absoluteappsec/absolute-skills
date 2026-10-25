@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, unquote_plus, urlsplit, urlunsplit
 
 import yaml
 
@@ -48,8 +48,6 @@ JSON_COLUMNS = {
 _SAFE = {"GET", "HEAD", "OPTIONS"}
 _MAX_LEAVES = 2000          # JSON leaves examined per producer response
 _MAX_BODY_FILE = 2_000_000  # bodies/ files larger than this are not scanned for values
-_MARKER_MIN_PREFIX = 10     # datagen truncates the marker to fit maxlength; shorter prefixes
-                            # are too generic to identify records this run created
 _TOKEN = re.compile(r"[\w.@~-]+")
 _SKIP_HEADERS = {"cookie", "authorization", "proxy-authorization", "user-agent", "referer",
                  "origin", "host", "accept", "accept-encoding", "accept-language",
@@ -292,6 +290,7 @@ class _Flow:
     landing_url: str             # canonical URL the final action left the page on
     form_ids: list[int] = field(default_factory=list)
     approval_id: str | None = None
+    event_id: str | None = None  # events.jsonl id of the final action (submit/click)
 
     @property
     def key(self) -> str:
@@ -329,9 +328,13 @@ def _prefix_steps(store: Store, role: str, prefix: list[dict]) -> list[_Step]:
                     f"SELECT id, to_state FROM transitions WHERE role=? AND action_type='navigate' "
                     f"AND to_state IN ({_marks(sids)}) ORDER BY id LIMIT 1", (role, *sids)).fetchone()
                 tid, cur = (row["id"], row["to_state"]) if row else (None, sids[0])
-            xid = _one(store, "SELECT id FROM exchanges WHERE role=? AND method='GET' AND url=? "
-                              "ORDER BY id LIMIT 1", role, url)
-            steps.append(_Step("goto", "", url, False, tid, xid, "GET" if xid else None))
+            x = store.conn.execute(
+                "SELECT x.id, x.status, e.path_pattern FROM exchanges x "
+                "LEFT JOIN endpoints e ON e.id=x.endpoint_id WHERE x.role=? AND x.method='GET' "
+                "AND x.url=? ORDER BY x.id LIMIT 1", (role, url)).fetchone()
+            steps.append(_Step("goto", "", url, False, tid, x["id"] if x else None,
+                               "GET" if x else None, x["path_pattern"] if x else None,
+                               x["status"] if x else None))
         else:
             label = st.get("form_label") or st.get("label") or ""
             row = store.conn.execute(
@@ -412,33 +415,43 @@ def _ui_submissions(store: Store) -> list[_Flow]:
         flows.append(_Flow(role, [label or "submit"], _route_of(store, tr["from_state"]) or pattern,
                            "ui", prefix + action, len(prefix),
                            _canon(first.get("url")) if first.get("type") == "goto" else "",
-                           _state_url(store, tr["to_state"]), form_ids=[form["id"]]))
+                           _state_url(store, tr["to_state"]), form_ids=[form["id"]],
+                           event_id=tr["event_id"]))
     return flows
 
 
-def _approval_events(store: Store, wanted: set[str]) -> dict[str, dict]:
-    out: dict[str, dict] = {}
+def _read_events(store: Store) -> tuple[dict[str, dict], dict[str, tuple[str, int]]]:
+    """One pass over events.jsonl: ``approval_executed`` events by id, and each ``submit``
+    event's (role, position among that role's submits)."""
+    executed: dict[str, dict] = {}
+    submits: dict[str, tuple[str, int]] = {}
+    counters: dict[str, int] = defaultdict(int)
     path = _run_root(store) / "events.jsonl"
-    if not wanted or not path.exists():
-        return out
+    if not path.exists():
+        return executed, submits
     with open(path, encoding="utf-8") as f:
         for line in f:
-            if '"approval_executed"' not in line:
+            if '"approval_executed"' not in line and '"submit"' not in line:
                 continue
             try:
                 ev = json.loads(line)
             except ValueError:
                 continue
-            if ev.get("id") in wanted:
-                out[ev["id"]] = ev
-    return out
+            if not isinstance(ev, dict):
+                continue
+            if ev.get("type") == "approval_executed":
+                executed[ev.get("id")] = ev
+            elif ev.get("type") == "submit":
+                role = ev.get("role") or ""
+                submits[ev.get("id")] = (role, counters[role])
+                counters[role] += 1
+    return executed, submits
 
 
-def _approved_executions(store: Store) -> list[_Flow]:
+def _approved_executions(store: Store, events: dict[str, dict]) -> list[_Flow]:
     failed = {r[0][len("approval_failed:"):] for r in store.conn.execute(
         "SELECT key FROM meta WHERE key LIKE 'approval_failed:%'")}
     rows = _rows(store, "SELECT * FROM approvals WHERE executed_event IS NOT NULL ORDER BY id")
-    events = _approval_events(store, {r["executed_event"] for r in rows})
     flows: list[_Flow] = []
     for a in rows:
         ev = events.get(a["executed_event"])
@@ -461,42 +474,50 @@ def _approved_executions(store: Store) -> list[_Flow]:
         if not pattern:
             pattern = next((s.path_pattern for s in action if s.path_pattern), "") or ""
         first = path[0] if path else {}
+        form_ids = [int(last["form_id"])] if last.get("type") == "submit" \
+            and isinstance(last.get("form_id"), int) else []
         flows.append(_Flow(a["role"], [a["label"] or a["category"] or "approved action"],
                            pattern, "approved", prefix + action, len(prefix),
                            _canon(first.get("url")) if first.get("type") == "goto" else "",
                            _state_url(store, tr["to_state"]) if tr else "",
-                           approval_id=a["id"]))
+                           form_ids=form_ids, approval_id=a["id"],
+                           event_id=ev.get("caused_by")))
     return flows
 
 
-def _merge_wizards(flows: list[_Flow]) -> list[_Flow]:
-    """A flow whose restore is just ``goto`` of the URL another flow's submit landed on
-    continues that flow (multi-step forms). Merged only when the continuation is unique."""
-    def successors(f: _Flow) -> list[_Flow]:
-        return [g for g in flows if g is not f and g.role == f.role and f.landing_url
-                and g.prefix_len == 1 and g.steps[0].type == "goto"
-                and g.start_url == f.landing_url]
+def _merge_wizards(flows: list[_Flow], submits: dict[str, tuple[str, int]]) -> list[_Flow]:
+    """Multi-step forms: flow B continues flow A when B's submit is the very next submit
+    event of the same role after A's (one sequential session, nothing submitted in
+    between) and B's restore is just ``goto`` of the URL A's submit landed on.
 
+    Merged flows are additive: every standalone flow is kept and each maximal chain is
+    returned once more as one multi-step flow. Event order makes chains acyclic; a
+    visited-set guard still stops any loop."""
+    at = {submits[f.event_id]: f for f in flows if f.event_id in submits}
     nxt: dict[int, _Flow] = {}
     for f in flows:
-        s = successors(f)
-        if len(s) == 1:
-            nxt[id(f)] = s[0]
-    absorbed = {id(g) for g in nxt.values()}
-    out: list[_Flow] = []
-    for f in flows:
-        if id(f) in absorbed:
+        if f.event_id not in submits or not f.landing_url:
             continue
-        cur, seen = f, {id(f)}
+        role, i = submits[f.event_id]
+        g = at.get((role, i + 1))
+        if g is not None and g is not f and g.role == f.role and g.prefix_len == 1 \
+                and g.steps and g.steps[0].type == "goto" and g.start_url == f.landing_url:
+            nxt[id(f)] = g
+    absorbed = {id(g) for g in nxt.values()}
+    merged: list[_Flow] = []
+    for f in flows:
+        if id(f) not in nxt or id(f) in absorbed:
+            continue  # only chain heads start a merged flow
+        cur, seen, m = f, {id(f)}, f
         while id(cur) in nxt and id(nxt[id(cur)]) not in seen:
             g = nxt[id(cur)]
             seen.add(id(g))
-            f = _Flow(f.role, f.labels + g.labels, f.route_pattern, f.origin,
-                      f.steps + g.steps[1:], f.prefix_len, f.start_url, g.landing_url,
-                      f.form_ids + g.form_ids, f.approval_id or g.approval_id)
+            m = _Flow(m.role, m.labels + g.labels, m.route_pattern, m.origin,
+                      m.steps + g.steps[1:], m.prefix_len, m.start_url, g.landing_url,
+                      m.form_ids + g.form_ids, m.approval_id or g.approval_id, g.event_id)
             cur = g
-        out.append(f)
-    return out
+        merged.append(m)
+    return flows + merged
 
 
 def _describe(steps: list[_Step]) -> str:
@@ -515,10 +536,13 @@ def _describe(steps: list[_Step]) -> str:
 
 def derive_flows(store: Store) -> int:
     """Rebuild ``flows``/``flow_steps``: one flow per successful form submission and per
-    executed approval (wizard submits merged, duplicates by flow key dropped)."""
+    executed approval, plus one merged flow per sequential multi-step form chain
+    (duplicates by flow key dropped)."""
     store.conn.execute("DELETE FROM flow_steps")
     store.conn.execute("DELETE FROM flows")
-    flows = _merge_wizards(_ui_submissions(store) + _approved_executions(store))
+    executed, submits = _read_events(store)
+    flows = _merge_wizards(_ui_submissions(store) + _approved_executions(store, executed),
+                           submits)
     seen: set[str] = set()
     n = 0
     for f in flows:
@@ -647,8 +671,12 @@ def apply_names(store: Store, path: Path) -> int:
     for e in data.get("flows") or []:
         if not isinstance(e, dict):
             continue
-        fid = by_key.get(e["key"]) if e.get("key") else (
-            e.get("id") if _one(store, "SELECT 1 FROM flows WHERE id=?", e.get("id")) else None)
+        key, id_ = e.get("key"), e.get("id")
+        if key is not None:
+            fid = by_key.get(key) if isinstance(key, str) else None
+        else:
+            fid = id_ if isinstance(id_, int) and not isinstance(id_, bool) and _one(
+                store, "SELECT 1 FROM flows WHERE id=?", id_) else None
         if fid is None:
             continue
         for col in ("name", "description"):
@@ -662,7 +690,10 @@ def apply_names(store: Store, path: Path) -> int:
         if not isinstance(e, dict) or not isinstance(e.get("purpose"), str) \
                 or not e["purpose"].strip():
             continue
-        g = next((g for g in groups if e.get("id") in g["ids"]), None)
+        fid = e.get("id")
+        if not isinstance(fid, int) or isinstance(fid, bool):
+            continue
+        g = next((g for g in groups if fid in g["ids"]), None)
         if g is None:
             continue
         cur = store.conn.execute(
@@ -822,20 +853,55 @@ def _ctx_forms(store: Store) -> dict:
     return {"rows": shown, "more": more}
 
 
+def marker_variants(store: Store, marker: str) -> set[str]:
+    """The marker plus the truncations the data generator produced in THIS run: from the
+    ``maxlength`` constraints and length hints in validation messages the run recorded
+    (same arithmetic as datagen: plain, email, url and password fields)."""
+    from appmap.datagen import _PASSWORD_TAIL, hint_from_validation
+
+    rooms: set[int] = set()
+    for cons, msgs in store.conn.execute("SELECT constraints, validation_messages FROM fields"):
+        ml = (_loads(cons, {}) or {}).get("maxlength")
+        if isinstance(ml, int) and not isinstance(ml, bool):
+            rooms.add(ml)
+        for m in _loads(msgs, []) or []:
+            h = hint_from_validation(m) if isinstance(m, str) else None
+            if h and h.startswith("max:"):
+                rooms.add(int(h[4:]))
+            elif h and h.startswith("len:"):
+                rooms.add(int(h[4:].split("-")[1]))
+    out = {marker}
+    for room in rooms:
+        for n in (room, room - 13, room - 21, room - len(_PASSWORD_TAIL)):
+            if 1 <= n < len(marker):
+                out.add(marker[:n])
+    return out
+
+
 def _ctx_records(store: Store) -> dict:
+    """Successful (2xx/3xx) writes whose URL or body (inline or bodies/ file) carries the
+    marker, or exactly one of this run's own truncations of it as a whole token."""
     marker = run_marker(store)
     if not marker:
-        return {"rows": [], "more": 0, "hint": None}
-    hint = marker[:_MARKER_MIN_PREFIX]
-    like = f"%{hint}%"
-    rows = _rows(store, """SELECT x.id, x.role, x.method, x.url, x.status, x.origin,
-            e.path_pattern, (SELECT h.value FROM json_each(x.resp_headers) h
-                             WHERE lower(h.key)='location') AS location
+        return {"rows": [], "more": 0, "variants": []}
+    variants = marker_variants(store, marker)
+    short = variants - {marker}
+    rows = []
+    for x in _rows(store, """SELECT x.id, x.role, x.method, x.url, x.status, x.origin, x.req_body,
+            x.req_body_path, x.resp_headers, e.path_pattern
         FROM exchanges x LEFT JOIN endpoints e ON e.id=x.endpoint_id
         WHERE upper(x.method) NOT IN ('GET','HEAD','OPTIONS') AND x.status BETWEEN 200 AND 399
-          AND (x.req_body LIKE ? OR x.url LIKE ?) ORDER BY x.id""", like, like)
+        ORDER BY x.id"""):
+        text = unquote_plus(" ".join(filter(None, (
+            x["url"], _body_text(store, x["req_body"], x["req_body_path"])))))
+        if marker not in text and not (short and short & set(_TOKEN.findall(text))):
+            continue
+        hdrs = _loads(x["resp_headers"], {}) or {}
+        x["location"] = next((v for k, v in hdrs.items() if str(k).lower() == "location"), None)
+        rows.append(x)
     shown, more = _cap(rows, CAPS["records"])
-    return {"rows": shown, "more": more, "hint": hint, "marker": marker}
+    return {"rows": shown, "more": more, "marker": marker,
+            "variants": sorted(short, key=len, reverse=True)}
 
 
 def _ctx_gaps(store: Store) -> dict:

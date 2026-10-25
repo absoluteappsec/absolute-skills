@@ -161,7 +161,7 @@ def test_build_idempotent(ssr_run, tmp_path, capsys):
     assert json.loads((root / "run.json").read_text())["status"] == "complete"
     pkg = Path(__file__).parents[1] / "lib" / "appmap" / "resources" / "SCHEMA.md"
     assert (root / "SCHEMA.md").read_text() == pkg.read_text()
-    assert st["next"] and "--names" in st["next"]
+    assert st["next"] == f"edit {root / 'names.yaml'}, then re-run: appmap build --run {root}"
 
 
 def test_app_map_sections_present(ssr_run, tmp_path, capsys):
@@ -289,8 +289,14 @@ def _frontier(store, role, path, status="done"):
                        (role, path[0].get("url", ""), json.dumps(path), status))
 
 
+def _events(root, *events):
+    with open(root / "events.jsonl", "a") as f:
+        for ev in events:
+            f.write(json.dumps({"ts": 1.0, "caused_by": None, "data": {}, **ev}) + "\n")
+
+
 def test_wizard_submits_merge_and_preconditions(tmp_path):
-    store, _root = _synthetic(tmp_path)
+    store, root = _synthetic(tmp_path)
     try:
         b = "https://example.test"
         ep_list = store.upsert_endpoint("GET", "example.test", "/api/plans", "rest")
@@ -306,24 +312,33 @@ def test_wizard_submits_merge_and_preconditions(tmp_path):
         nav = store.add_transition(None, "s1", "u", "navigate", "Sign up", exchange_ids=[])
         x1 = _x(store, "u", "POST", f"{b}/signup/step1", status=302, ep=ep1,
                 req_body="plan=gold-plan&name=appmap-20261024-120000")
-        t1 = store.add_transition("s1", "s2", "u", "submit", "Next", exchange_ids=[x1])
+        t1 = store.add_transition("s1", "s2", "u", "submit", "Next", event_id="ev-000001",
+                                  exchange_ids=[x1])
         x2 = _x(store, "u", "POST", f"{b}/signup/step2", status=302, ep=ep2, req_body="ok=yes")
-        t2 = store.add_transition("s2", "s3", "u", "submit", "Finish", exchange_ids=[x2])
+        t2 = store.add_transition("s2", "s3", "u", "submit", "Finish", event_id="ev-000003",
+                                  exchange_ids=[x2])
+        # sequential submits of one session (another role's submit in between is fine)
+        _events(root, {"id": "ev-000001", "type": "submit", "role": "u"},
+                {"id": "ev-000002", "type": "submit", "role": "v"},
+                {"id": "ev-000003", "type": "submit", "role": "u"})
         _frontier(store, "u", [{"type": "goto", "url": f"{b}/signup"},
                                {"type": "submit", "form_label": "Next", "form_id": f1}])
         _frontier(store, "u", [{"type": "goto", "url": f"{b}/signup/2"},
                                {"type": "submit", "form_label": "Finish", "form_id": f2}])
         derive_value_links(store)
-        assert derive_flows(store) == 1
-        flow = _rows(store, "SELECT * FROM flows")[0]
-        assert flow["name"] == "u: Next → Finish @ /signup"
+        assert derive_flows(store) == 3  # both standalone steps plus the merged wizard
+        names = [r["name"] for r in _rows(store, "SELECT name FROM flows ORDER BY id")]
+        assert names == ["u: Next @ /signup", "u: Finish @ /signup/2", "u: Next → Finish @ /signup"]
+        flow = _rows(store, "SELECT * FROM flows WHERE name LIKE '%→%'")[0]
         steps = _rows(store, "SELECT * FROM flow_steps WHERE flow_id=? ORDER BY ordinal", flow["id"])
         assert [(s["transition_id"], s["exchange_id"]) for s in steps] == \
             [(nav, None), (t1, x1), (t2, x2)]
         pre = json.loads(flow["preconditions"])
         assert pre["flow_key"] == "u|POST /signup/step1|POST /signup/step2"
-        assert derive_preconditions(store) == 1
-        pre = json.loads(_rows(store, "SELECT preconditions FROM flows")[0]["preconditions"])
+        assert pre["form_ids"] == [f1, f2]
+        assert derive_preconditions(store) == 2  # the Next flow and the merged flow
+        pre = json.loads(_rows(store, "SELECT preconditions FROM flows WHERE id=?",
+                               flow["id"])[0]["preconditions"])
         assert pre["requires"] == [{"endpoint": "GET /api/plans", "json_path": "$.plans[0].code",
                                     "producer_exchange_id": plans, "consumer_exchange_id": x1,
                                     "consumer_location": "body"}]
@@ -496,3 +511,176 @@ def test_schema_md_recipes_run(ssr_run, spa_run, tmp_path):
                 assert last["action_type"] == "click" and json.loads(last["locators"])
         finally:
             store.close()
+
+
+# -- fix round 1 -----------------------------------------------------------------------
+def _two_forms(tmp_path, *, cycle: bool, sequential: bool):
+    """Reviewer repro: "Add" on /items/new lands on /items, whose Filter form posts."""
+    store, root = _synthetic(tmp_path)
+    b = "https://example.test"
+    ep_a = store.upsert_endpoint("POST", "example.test", "/items", "page")
+    ep_b = store.upsert_endpoint("POST", "example.test", "/items/filter", "page")
+    _state(store, "sl", "u", f"{b}/items", "/items")
+    _state(store, "sn", "u", f"{b}/items/new", "/items/new")
+    fa = store.add_form("sn", method="POST", action_endpoint_id=ep_a, succeeded=True)
+    fb = store.add_form("sl", method="POST", action_endpoint_id=ep_b, succeeded=True)
+    xa = _x(store, "u", "POST", f"{b}/items", status=302, ep=ep_a)
+    store.add_transition("sn", "sl", "u", "submit", "Add", event_id="ev-000001", exchange_ids=[xa])
+    xb = _x(store, "u", "POST", f"{b}/items/filter", status=302, ep=ep_b)
+    store.add_transition("sl", "sn" if cycle else "sl", "u", "submit", "Filter",
+                         event_id="ev-000003", exchange_ids=[xb])
+    _frontier(store, "u", [{"type": "goto", "url": f"{b}/items/new"},
+                           {"type": "submit", "form_label": "Add", "form_id": fa}])
+    _frontier(store, "u", [{"type": "goto", "url": f"{b}/items"},
+                           {"type": "submit", "form_label": "Filter", "form_id": fb}])
+    evs = [{"id": "ev-000001", "type": "submit", "role": "u"}]
+    if not sequential:
+        evs.append({"id": "ev-000002", "type": "submit", "role": "u"})
+    evs.append({"id": "ev-000003", "type": "submit", "role": "u"})
+    _events(root, *evs)
+    return store
+
+
+@pytest.mark.parametrize("cycle", [False, True])
+def test_wizard_merge_needs_sequential_submits_and_never_drops_flows(tmp_path, cycle):
+    store = _two_forms(tmp_path, cycle=cycle, sequential=False)
+    try:
+        assert derive_flows(store) == 2
+        assert {r["name"] for r in _rows(store, "SELECT name FROM flows")} == \
+            {"u: Add @ /items/new", "u: Filter @ /items"}
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("cycle", [False, True])
+def test_wizard_merge_is_additive_and_acyclic(tmp_path, cycle):
+    store = _two_forms(tmp_path, cycle=cycle, sequential=True)
+    try:
+        assert derive_flows(store) == 3
+        assert {r["name"] for r in _rows(store, "SELECT name FROM flows")} == \
+            {"u: Add @ /items/new", "u: Filter @ /items", "u: Add → Filter @ /items/new"}
+    finally:
+        store.close()
+
+
+def test_approved_submit_flow_has_form_id(tmp_path):
+    store, root = _synthetic(tmp_path)
+    try:
+        b = "https://example.test"
+        ep = store.upsert_endpoint("POST", "example.test", "/account/email", "page")
+        _state(store, "a1", "u", f"{b}/account", "/account")
+        fid = store.add_form("a1", method="POST", action_endpoint_id=ep)
+        x = _x(store, "u", "POST", f"{b}/account/email", status=302, ep=ep)
+        store.add_transition("a1", "a1", "u", "submit", "Send", event_id="ev-000010",
+                             exchange_ids=[x])
+        store.upsert_approval("ap-0001", role="u", category="outbound_message", label="Send",
+                              action_path=[{"type": "goto", "url": f"{b}/account"},
+                                           {"type": "submit", "form_label": "Send",
+                                            "form_id": fid, "method": "POST"}],
+                              decision="approve", executed_event="ev-000011")
+        _events(root, {"id": "ev-000010", "type": "submit", "role": "u"},
+                {"id": "ev-000011", "type": "approval_executed", "role": "u",
+                 "caused_by": "ev-000010", "data": {"exchange_ids": [x], "outcome": "done"}})
+        assert derive_flows(store) == 1
+        pre = json.loads(_rows(store, "SELECT preconditions FROM flows")[0]["preconditions"])
+        assert pre["form_ids"] == [fid] and pre["origin"] == "approved"
+    finally:
+        store.close()
+
+
+def test_goto_step_carries_page_load_shape(ssr_run, tmp_path):
+    root = _copy(ssr_run, tmp_path)
+    store = Store(root / "appmap.sqlite")
+    try:
+        derive_flows(store)
+        pre = json.loads(_rows(store, "SELECT preconditions FROM flows WHERE role='admin'")[0]
+                         ["preconditions"])
+        goto = pre["steps"][0]
+        assert goto["type"] == "goto" and goto["method"] == "GET"
+        assert (goto["path_pattern"], goto["status"]) == ("/projects/new", 200)
+    finally:
+        store.close()
+
+
+def test_path_to_state_sql_is_fast_on_dense_graph(tmp_path):
+    import random
+    import time
+    from collections import deque
+
+    store, _root = _synthetic(tmp_path)
+    try:
+        rnd = random.Random(7)
+        n = 200
+        for i in range(n):
+            _state(store, f"s{i}", "u", f"https://example.test/p?i={i}", "/p")
+        store.add_transition(None, "s0", "u", "navigate", "home")  # the only URL entry
+        edges = set()
+        for i in range(n):  # a ring gives every state a way in, so s0 is the only entry
+            for j in [(i + 1) % n, *rnd.sample(range(n), 3)]:
+                if j != i and (i, j) not in edges:
+                    edges.add((i, j))
+                    store.add_transition(f"s{i}", f"s{j}", "u", "click", f"{i}->{j}")
+        target = "s199"
+        dist = {0: 0}
+        q = deque([0])
+        while q:  # forward BFS from the entry for the expected length
+            i = q.popleft()
+            for a, c in edges:
+                if a == i and c not in dist:
+                    dist[c] = dist[i] + 1
+                    q.append(c)
+        sql = _recipes()["path-to-state"]
+        t0 = time.monotonic()
+        rows = [dict(r) for r in store.conn.execute(sql, {"state": target})]
+        assert time.monotonic() - t0 < 2.0
+        assert rows[0]["action_type"] == "goto" and rows[0]["url"].endswith("i=0")
+        assert len(rows) - 1 == dist[199]
+        cur = "s0"
+        for r in rows[1:]:  # a connected chain of clicks ending at the target
+            t = store.conn.execute("SELECT * FROM transitions WHERE id=?",
+                                   (r["transition_id"],)).fetchone()
+            assert t["from_state"] == cur
+            cur = t["to_state"]
+        assert cur == target
+    finally:
+        store.close()
+
+
+def test_apply_names_ignores_unhashable_entries(tmp_path):
+    store, root = _synthetic(tmp_path)
+    try:
+        p = root / "n.yaml"
+        p.write_text("flows: [{key: [a], name: x}, {id: {a: 1}, name: y}, {key: {a: 1}}]\n"
+                     "forms: [{id: [1], purpose: p}, {id: {a: 1}, purpose: q}]\n")
+        assert apply_names(store, p) == 0
+    finally:
+        store.close()
+
+
+def test_records_use_this_runs_truncations_only(tmp_path):
+    store, root = _synthetic(tmp_path)
+    try:
+        b = "https://example.test"
+        marker = "appmap-20261024-120000"
+        fid = store.add_form(None, method="POST")
+        store.add_field(fid, "name", "text", "input",
+                        validation_messages=["Name must be at most 12 characters"])
+        ours = _x(store, "u", "POST", f"{b}/projects", status=302,
+                  req_body=f"name={marker[:12]}&x=1")
+        _x(store, "u", "POST", f"{b}/projects", status=302,
+           req_body="name=appmap-2026")  # another run's (or a shorter) prefix: not ours
+        _x(store, "u", "POST", f"{b}/projects", status=422, req_body=f"name={marker}")
+        bodies = root / "bodies"
+        bodies.mkdir()
+        big = store.add_exchange(None, "u", "ui", method="PUT", url=f"{b}/docs/1", status=200,
+                                 req_body_path="bodies/9.req.json")
+        (bodies / "9.req.json").write_text(json.dumps({"title": marker, "pad": "x" * 10}))
+        pct = _x(store, "u", "POST", f"{b}/q", status=201, req_body="name=appmap%25_20261024")
+        md = render_app_map(store, open_run_dir(root))
+        rec = md.split("## Records created by this run", 1)[1].split("## Where", 1)[0]
+        ids = {int(line.split("|")[1]) for line in rec.splitlines()
+               if line.startswith("| ") and line.split("|")[1].strip().isdigit()}
+        assert ids == {ours, big} and pct not in ids
+        assert f"`{marker[:12]}`" in rec
+    finally:
+        store.close()

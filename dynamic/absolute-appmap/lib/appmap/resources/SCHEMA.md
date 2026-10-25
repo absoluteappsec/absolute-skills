@@ -20,7 +20,7 @@ Conventions:
   (`/items/:id` style, recorded as found).
 - **Redaction:** credentials and session tokens are replaced in every table by
   `<redacted:KIND>` (`password`, `secret`, `cookie`, `authorization`, `jwt`, `csrf`,
-  `api_key`); everything else, including customer data, is kept. If `run.json` has
+  `api_key`; `undecodable` replaces a binary body that could not be checked for secrets); everything else, including customer data, is kept. If `run.json` has
   `contains_production_data: true`, treat the run directory as sensitive production data.
 - Paths in the run directory (`screenshot`, `dom_snapshot`, `*_body_path`) are relative to
   the run directory.
@@ -242,8 +242,10 @@ The form's label is the `form_label` of the action-path step that targets it
 
 Derived by `appmap build` (rebuilt from scratch on every build, so ids are not stable; use
 `preconditions.flow_key`). One flow per successful form submission and per executed approved
-action; consecutive submits where one form's restore is the page the previous submit landed
-on are merged (wizards); flows with the same key are kept once.
+action. Multi-step forms additionally get one merged flow per chain: B continues A when B's
+submit is the very next `submit` event of the same role after A's in `events.jsonl` and
+B's restore is just a `goto` of the URL A's submit landed on; the standalone flows are kept.
+Flows with the same key are kept once.
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -263,7 +265,7 @@ on are merged (wizards); flows with the same key are kept once.
 | `origin` | `ui` (crawled form submission) or `approved` (executed approval) |
 | `approval_id` | `approvals.id` for approved flows, else NULL |
 | `form_ids` | `forms.id` of the submitted forms |
-| `steps` | Same order as `flow_steps`: `{"ordinal", "type" (goto/click/submit/request), "label", "url", "method", "path_pattern", "status", "mutating", "transition_id", "exchange_id"}`. `mutating` is true for a step that sent a non-GET request or a click the crawler marked as write-issuing; replaying it changes server state |
+| `steps` | Same order as `flow_steps` (`goto` steps carry the page load's `method`/`path_pattern`/`status`): `{"ordinal", "type" (goto/click/submit/request), "label", "url", "method", "path_pattern", "status", "mutating", "transition_id", "exchange_id"}`. `mutating` is true for a step that sent a non-GET request or a click the crawler marked as write-issuing; replaying it changes server state |
 
 ### `flow_steps`
 
@@ -277,6 +279,10 @@ on are merged (wizards); flows with the same key are kept once.
 
 A submit that sent several requests has one step per request, all with the same
 `transition_id`. Failed attempts (status ≥ 400) and static assets are left out.
+To replay a flow, a `goto` step loads its `url` (from `preconditions.steps`, or the
+step's page-load exchange); the navigate transition attached to it, if any, is
+informational (its `from_state` is one page that links there, not a required step).
+Click and submit steps replay through their transition's `locator_set_id`.
 
 ### `value_links`
 
@@ -489,42 +495,64 @@ ORDER BY CASE part WHEN 'param' THEN 0 ELSE 1 END, role, name;
 ### `path-to-state`
 
 `appmap query --run R path-to-state --state ID` — how to reach a state: step 0 loads a URL
-(a state reached by navigation, or with no recorded way in), then the shortest chain of
-click/submit transitions, each with its locators (best first).
+(the nearest state loadable by URL — some navigate transition leads to it — or with no
+recorded way in), then the shortest chain of click/submit transitions, each with its
+locators (best first).
+
+Algorithm (linear in states × depth, never enumerates paths): (1) BFS backwards from the
+target over click/submit transitions, `UNION` keeping one row per (state, depth), capped at
+depth 12, then `min(depth)` per state = distance to the target; (2) the entry is the
+reachable state with the smallest distance that is loadable by URL; (3) reconstruct the path
+forward from the entry, at each state taking the lowest-id transition to a state whose
+distance is one less, until distance 0. An implementation in a host language should do the
+same BFS (one visit per state) and the same tie-break (lowest transition id).
 
 ```sql
 WITH RECURSIVE
-back(start, depth, path, seen) AS (
-  SELECT :state, 0, '[]', '|' || :state || '|'
-  UNION ALL
-  SELECT t.from_state, b.depth + 1,
-         CASE b.path WHEN '[]' THEN '[' || t.id || ']'
-                     ELSE '[' || t.id || ',' || substr(b.path, 2) END,
-         b.seen || t.from_state || '|'
-  FROM back b JOIN transitions t ON t.to_state = b.start
-  WHERE t.action_type != 'navigate' AND t.from_state IS NOT NULL
-    AND instr(b.seen, '|' || t.from_state || '|') = 0 AND b.depth < 12
+-- 1. BFS backwards from the target over click/submit edges. UNION drops duplicate
+--    (state, depth) rows, so the work is bounded by states x max depth (12), not paths.
+back(state, depth) AS (
+  SELECT :state, 0
+  UNION
+  SELECT t.from_state, b.depth + 1
+  FROM back b JOIN transitions t ON t.to_state = b.state
+  WHERE t.action_type != 'navigate' AND t.from_state IS NOT NULL AND b.depth < 12
 ),
-best AS (
-  SELECT b.start, b.path FROM back b
-  WHERE EXISTS (SELECT 1 FROM transitions n WHERE n.to_state = b.start
+dist(state, d) AS (SELECT state, min(depth) FROM back GROUP BY state),
+-- 2. The nearest entry: a state loadable by URL (some navigate edge leads to it) or one
+--    with no recorded way in.
+best(state) AS (
+  SELECT dist.state FROM dist
+  WHERE EXISTS (SELECT 1 FROM transitions n WHERE n.to_state = dist.state
                 AND n.action_type = 'navigate')
-     OR NOT EXISTS (SELECT 1 FROM transitions n WHERE n.to_state = b.start)
-  ORDER BY b.depth LIMIT 1
+     OR NOT EXISTS (SELECT 1 FROM transitions n WHERE n.to_state = dist.state)
+  ORDER BY dist.d, dist.state LIMIT 1
+),
+-- 3. Walk forward from the entry, each step taking the lowest-id edge to a state one
+--    step closer to the target (d decreases by 1), until the target (d = 0).
+walk(step, state, tid) AS (
+  SELECT 0, best.state, NULL FROM best
+  UNION ALL
+  SELECT w.step + 1, t.to_state, t.id
+  FROM walk w
+  JOIN transitions t ON t.id = (
+    SELECT t2.id FROM transitions t2 JOIN dist d2 ON d2.state = t2.to_state
+    WHERE t2.from_state = w.state AND t2.action_type != 'navigate'
+      AND d2.d = (SELECT d FROM dist WHERE state = w.state) - 1
+    ORDER BY t2.id LIMIT 1)
+  WHERE (SELECT d FROM dist WHERE state = w.state) > 0
 )
-SELECT 0 AS step, 'goto' AS action_type, s.url, NULL AS label, NULL AS transition_id,
-       NULL AS locator_set_id, NULL AS locators
-FROM best JOIN states s ON s.id = best.start
-UNION ALL
-SELECT j.key + 1, t.action_type, s.url, t.action_label, t.id, t.locator_set_id,
-       (SELECT json_group_array(json_object('strategy', l.strategy, 'value', l.value,
-                                            'rank', l.rank))
-        FROM (SELECT * FROM locators WHERE locator_set_id = t.locator_set_id
-              ORDER BY rank) l)
-FROM best, json_each(best.path) j
-JOIN transitions t ON t.id = j.value
-JOIN states s ON s.id = t.from_state
-ORDER BY step;
+SELECT w.step, CASE WHEN w.tid IS NULL THEN 'goto' ELSE t.action_type END AS action_type,
+       s.url, t.action_label AS label, w.tid AS transition_id, t.locator_set_id,
+       CASE WHEN w.tid IS NULL THEN NULL ELSE
+         (SELECT json_group_array(json_object('strategy', l.strategy, 'value', l.value,
+                                              'rank', l.rank))
+          FROM (SELECT * FROM locators WHERE locator_set_id = t.locator_set_id
+                ORDER BY rank) l) END AS locators
+FROM walk w
+LEFT JOIN transitions t ON t.id = w.tid
+JOIN states s ON s.id = CASE WHEN w.tid IS NULL THEN w.state ELSE t.from_state END
+ORDER BY w.step;
 ```
 
 ### `role-matrix`
@@ -593,6 +621,28 @@ ORDER BY 1, 2;
 
 ## More examples
 
+`flow-form-fields` — every field of the forms a flow submits, with locators and the body the
+flow actually sent (`:flow` = `flows.id`):
+
+```sql
+SELECT f.id AS flow_id, f.name, fo.id AS form_id, fi.name AS field, fi.type, fi.widget,
+       fi.constraints, fi.options,
+       (SELECT json_group_array(json_object('strategy', l.strategy, 'value', l.value))
+        FROM (SELECT * FROM locators WHERE locator_set_id = fi.locator_set_id
+              ORDER BY rank) l) AS field_locators,
+       (SELECT x.req_body FROM flow_steps fs
+        JOIN transitions t ON t.id = fs.transition_id AND t.action_type = 'submit'
+        JOIN exchanges x ON x.id = fs.exchange_id
+        WHERE fs.flow_id = f.id AND t.from_state = fo.state_id
+        ORDER BY fs.ordinal LIMIT 1) AS submitted_body
+FROM flows f
+JOIN json_each(f.preconditions, '$.form_ids') j
+JOIN forms fo ON fo.id = j.value
+JOIN fields fi ON fi.form_id = fo.id
+WHERE f.id = :flow
+ORDER BY fo.id, fi.id;
+```
+
 ```sql
 -- request/response pairs of a flow, in order
 SELECT fs.ordinal, x.method, x.url, x.status, x.req_body, x.resp_body
@@ -609,8 +659,12 @@ SELECT e.method, e.path_pattern, group_concat(ra.role || '=' || ra.outcome, ', '
 FROM role_access ra JOIN endpoints e ON ra.item_kind = 'endpoint' AND e.id = ra.item_id
 GROUP BY e.id HAVING count(DISTINCT ra.outcome) > 1;
 
--- write requests that carried the run marker (records created by this run)
+-- write requests that carried the full run marker (records created by this run); substitute
+-- the marker from run.json and escape LIKE wildcards ('_' and '%') in it. Bodies over
+-- 256 KiB are in req_body_path files and are not covered by this query. APP-MAP.md also
+-- matches the run's own truncations of the marker (fields too short for it).
 SELECT id, role, method, url, status FROM exchanges
 WHERE upper(method) NOT IN ('GET','HEAD','OPTIONS') AND status BETWEEN 200 AND 399
-  AND (req_body LIKE '%appmap-%' OR url LIKE '%appmap-%');
+  AND (req_body LIKE '%appmap-20261024-120000%' ESCAPE '\'
+       OR url LIKE '%appmap-20261024-120000%' ESCAPE '\');
 ```
