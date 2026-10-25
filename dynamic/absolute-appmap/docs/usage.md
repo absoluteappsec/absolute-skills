@@ -269,6 +269,9 @@ Each run is one self-contained directory, `appmap-<host>-<YYYYMMDD-HHMMSS>/`:
 After the first `build`, fill in `names.yaml` (flow names, descriptions, form purposes) and run
 `$A build --run "$RUN"` again.
 
+`profile` (section 7a) adds `profile.json`, `APP-PROFILE.md` and `profile-names.yaml` to the run
+directory, or to `--out`.
+
 ## 7. Querying the map
 
 ```bash
@@ -287,6 +290,47 @@ Output is one JSON object per row (`--format table` for aligned text), followed 
 line (`counts.rows`). `sql` accepts a single read-only `SELECT`/`WITH` statement. `SCHEMA.md`
 in the run directory and `skills/query-app-map/` describe every table and more recipes;
 evidence for any row is in `events.jsonl` and the HAR files.
+
+## 7a. Profiling the application
+
+`profile` turns one or more finished runs into a briefing for testers and developers
+(`skills/profile-running-application/`). It only reads the run directories — no requests to the
+target, no writes to `appmap.sqlite`, no run lock — and works on unfinished runs too (status
+`partial`, with the gaps listed).
+
+```bash
+$A profile --run "$RUN"                                         # writes into $RUN
+$A profile --run "$STAGING_RUN" --run "$PROD_RUN" --out ~/engagements/profile   # several environments
+$A profile --run "$RUN" --out /tmp/profile --include-observed-accounts         # unmask (production)
+```
+
+| `status` | Meaning |
+|---|---|
+| `profiled` | Every section derived |
+| `partial` | Written; `could_not_determine` in `profile.json` says what is missing (no build, failed role, unfinished crawl, …) |
+| `error` | Nothing written (no `appmap.sqlite`; output directory not writable — pass `--out`) |
+
+`counts`: `technologies`, `features`, `entities`, `environments`. Outputs:
+
+- `profile.json` — structured profile (`profile_schema_version` 1.0.0); every technology with
+  `versions`, `confidence` (`confirmed` / `likely`) and evidence refs
+  `{run_id, kind, id}`. Shape: "profile.json" in `SCHEMA.md`.
+- `APP-PROFILE.md` — purpose, main features, how it works, technology stack, layout, data
+  model, data setup, test accounts, environments (with differences), coverage orientation,
+  could not determine. Descriptive only.
+- `profile-names.yaml` — `purpose` plus, per feature `key`, `name` / `description` /
+  `how_it_works` (and the generated `suggestion`); `stale` keeps entries whose feature
+  disappeared; `technology_overrides` (`name`, `category`, `confidence`, `reason`) lowers a
+  detected confidence — upgrades are refused with a warning. Fill it, rerun the same `profile`
+  command; `next` is `null` once the purpose is set and every feature has a name other than
+  its suggestion, or a description.
+
+With several `--run`s the runs are treated as environments of one application: top-level
+sections describe the first run, `other_runs` the rest, and `differences` lists technologies,
+versions, routes, endpoints and role reach that are not shared by all (a warning appears when
+their routes overlap less than 30%). If any run has `contains_production_data`, observed
+usernames/emails are masked unless `--include-observed-accounts` is given, and APP-PROFILE.md
+carries the handling notice. Passwords, tokens and env-var values never appear.
 
 ## 8. Safety notes
 

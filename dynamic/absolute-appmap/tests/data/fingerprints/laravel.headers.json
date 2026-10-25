@@ -1,0 +1,4 @@
+{"Server": "nginx/1.25.3", "Content-Type": "text/html; charset=UTF-8",
+ "Cache-Control": "no-cache, private", "X-Powered-By": "PHP/8.2.12",
+ "Set-Cookie": ["XSRF-TOKEN=<redacted:csrf>; expires=Sun, 25 Oct 2026 12:00:00 GMT; Max-Age=7200; path=/; samesite=lax",
+                "laravel_session=<redacted:cookie>; expires=Sun, 25 Oct 2026 12:00:00 GMT; Max-Age=7200; path=/; httponly; samesite=lax"]}

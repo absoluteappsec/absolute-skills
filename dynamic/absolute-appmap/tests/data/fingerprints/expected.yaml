@@ -1,0 +1,118 @@
+# sample file -> exact detections: [technology, version (null | "x" | [..]), confidence]
+# Kind by suffix: .headers.json -> header + cookie, .error.html -> error_page, .html -> html,
+# .js -> script, .map -> source_map (sources list), .schema.* -> schema, .auth.txt -> auth.
+django.headers.json:
+  - [gunicorn, null, confirmed]
+  - [Python, null, likely]
+  - [Django, null, likely]
+  - [Cookie session, null, likely]
+  - [CSRF token, null, likely]
+django_admin_login.html:
+  - [Django, null, confirmed]
+  - [Python, null, likely]
+  - [CSRF token, null, likely]
+django_debug.error.html:
+  - [Django, "4.2.7", confirmed]
+  - [Python, "3.11.6", confirmed]
+drf_browsable.html:
+  - [Django REST Framework, null, confirmed]
+  - [Django, null, likely]
+  - [Python, null, likely]
+  - [Bootstrap, null, likely]
+drf_spectacular.schema.yaml:
+  - [OpenAPI, "3.0.3", confirmed]
+  - [drf-spectacular, null, likely]
+  - [Django REST Framework, null, likely]
+  - [Django, null, likely]
+  - [Python, null, likely]
+werkzeug.headers.json:
+  - [Werkzeug, "3.0.1", confirmed]
+  - [Python, "3.12.2", confirmed]
+  - [Cookie session, null, likely]
+werkzeug_debugger.error.html:
+  - [Werkzeug, null, confirmed]
+  - [Flask, null, likely]
+  - [Python, null, likely]
+rails.headers.json:
+  - [Ruby on Rails, null, likely]
+  - [Ruby, null, likely]
+  - [Cookie session, null, likely]
+rails.html:
+  - [Ruby on Rails, null, confirmed]
+  - [Ruby, null, likely]
+  - [CSRF token, null, likely]
+laravel.headers.json:
+  - [nginx, "1.25.3", confirmed]
+  - [PHP, "8.2.12", confirmed]
+  - [Laravel, null, likely]
+  - [Cookie session, null, likely]
+  - [CSRF token, null, likely]
+express.headers.json:
+  - [Express, null, confirmed]
+  - [Node.js, null, likely]
+  - [Cookie session, null, likely]
+spring.headers.json:
+  - [Java, null, likely]
+  - [Cookie session, null, likely]
+spring_whitelabel.error.html:
+  - [Spring Boot, null, confirmed]
+  - [Java, null, likely]
+aspnet.headers.json:
+  - [IIS, "10.0", confirmed]
+  - [ASP.NET, "4.0.30319", confirmed]
+  - [ASP.NET MVC, "5.2", confirmed]
+  - [C#, null, likely]
+  - [Cookie session, null, likely]
+php.headers.json:
+  - [Apache HTTP Server, "2.4.57", confirmed]
+  - [PHP, "7.4.33", confirmed]
+  - [Cookie session, null, likely]
+uvicorn.headers.json:
+  - [uvicorn, null, confirmed]
+  - [Python, null, likely]
+cloudflare.headers.json:
+  - [Cloudflare, null, confirmed]
+cloudfront.headers.json:
+  - [Amazon CloudFront, null, confirmed]
+fastly.headers.json:
+  - [Fastly, null, confirmed]
+react.js:
+  - [React, "17.0.2", confirmed]
+react_app.map:
+  - [React, null, likely]
+next.html:
+  - [Next.js, null, confirmed]
+  - [React, null, likely]
+nuxt.html:
+  - [Nuxt, null, confirmed]
+  - [Vue, null, likely]
+sveltekit.html:
+  - [SvelteKit, null, confirmed]
+  - [Svelte, null, likely]
+angular.html:
+  - [Angular, "17.3.1", confirmed]
+jquery.js:
+  - [jQuery, "3.7.1", confirmed]
+bootstrap.js:
+  - [Bootstrap, "5.3.2", confirmed]
+cdn_assets.html:
+  - [Bootstrap, "5.3.2", likely]
+  - [Font Awesome, "6.4.2", likely]
+  - [jQuery, "3.6.0", likely]
+  - [Google Analytics, null, likely]
+  - [Google Tag Manager, null, likely]
+openapi.schema.json:
+  - [OpenAPI, "3.1.0", confirmed]
+  - [JWT bearer, null, likely]
+graphql.schema.json:
+  - [GraphQL, null, confirmed]
+bearer_login.auth.txt:
+  - [JWT bearer, null, likely]
+csrf_login.auth.txt:
+  - [Django, null, likely]
+  - [Python, null, likely]
+  - [CSRF token, null, likely]
+bootstrap.css:
+  - [Bootstrap, "5.3.2", confirmed]
+fontawesome.css:
+  - [Font Awesome, "6.4.2", confirmed]

@@ -152,6 +152,19 @@ production.
 
 ---
 
+## Step 9 — Profile the Application (optional)
+
+Invoke skill: `profile-running-application` — when the operator wants a briefing for testers or
+developers, or a test-generation step follows.
+
+`appmap profile --run <run>` (one `--run` per environment of the same application) writes
+`profile.json`, `APP-PROFILE.md` and a `profile-names.yaml` stub; you fill the purpose and
+feature names, descriptions and "how it works" with evidence refs (and optional confidence
+downgrades), and re-run until `next` is `null`. Statuses:
+`profiled`, `partial` (something could not be determined), `error`.
+
+---
+
 ## Completion Criteria
 
 - [ ] Operator explicitly confirmed authorization and scope; `run.json` records it.
@@ -172,5 +185,6 @@ production.
   and reruns, the double-back procedure and stop rule, resuming a run.
 - `references/config-reference.md` — every `appmap.config.yaml` key, defaults, profiles, login
   types, examples.
+- `../profile-running-application/SKILL.md` — the optional application profile (Step 9).
 - `references/safety.md` — authorization, scope, throttling and circuit breaker, approvals,
   redaction, credentials, sensitive-data handling and cleanup.

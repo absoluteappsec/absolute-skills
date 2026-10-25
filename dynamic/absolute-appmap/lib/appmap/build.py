@@ -25,8 +25,8 @@ from appmap import SCHEMA_VERSION
 from appmap.store import Store
 
 __all__ = ["derive_flows", "derive_value_links", "derive_preconditions", "emit_naming_stub",
-           "apply_names", "export_json", "render_app_map", "build_map", "INTERNAL_TABLES",
-           "is_internal_meta_key"]
+           "apply_names", "created_records", "export_json", "render_app_map", "build_map",
+           "INTERNAL_TABLES", "is_internal_meta_key"]
 
 # Crawl-internal tables: never exported, documented as internal in SCHEMA.md.
 INTERNAL_TABLES = ("frontier", "frontier_links")
@@ -974,7 +974,7 @@ def _url_key(url: str) -> str:
         f"?{p.query}" if p.query else "")
 
 
-def _ctx_records(store: Store) -> dict:
+def _collect_records(store: Store) -> tuple[list[dict], list[dict], str | None, set[str]]:
     """Records created or changed by this run (ruling R23): every exchange in the run
     directory was sent by this run, so this is every successful (2xx/3xx) non-GET exchange
     except login traffic, login/logout endpoints and writes redirected to a login page
@@ -1015,6 +1015,17 @@ def _ctx_records(store: Store) -> dict:
             if _AUTH_PATH.search(to) or (to.rstrip("/") or "/") in login_paths:
                 continue  # bounced to the login page: the write did not happen
         (matched if x["marker"] else other).append(x)
+    return matched, other, marker, short
+
+
+def created_records(store: Store) -> list[dict]:
+    """Every record this run created, uncapped, marker-matched rows first."""
+    matched, other, _, _ = _collect_records(store)
+    return matched + other
+
+
+def _ctx_records(store: Store) -> dict:
+    matched, other, marker, short = _collect_records(store)
     shown, more = _cap(matched + other, CAPS["records"])
     return {"rows": shown, "more": more, "marker": marker or "",
             "matched": len(matched), "variants": sorted(short, key=len, reverse=True)}

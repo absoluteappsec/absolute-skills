@@ -28,11 +28,16 @@ recipes.
 
 ## Step 1 — Orient
 
-1. `run.json` — target, profile, roles, `authorization`, `schema_version`, `status`
+1. **The profile first, if there is one.** `APP-PROFILE.md` (and `profile.json`) in the run
+   directory — or wherever `appmap profile --out` put them — is the briefing: purpose, features,
+   technology stack, layout, data model, data setup, test accounts, environments, coverage.
+   Read it before anything else. If there is none and you need that context, run the
+   `profile-running-application` skill (`../profile-running-application/SKILL.md`) first.
+2. `run.json` — target, profile, roles, `authorization`, `schema_version`, `status`
    (`complete` = map built), `contains_production_data`.
-2. `APP-MAP.md` — the human summary: route tree, endpoint inventory, role access matrix, flows,
+3. `APP-MAP.md` — the human summary: route tree, endpoint inventory, role access matrix, flows,
    forms, unexercised surface, gaps.
-3. `SCHEMA.md` (same content as `references/schema.md`) — every table, column and vocabulary.
+4. `SCHEMA.md` (same content as `references/schema.md`) — every table, column and vocabulary.
    Check `meta.schema_version`; a different major version means the schema changed.
 
 ---
@@ -100,7 +105,8 @@ Examples: `appmap query --run <run> flows --role admin`,
 
 ## Completion Criteria
 
-- [ ] Oriented from `run.json`, `APP-MAP.md` and the schema version before querying.
+- [ ] Oriented from `APP-PROFILE.md` (when present), `run.json`, `APP-MAP.md` and the schema
+      version before querying.
 - [ ] Answers come from recipes or read-only SQL, with ids (exchange, state, flow) as evidence.
 - [ ] Raw bodies and personal data quoted only as far as the task requires.
 
@@ -111,3 +117,4 @@ Examples: `appmap query --run <run> flows --role admin`,
 - `references/schema.md` — tables, columns, vocabularies and recipe SQL (identical to
   `SCHEMA.md` in every run directory).
 - `references/example-queries.md` — SQL for common questions and test-generation tasks.
+- `../profile-running-application/SKILL.md` — producing `APP-PROFILE.md` / `profile.json`.

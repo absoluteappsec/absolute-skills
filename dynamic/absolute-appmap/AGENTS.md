@@ -18,8 +18,12 @@ screenshots. Destructive actions are held for human approval. The result feeds t
    calls the phase skills in order:
    `configure-crawl` → `authenticate-roles` → `probe-endpoints` (passive) → `crawl-application`
    → `probe-endpoints` (active) → `review-approvals` → double back → `build-app-map`.
-2. To use an existing run directory (e.g. to write tests from it): read
-   **`skills/query-app-map/SKILL.md`**.
+2. To brief someone on an already-mapped application (purpose, features, technology stack,
+   layout, data model, test accounts, environments): read
+   **`skills/profile-running-application/SKILL.md`**. It runs `appmap profile` and writes
+   `APP-PROFILE.md` — the dynamic counterpart of a source-code profile.
+3. To use an existing run directory (e.g. to write tests from it): read
+   **`skills/query-app-map/SKILL.md`**. Read the run's `APP-PROFILE.md` first when there is one.
 
 Each skill is `skills/<name>/SKILL.md`; detail lives in its `references/` folder and loads on
 demand. "Invoke skill: `x`" means read `skills/x/SKILL.md` and follow it.
@@ -29,7 +33,7 @@ demand. "Invoke skill: `x`" means read `skills/x/SKILL.md` and follow it.
 Run every command through the wrapper **`scripts/appmap`** (absolute path). On first use it
 creates a virtualenv and installs Chromium under `~/.cache/absolute-appmap/` (needs Python 3.11+
 and network). Subcommands: `init`, `auth`, `crawl`, `probe`, `approvals`, `build`, `status`,
-`query`; `scripts/appmap <subcommand> --help` lists the options.
+`profile`, `query`; `scripts/appmap <subcommand> --help` lists the options.
 
 ## The APPMAP_STATUS contract
 

@@ -1,0 +1,44 @@
+openapi: 3.0.3
+info:
+  title: Inventory API
+  version: 1.0.0
+paths:
+  /api/items/:
+    get:
+      operationId: items_list
+      tags:
+      - items
+      security:
+      - cookieAuth: []
+      - basicAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Item'
+          description: ''
+components:
+  schemas:
+    Item:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        name:
+          type: string
+          maxLength: 120
+      required:
+      - id
+      - name
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: sessionid

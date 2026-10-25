@@ -1,0 +1,4 @@
+{"Cache-Control": "private", "Content-Type": "text/html; charset=utf-8",
+ "Server": "Microsoft-IIS/10.0", "X-AspNetMvc-Version": "5.2", "X-AspNet-Version": "4.0.30319",
+ "X-Powered-By": "ASP.NET",
+ "Set-Cookie": "ASP.NET_SessionId=<redacted:cookie>; path=/; HttpOnly; SameSite=Lax"}

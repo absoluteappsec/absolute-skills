@@ -88,6 +88,7 @@ $A status --run "$RUN" --new-pass          # double back: read new_in_prev_pass
 $A status --run "$RUN" --gaps
 $A build --run "$RUN"                      # name flows in names.yaml, build again
 $A query --run "$RUN" role-matrix
+$A profile --run "$RUN"                    # optional briefing: fill profile-names.yaml, rerun
 ```
 
 [`docs/usage.md`](docs/usage.md) walks through this sequence in detail: install, configuration
@@ -120,10 +121,11 @@ querying and safety notes.
 | `review-approvals` | Reviews held destructive actions, recommends with reasons, presents them to the human by category, records the human's decisions, executes approved items. |
 | `build-app-map` | Derives flows and value links, writes `appmap.json` / `APP-MAP.md` / `SCHEMA.md`, has the agent name flows and form purposes, reviews the map, reports. |
 
-### Consumer skill
+### Consumer skills
 
 | Skill | Description |
 |-------|-------------|
+| `profile-running-application` | Turns finished run directories (one per environment) into an application profile for testers and developers: purpose, features, technology stack with versions and confidence, layout, how features work, data model, data setup, test accounts, environments, coverage. Runs `appmap profile`; the agent writes the narrative with evidence refs. Dynamic only — for a source-code profile use `absolute-codereview`'s `profile-application`. |
 | `query-app-map` | Teaches downstream agents (e.g. a test generator) to answer questions from a run directory: orientation, `appmap query` recipes, read-only SQL, evidence in `events.jsonl` and HAR. |
 
 ## Outputs
@@ -143,6 +145,15 @@ Each run writes one self-contained directory, `appmap-<host>-<YYYYMMDD-HHMMSS>/`
 | `names.yaml` | Agent-written flow names/descriptions and form purposes, applied on every build. |
 | `artifacts/`, `bodies/` | Screenshot + DOM snapshot per state; large or binary bodies. |
 | `crawl.log` | Human-oriented log. |
+
+`appmap profile` (optional, after `build`) adds three files to the run directory, or to the
+directory given with `--out`:
+
+| File | Description |
+|------|-------------|
+| `profile.json` | Structured, versioned application profile (`profile_schema_version`): technologies with versions, confidence (`confirmed` / `likely`) and evidence refs, layout, features, data model, data setup, accounts, environments and differences, coverage, what could not be determined. |
+| `APP-PROFILE.md` | The briefing, leading with purpose and features. Descriptive only — no judgments of versions or security. |
+| `profile-names.yaml` | Agent-written purpose and feature names, descriptions and "how it works", plus optional technology confidence downgrades (`technology_overrides`), applied on every profile run; entries whose feature disappeared move to `stale`. |
 
 Saved login sessions are kept outside the run directory, in
 `~/.cache/absolute-appmap/sessions/<run_id>/`.

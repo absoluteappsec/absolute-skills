@@ -1,0 +1,1 @@
+role=api login_type=form auth_ok=1 fields=email,password token_headers=authorization
