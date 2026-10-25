@@ -2,18 +2,19 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 from pathlib import Path
 from typing import Any, Awaitable
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlsplit
 
 from playwright.async_api import BrowserContext, Page, Request, Route, WebSocket
 
 from ..events import EventLog
 from ..gate import RequestGate
 from ..normalize import normalize_path
-from ..recording import record_exchange
+from ..recording import record_exchange, redact_bytes, redact_text
 from ..redact import Redactor
 from ..rundir import RunDir
 from ..store import Store
@@ -21,9 +22,7 @@ from ..throttle import CircuitOpen
 
 # Static subresources of in-scope hosts skip the rate limiter (scope still applies).
 STATIC_TYPES = frozenset({"image", "stylesheet", "script", "font", "media"})
-# Long-lived streams are never buffered; redirects are not a concern for them.
-_PASSTHROUGH_TYPES = frozenset({"eventsource", "websocket"})
-_REDIRECTS = frozenset({301, 302, 303, 307, 308})
+_CDP_STATIC_TYPES = frozenset({"Image", "Stylesheet", "Script", "Font", "Media"})
 _CSRF = re.compile(r"csrf|xsrf", re.I)
 _FRAME_LIMIT = 4096
 
@@ -42,19 +41,70 @@ class TrafficRecorder:
         self.origin_by_role: dict[str, str] = {}   # "login" while a login flow runs
         self.last_status: dict[str, int | None] = {}
         self._pending: set[asyncio.Task] = set()
+        self._gate_tasks: dict[Page, asyncio.Task] = {}
 
     # -- wiring ------------------------------------------------------------
     async def attach(self, context: BrowserContext, role: str) -> None:
         self.auth_headers.setdefault(role, {})
         await context.route("**/*", lambda route, request: self._route(route, request, role))
-        if hasattr(context, "route_web_socket"):
-            await context.route_web_socket("**/*", lambda ws: self._gate_websocket(ws, role))
+        await context.route_web_socket("**/*", lambda ws: self._gate_websocket(ws, role))
         context.on("request", lambda request: self._learn_auth(request, role))
         context.on("requestfinished",
                    lambda request: self._spawn(self._record(request, role)))
         context.on("page", lambda page: self._watch_page(page, role))
         for page in context.pages:
             self._watch_page(page, role)
+
+    # -- redirect hops (CDP) -------------------------------------------------
+    # Chromium follows redirects internally without re-running Playwright route handlers,
+    # so hops 2+ would bypass scope/deny/limiter/breaker. A CDP Fetch session per page sees
+    # every redirected request; first hops are gated by the route handler above.
+    async def _enable_redirect_gate(self, page: Page, role: str) -> None:
+        session = await page.context.new_cdp_session(page)
+
+        async def on_paused(ev: dict) -> None:
+            rid = ev["requestId"]
+            try:
+                if not ev.get("redirectedRequestId"):
+                    await session.send("Fetch.continueRequest", {"requestId": rid})
+                    return
+                req = ev["request"]
+                url = req["url"]
+                if ev.get("resourceType") in _CDP_STATIC_TYPES and self.gate.scope.allows(url):
+                    ok = True
+                else:
+                    ok = await self.gate.admit(req["method"], url, role=role,
+                                               found_on=req.get("headers", {}).get("Referer", ""))
+            except CircuitOpen as exc:
+                self.events.emit("error", role=role, message=str(exc), url=ev["request"]["url"])
+                ok = False
+            except Exception as exc:  # fail closed
+                self.events.emit("error", role=role, message=f"redirect gate failed: {exc}")
+                ok = False
+            try:
+                if ok:
+                    await session.send("Fetch.continueRequest", {"requestId": rid})
+                else:
+                    await session.send("Fetch.failRequest",
+                                       {"requestId": rid, "errorReason": "BlockedByClient"})
+            except Exception:
+                pass  # page closed while paused
+
+        session.on("Fetch.requestPaused", lambda ev: self._spawn(on_paused(ev)))
+        await session.send("Fetch.enable", {"patterns": [{"urlPattern": "*",
+                                                          "requestStage": "Request"}]})
+
+    async def new_page(self, context: BrowserContext) -> Page:
+        """Open a page whose redirect gate is armed before it can navigate.
+
+        Use this instead of ``context.new_page()``; pages opened by the site itself
+        (popups) are armed asynchronously and may miss their very first request.
+        """
+        page = await context.new_page()
+        task = self._gate_tasks.get(page)
+        if task is not None:
+            await task
+        return page
 
     def _spawn(self, coro: Awaitable[Any]) -> None:
         task = asyncio.ensure_future(coro)
@@ -81,7 +131,7 @@ class TrafficRecorder:
     async def _route(self, route: Route, request: Request, role: str) -> None:
         url = request.url
         if request.resource_type in STATIC_TYPES and self.gate.scope.allows(url):
-            await self._fetch_checking_redirect(route, request, role)
+            await route.continue_()
             return
         try:
             admitted = await self.gate.admit(request.method, url, role=role,
@@ -89,35 +139,10 @@ class TrafficRecorder:
         except CircuitOpen as exc:
             self.events.emit("error", role=role, message=str(exc), url=url)
             admitted = False
-        if not admitted:
-            await route.abort()
-        elif request.resource_type in _PASSTHROUGH_TYPES:
+        if admitted:
             await route.continue_()
         else:
-            await self._fetch_checking_redirect(route, request, role)
-
-    async def _fetch_checking_redirect(self, route: Route, request: Request,
-                                       role: str) -> None:
-        """Chromium follows redirects without re-running route handlers, so fetch with
-        redirects disabled and gate the ``Location`` before the browser can follow it."""
-        try:
-            response = await route.fetch(max_redirects=0, timeout=0)
-        except Exception:
             await route.abort()
-            return
-        location = response.headers.get("location")
-        if response.status in _REDIRECTS and location:
-            target = urljoin(request.url, location)
-            try:
-                allowed = await self.gate.admit(request.method, target, role=role,
-                                                found_on=request.url)
-            except CircuitOpen as exc:
-                self.events.emit("error", role=role, message=str(exc), url=target)
-                allowed = False
-            if not allowed:
-                await route.abort()
-                return
-        await route.fulfill(response=response)
 
     async def _gate_websocket(self, ws, role: str) -> None:
         try:
@@ -134,6 +159,8 @@ class TrafficRecorder:
 
     # -- learning + recording ---------------------------------------------
     def _learn_auth(self, request: Request, role: str) -> None:
+        if not self.gate.scope.allows(request.url):
+            return
         learned = self.auth_headers.setdefault(role, {})
         for name, value in request.headers.items():
             if name == "authorization" or _CSRF.search(name):
@@ -167,6 +194,11 @@ class TrafficRecorder:
 
     # -- websockets --------------------------------------------------------
     def _watch_page(self, page: Page, role: str) -> None:
+        if page not in self._gate_tasks:
+            task = asyncio.ensure_future(self._enable_redirect_gate(page, role))
+            self._gate_tasks[page] = task
+            self._pending.add(task)
+            task.add_done_callback(self._pending.discard)
         page.on("websocket", lambda ws: self._on_websocket(ws, role))
 
     def _on_websocket(self, ws: WebSocket, role: str) -> None:
@@ -197,5 +229,31 @@ class TrafficRecorder:
         if not path.exists():
             return None
         har = json.loads(path.read_text(encoding="utf-8"))
+        for entry in har.get("log", {}).get("entries", []):
+            self._redact_bodies(entry)
         path.write_text(json.dumps(self.redactor.json(har), indent=1), encoding="utf-8")
         return path
+
+    def _redact_body(self, text: str, mime: str, encoding: str | None) -> str:
+        """Redact a HAR body the way recording.py redacts stored bodies."""
+        is_b64 = encoding == "base64"
+        if is_b64:
+            raw = base64.b64decode(text)
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return base64.b64encode(redact_bytes(self.redactor, raw)).decode()
+        if "x-www-form-urlencoded" in (mime or ""):
+            text = self.redactor.url("x?" + text)[2:]
+        else:
+            text = redact_text(self.redactor, text)
+        return base64.b64encode(text.encode()).decode() if is_b64 else text
+
+    def _redact_bodies(self, entry: dict) -> None:
+        content = entry.get("response", {}).get("content") or {}
+        if isinstance(content.get("text"), str):
+            content["text"] = self._redact_body(content["text"], content.get("mimeType", ""),
+                                                content.get("encoding"))
+        post = entry.get("request", {}).get("postData") or {}
+        if isinstance(post.get("text"), str):
+            post["text"] = self._redact_body(post["text"], post.get("mimeType", ""), None)

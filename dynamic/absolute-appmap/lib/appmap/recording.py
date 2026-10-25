@@ -209,12 +209,12 @@ def _index_params(store: Store, redactor: Redactor, endpoint_id: int, raw_segs: 
                 _upsert_param(store, redactor, endpoint_id, "body", k, v)
 
 
-def _redact_bytes(redactor: Redactor, raw: bytes) -> bytes:
+def redact_bytes(redactor: Redactor, raw: bytes) -> bytes:
     """Redact binary / non-UTF-8 content via a lossless latin-1 round trip."""
     return redactor.text(raw.decode("latin-1")).encode("latin-1", errors="replace")
 
 
-def _redact_text(redactor: Redactor, text: str) -> str:
+def redact_text(redactor: Redactor, text: str) -> str:
     obj = _json_or_none(text)
     if isinstance(obj, (dict, list)):
         return json.dumps(redactor.json(obj), ensure_ascii=False)
@@ -276,9 +276,9 @@ def record_exchange(store: Store, events: EventLog, redactor: Redactor, rd: RunD
         if not raw:
             continue
         if text is None:
-            files[side] = (_redact_bytes(redactor, raw), _ext(ct, False))
+            files[side] = (redact_bytes(redactor, raw), _ext(ct, False))
             continue
-        safe = _redact_text(redactor, text)
+        safe = redact_text(redactor, text)
         if len(safe.encode("utf-8")) <= INLINE_LIMIT:
             inline[side] = safe
         else:

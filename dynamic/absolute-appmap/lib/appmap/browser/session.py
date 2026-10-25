@@ -113,6 +113,12 @@ async def _save_state(sess: RoleSession, page: Page) -> Path:
     return path
 
 
+async def _new_page(sess: RoleSession) -> Page:
+    if sess.recorder:
+        return await sess.recorder.new_page(sess.context)
+    return await sess.context.new_page()
+
+
 # -- login -------------------------------------------------------------------
 async def _visible(page: Page, selector: str) -> bool:
     try:
@@ -182,10 +188,10 @@ async def login(sess: RoleSession, cfg: RunConfig, events: EventLog) -> bool:
             p = _spec_state_path(cfg, role)
             ok = bool(state_path(sess.rd, role.name).exists() or (p and p.exists()))
             if ok:
-                page = await sess.context.new_page()
+                page = await _new_page(sess)
                 await page.goto(_login_url(cfg, role))
         else:
-            page = await sess.context.new_page()
+            page = await _new_page(sess)
             ok = await (_form_login(sess, cfg, page) if spec.type == "form"
                         else _manual_login(sess, cfg, page))
         if ok and page is not None:

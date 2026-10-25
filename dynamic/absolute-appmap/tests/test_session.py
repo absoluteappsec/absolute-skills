@@ -100,7 +100,7 @@ async def test_session_loss_detected_and_recovered(browser, ssr_url, make_cfg, r
     h = Harness(cfg, run_dir(tmp_path, cfg))
     sess = await h.open(browser, "admin")
     assert await login(sess, cfg, h.events)
-    page = await sess.context.new_page()
+    page = await h.recorder.new_page(sess.context)
     assert (await page.goto(f"{ssr_url}/admin")).status == 200
     assert await ensure_authenticated(sess, page, cfg, h.events)  # still fine: no event
     assert not [e for e in h.events.iter() if e.type == "session_lost"]
@@ -121,7 +121,7 @@ async def test_change_password_page_is_not_session_loss(browser, ssr_url, make_c
     h = Harness(cfg, run_dir(tmp_path, cfg))
     sess = await h.open(browser, "admin")
     assert await login(sess, cfg, h.events)
-    page = await sess.context.new_page()
+    page = await h.recorder.new_page(sess.context)
     await page.goto(f"{ssr_url}/account/password")
     assert await ensure_authenticated(sess, page, cfg, h.events)
     assert not [e for e in h.events.iter() if e.type == "session_lost"]
@@ -137,6 +137,6 @@ async def test_saved_state_restored(browser, ssr_url, make_cfg, run_dir, tmp_pat
     assert await login(sess, cfg, h.events)
     await sess.context.close()
     sess2 = await h.open(browser, "admin")
-    page = await sess2.context.new_page()
+    page = await h.recorder.new_page(sess2.context)
     assert (await page.goto(f"{ssr_url}/admin")).status == 200
     await sess2.context.close()
