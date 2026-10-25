@@ -141,9 +141,12 @@ def test_fix_bare_prefix_and_i18n():
 
 
 def test_fix_filesystem_routes():
-    f = mine_bundle('[{path:"/usr/lib/x"},{path:"/etc"},{path:"/readme.md"},{path:"/home"},'
-                    '{path:"/dash"}]')
-    assert f.routes == {"/dash"}
+    f = mine_bundle('[{path:"/usr/lib/x"},{path:"/etc/passwd"},{path:"/readme.md"},'
+                    '{path:"/home/bob/.bashrc"},{path:"/home/bob/a/b.txt"},{path:"/C:/Users/x"},'
+                    '{path:"/home"},{path:"/home/settings"},{path:"/tmp"},{path:"/opt"},'
+                    '{path:"/v1.0"},{path:"/var/reports"},{path:"/dash"}]')
+    assert f.routes == {"/home", "/home/settings", "/tmp", "/opt", "/v1.0", "/var/reports", "/dash"}
+    assert mine_bundle("fetch(`${a}${b}/x`)").api_paths == {"/x"}
 
 
 def test_fix_in_scope_absolute_call_kept(api_free=None):

@@ -35,12 +35,15 @@ _GQL = re.compile(r"\b(query|mutation|subscription)\s+(\w{1,80})\s*[({]")
 _SOURCE_MAP = re.compile(r"//[#@]\s*sourceMappingURL=(\S+)")
 _ABS_URL = re.compile(r"https?://[^\s\"'`<>\\)\]}]{1,500}")
 _TEMPLATE = re.compile(r"\$\{[^}]{0,200}\}")
-_LEAD_TEMPLATE = re.compile(r"^\$\{[^}]{0,200}\}(?=/)")
+_LEAD_TEMPLATE = re.compile(r"^(?:\$\{[^}]{0,200}\})+(?=/)")
 _STATIC_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".css", ".js", ".mjs", ".map",
                ".woff", ".woff2", ".ttf", ".eot", ".webp", ".mp4", ".webm")
 _BARE_PREFIX = re.compile(r"^/(?:api|v\d+)/*$")
 _I18N_KEY = re.compile(r"^[A-Za-z_]+(?:\.[A-Za-z_]+){2,}$")
-_FS_ROUTE = re.compile(r"^/(?:usr|bin|etc|home|var|tmp|opt)(?:/|$)|\.\w{1,5}$")
+_FS_ROUTE = re.compile(
+    r"^/(?:usr|etc|bin|sbin|proc|dev)/|^/[A-Za-z]:/"
+    r"|^/home/[^/]+/(?:\.[^/]+|.*\.[A-Za-z0-9]+$)"
+    r"|\.(?:js|ts|jsx|tsx|vue|css|scss|md|json|map|html|png|jpg|svg|txt|lock|yml|yaml)$", re.I)
 _PATHLIKE = re.compile(r"^[\w\-./~%:@{}!$&'()*+,;=?#\[\]]+$")
 _SCRIPT_SRC = re.compile(r"<script\b[^>]{0,2000}?\bsrc\s*=\s*[\"']([^\"']+)[\"']", re.I)
 
