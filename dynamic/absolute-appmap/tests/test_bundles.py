@@ -124,3 +124,51 @@ def test_cli_probe_passive_mines_bundles(spa_url, make_cfg, tmp_path, capsys):
     db = sqlite3.connect(next(run.glob("*.sqlite")))
     assert db.execute("select count(*) from endpoints where path_pattern='/api/internal/flags'"
                       ).fetchone()[0] == 1
+
+
+def test_fix_template_prefix_and_static_and_open():
+    f = mine_bundle('fetch(`${API}/users`); fetch(`${BASE_URL}/api/orders/${id}`);'
+                    'window.open("/logout"); x.open("POST", "/submit");'
+                    'fetch("/img/logo.png"); fetch("/static/css/app.css"); fetch("/data/x.json")')
+    assert f.api_paths == {"/users", "/api/orders/{id}", "/submit", "/data/x.json"}
+    assert f.methods["/submit"] == {"POST"}
+
+
+def test_fix_bare_prefix_and_i18n():
+    f = mine_bundle('a="/v1/"; b="/api/auth.login.title"; c="/api/"; d="/v2/users"; '
+                    'e="/api/auth/login.title"')
+    assert f.api_paths == {"/v2/users", "/api/auth/login.title"}
+
+
+def test_fix_filesystem_routes():
+    f = mine_bundle('[{path:"/usr/lib/x"},{path:"/etc"},{path:"/readme.md"},{path:"/home"},'
+                    '{path:"/dash"}]')
+    assert f.routes == {"/dash"}
+
+
+def test_fix_in_scope_absolute_call_kept(api_free=None):
+    f = mine_bundle('axios.post("https://app.test/orders/${id}", b); fetch("https://x.io/logo.png")')
+    assert f.call_urls == {"https://app.test/orders/{id}"}
+    assert f.methods["https://app.test/orders/{id}"] == {"POST"}
+
+
+async def test_fix_probe_absolute_call_and_map_sources(api, stub_server, make_cfg, run_dir,
+                                                       tmp_path):
+    holder = {}
+    maps = json.dumps({"version": 3, "sources": ["webpack/boot.js", "src/a.js", "node_modules/x.js"],
+                       "sourcesContent": ['fetch("/api/webpackish");', 'fetch("/api/mine");',
+                                          'fetch("/api/vendor");']})
+    js = ('fetch(`${location.origin}/api/x`); axios.put(ABS + "/n"); '
+          'fetch("%s/abs/thing", {method: "PATCH"});\\n//# sourceMappingURL=a.js.map')
+    routes = {"/": lambda r: Response('<script src="/a.js"></script>', content_type="text/html"),
+              "/a.js": lambda r: Response(js % holder["url"], content_type="application/javascript"),
+              "/a.js.map": lambda r: Response(maps, content_type="application/json")}
+    srv = stub_server(routes)
+    holder["url"] = srv.url
+    cfg = make_cfg(srv.url)
+    rt, client = _client(cfg, run_dir(tmp_path, cfg))
+    await probe_bundles(client, api, cfg, rt.store, Frontier(rt.store), "anonymous")
+    eps = set(_rows(rt.store, "SELECT method, path_pattern FROM endpoints"))
+    assert ("PATCH", "/abs/thing") in eps and ("GET", "/api/mine") in eps
+    assert ("GET", "/api/webpackish") not in eps and ("GET", "/api/vendor") not in eps
+    rt.store.close()

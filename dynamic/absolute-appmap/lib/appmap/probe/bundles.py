@@ -24,8 +24,8 @@ _HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 # Every pattern is linear: bounded character classes, no nested quantifiers.
 _STRING = re.compile(r"\"([^\"\\\n]{1,300})\"|'([^'\\\n]{1,300})'|`([^`\\\n]{1,300})`")
 _CALL = re.compile(
-    r"(?:\bfetch|\baxios\.(get|post|put|patch|delete)|\baxios|\.open)\s*\(\s*"
-    r"(?:[\"'](GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)[\"']\s*,\s*)?"
+    r"(?:\bfetch\s*\(|\baxios\.(get|post|put|patch|delete)\s*\(|\baxios\s*\("
+    r"|\.open\s*\(\s*[\"'](GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)[\"']\s*,)\s*"
     r"(?:\"([^\"\\\n]{1,300})\"|'([^'\\\n]{1,300})'|`([^`\\\n]{1,300})`)", re.I)
 _METHOD_OPT = re.compile(r"method\s*:\s*[\"'`](\w{3,7})[\"'`]", re.I)
 _API_PATH = re.compile(r"^/(?:api/|v\d+/|graphql)")
@@ -35,6 +35,12 @@ _GQL = re.compile(r"\b(query|mutation|subscription)\s+(\w{1,80})\s*[({]")
 _SOURCE_MAP = re.compile(r"//[#@]\s*sourceMappingURL=(\S+)")
 _ABS_URL = re.compile(r"https?://[^\s\"'`<>\\)\]}]{1,500}")
 _TEMPLATE = re.compile(r"\$\{[^}]{0,200}\}")
+_LEAD_TEMPLATE = re.compile(r"^\$\{[^}]{0,200}\}(?=/)")
+_STATIC_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".css", ".js", ".mjs", ".map",
+               ".woff", ".woff2", ".ttf", ".eot", ".webp", ".mp4", ".webm")
+_BARE_PREFIX = re.compile(r"^/(?:api|v\d+)/*$")
+_I18N_KEY = re.compile(r"^[A-Za-z_]+(?:\.[A-Za-z_]+){2,}$")
+_FS_ROUTE = re.compile(r"^/(?:usr|bin|etc|home|var|tmp|opt)(?:/|$)|\.\w{1,5}$")
 _PATHLIKE = re.compile(r"^[\w\-./~%:@{}!$&'()*+,;=?#\[\]]+$")
 _SCRIPT_SRC = re.compile(r"<script\b[^>]{0,2000}?\bsrc\s*=\s*[\"']([^\"']+)[\"']", re.I)
 
@@ -48,6 +54,8 @@ class BundleFindings:
     source_maps: set[str] = field(default_factory=set)
     # path -> HTTP methods seen at a call site (paths without an entry are GET)
     methods: dict[str, set[str]] = field(default_factory=dict)
+    # absolute URLs passed straight to fetch/axios (their methods live in ``methods``)
+    call_urls: set[str] = field(default_factory=set)
 
     def update(self, other: "BundleFindings") -> None:
         self.api_paths |= other.api_paths
@@ -55,13 +63,14 @@ class BundleFindings:
         self.graphql_ops |= other.graphql_ops
         self.absolute_urls |= other.absolute_urls
         self.source_maps |= other.source_maps
+        self.call_urls |= other.call_urls
         for p, ms in other.methods.items():
             self.methods.setdefault(p, set()).update(ms)
 
 
 def _clean_path(raw: str, follows_plus: bool) -> str | None:
     """Normalized relative API path from a literal, or None if it is not path-like."""
-    s = _TEMPLATE.sub("{id}", raw).strip()
+    s = _TEMPLATE.sub("{id}", _LEAD_TEMPLATE.sub("", raw.strip())).strip()
     if not s or s.startswith("//") or "://" in s or not _PATHLIKE.match(s):
         return None
     if not s.startswith("/"):
@@ -69,13 +78,21 @@ def _clean_path(raw: str, follows_plus: bool) -> str | None:
     if s.endswith("/") and follows_plus and len(s) > 1:
         s += "{id}"  # "/api/items/" + id
     path = s.split("?", 1)[0].split("#", 1)[0]
-    if len(path.strip("/")) == 0 or path in ("/api", "/api/") or path.rstrip("/") == "/api":
-        return None
-    return path
+    return path if _usable_path(path) else None
+
+
+def _usable_path(path: str) -> bool:
+    """Reject bare prefixes, static assets and dotted i18n keys."""
+    if not path.strip("/") or _BARE_PREFIX.match(path) or path.lower().endswith(_STATIC_EXT):
+        return False
+    rest = re.sub(r"^/(?:api|v\d+)/", "/", path)[1:]
+    return not ("/" not in rest and _I18N_KEY.match(rest))
 
 
 def _route(raw: str) -> str | None:
     if not raw.startswith("/") or raw.startswith("//") or not _PATHLIKE.match(raw.replace(":", "")):
+        return None
+    if _FS_ROUTE.search(raw.split("?", 1)[0]):
         return None
     pat = re.sub(r"/:(\w+)\??", "/{\\1}", raw.split("?", 1)[0])
     return pat if pat == "/" else pat.rstrip("/")
@@ -100,7 +117,7 @@ def mine_bundle(js: str) -> BundleFindings:
     for m in _CALL.finditer(js):
         verb, open_method, *lits = m.groups()
         raw = next((g for g in lits if g is not None), None)
-        if raw is None or raw.lower().startswith(("http://", "https://")):
+        if raw is None:
             continue
         method = verb or open_method
         if not method and m.group(0).lstrip().startswith("fetch"):
@@ -108,7 +125,12 @@ def mine_bundle(js: str) -> BundleFindings:
             method = opt.group(1) if opt else None
         if method and method.upper() not in _HTTP_METHODS:
             method = None
-        if "/" in raw:
+        if raw.lower().startswith(("http://", "https://")):
+            url = urldefrag(_TEMPLATE.sub("{id}", raw))[0]
+            if _usable_path(urlsplit(url).path or "/"):
+                out.call_urls.add(url)
+                out.methods.setdefault(url, set()).add((method or "GET").upper())
+        elif "/" in raw:
             add_api(raw, m.end(), method)
     for rx in (_ROUTE_OBJ, _ROUTE_JSX):
         for m in rx.finditer(js):
@@ -223,6 +245,14 @@ async def probe_bundles(client: DirectClient, api, cfg, store: Store, frontier: 
                     eid = store.upsert_endpoint(method, host, pattern, "rest")
                     store.upsert_source("endpoint", eid, source)
                     counts["endpoints"] += 1
+        for url in sorted(found.call_urls):
+            parts = urlsplit(url)
+            if scope.allows(url):
+                pattern = normalize_path(parts.path or "/", known)
+                for method in sorted(found.methods.get(url) or {"GET"}):
+                    eid = store.upsert_endpoint(method, parts.netloc.lower(), pattern, "rest")
+                    store.upsert_source("endpoint", eid, source)
+                    counts["endpoints"] += 1
         for url in found.absolute_urls:
             url = urldefrag(url)[0]
             parts = urlsplit(url)
@@ -286,7 +316,11 @@ async def probe_bundles(client: DirectClient, api, cfg, store: Store, frontier: 
                 continue
             contents = doc.get("sourcesContent") if isinstance(doc, dict) else None
             mapped = BundleFindings()
-            for src in contents if isinstance(contents, list) else []:
+            names = doc.get("sources") if isinstance(doc.get("sources"), list) else []
+            for i, src in enumerate(contents if isinstance(contents, list) else []):
+                name = str(names[i]) if i < len(names) else ""
+                if "node_modules/" in name or "webpack/" in name:
+                    continue  # third-party / bundler runtime sources
                 if isinstance(src, str):
                     mapped.update(mine_bundle(src))
             record(mapped, "source_map", map_url)
