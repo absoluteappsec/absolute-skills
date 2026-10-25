@@ -46,13 +46,32 @@ from .throttle import CircuitBreaker, CircuitOpen, RateLimiter
 
 log = logging.getLogger("appmap.crawl")
 
-CrawlStatus = Literal["done", "in_progress", "paused_circuit", "limit_reached"]
+CrawlStatus = Literal["done", "in_progress", "paused_circuit", "limit_reached",
+                      "not_implemented"]
 # url items first (cheap, map pages), then clicks, then form submissions
 PRIORITY = {"url": 2, "click": 1, "submit": 0}
 NAV_TIMEOUT_MS = 15000
 ACTION_TIMEOUT_MS = 5000
 _NTH = re.compile(r":nth-of-type\(\d+\)")
 _SKIP_CLICK_TAGS = {"select", "textarea", "option", "label"}
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+# Every <form>: xpath (same algorithm as LOCATOR_JS), effective method, action, confirm hint.
+_FORMS_JS = """() => [...document.forms].map(f => {
+  const parts = [];
+  for (let n = f; n && n.nodeType === 1; n = n.parentElement) {
+    const sibs = n.parentElement ? [...n.parentElement.children].filter(c => c.tagName === n.tagName) : [n];
+    parts.unshift(n.tagName.toLowerCase() + '[' + (sibs.indexOf(n) + 1) + ']');
+  }
+  const o = f.querySelector('input[type=hidden][name=_method]');
+  let action;
+  try { action = new URL(f.getAttribute('action') ?? location.href, document.baseURI).href; }
+  catch (e) { action = location.href; }
+  return {xpath: '/' + parts.join('/'),
+          method: ((o && o.value) || f.getAttribute('method') || 'GET').toUpperCase(), action,
+          confirm: /confirm\\s*\\(/.test(f.getAttribute('onsubmit') || '')
+            || f.hasAttribute('data-confirm') || f.hasAttribute('data-turbo-confirm')};
+})"""
 
 # Serialized DOM with password input values removed (attribute values only exist in markup).
 _DOM_JS = """() => {
@@ -120,19 +139,23 @@ class Crawler:
         self.known = [r["pattern"] for r in store.conn.execute(
             "SELECT pattern FROM routes WHERE kind='spa_route'")]
         self._url_patterns: dict[str, Counter] = {}
-        # anchor -> (from_state, label, locators), to record the link transition on visit
-        self._links: dict[tuple[str, str], tuple[str, str, list[dict]]] = {}
         self._installed: set = set()
         self._confirm_seen = False
-        self._accept_confirms = False  # set while executing approved actions (Task 17)
+        self._approved_mode = False  # set while executing approved actions (Task 17)
+        # network guard state while an item is processed: label/context of the triggering
+        # action and the held requests it aborted (flag, method, url)
+        self._guard: dict | None = None
 
     # -- driver --------------------------------------------------------------
     async def run(self, roles: list[str], *, budget_minutes: float,
                   approved_only: bool = False) -> CrawlStats:
         if approved_only:
             # Executing approved actions is implemented by the approvals task (Task 17).
-            log.info("approved-only crawl: no approved-action executor yet; nothing to do")
-            return self.stats("done")
+            msg = "--approved-only is not implemented yet; no approved actions were executed"
+            log.warning(msg)
+            stats = self.stats("not_implemented")
+            stats.warnings.append(msg)
+            return stats
         start = time.monotonic()
         prior = float(self.store.get_meta("crawl_elapsed_s") or 0)
         budget_s = budget_minutes * 60
@@ -217,13 +240,39 @@ class Crawler:
             await self._on_dialog(dialog, role, page)
 
         page.on("dialog", on_dialog)
+        # Page routes run before the recorder's context route.
+        await page.route("**/*", lambda route, request: self._guard_route(route, request, role))
         return page
+
+    async def _guard_route(self, route, request, role: str) -> None:
+        """Network-level destructive guard (ruling R17): a non-GET request issued while an
+        item is processed is classified as a ``request``; held ones are aborted."""
+        g = self._guard
+        if g is None or self._approved_mode or request.method in _SAFE_METHODS:
+            await route.fallback()
+            return
+        flag = classify(ActionDescriptor("request", request.method, request.url, g["label"],
+                                         g["context"], False, role, "ui"), self.cfg.profile)
+        if not flag.held:
+            await route.fallback()
+            return
+        url = self.redactor.url(request.url)
+        g["hits"].append((flag, request.method, url))
+        self.events.emit("error", role=role, url=url,
+                         message=f"held {request.method} request aborted ({flag.category}); "
+                                 "needs approval")
+        await route.abort("blockedbyclient")
+
+    def _arm_guard(self, label: str = "", context: str = "") -> list:
+        """Attribute subsequent requests to a new triggering action; returns its hit list."""
+        self._guard = {"label": label, "context": context, "hits": []}
+        return self._guard["hits"]
 
     async def _on_dialog(self, dialog: Dialog, role: str, page: Page) -> None:
         self.events.emit("dialog", role=role, dialog_type=dialog.type,
                          message=(dialog.message or "")[:500], url=self.redactor.url(page.url))
         try:
-            if dialog.type == "confirm" and not self._accept_confirms:
+            if dialog.type == "confirm" and not self._approved_mode:
                 self._confirm_seen = True
                 await dialog.dismiss()
             else:  # alert, prompt, beforeunload: record and accept
@@ -234,7 +283,15 @@ class Crawler:
     # -- item processing -----------------------------------------------------
     async def _process(self, sess: RoleSession, page: Page, item: FrontierItem) -> str:
         role = sess.role.name
+        try:
+            return await self._process_guarded(sess, page, item)
+        finally:
+            self._guard = None
+
+    async def _process_guarded(self, sess: RoleSession, page: Page, item: FrontierItem) -> str:
+        role = sess.role.name
         for attempt in (1, 2):
+            self._arm_guard()
             try:
                 if item.kind == "url":
                     return await self._do_url(sess, page, item)
@@ -281,12 +338,12 @@ class Crawler:
         await self._goto(page, url)
         await self._check_lost(sess, page)
         st = await self._record_state(page, role)
-        link = self._links.pop((role, url), None)
-        if link:
-            await self.recorder.drain()
-            from_state, label, locs = link
+        await self.recorder.drain()
+        ids = self._ids_since(mark, role)
+        for link_id, from_state, label, locs in self.frontier.mark_visited(role, url, st.id):
             self.store.add_transition(from_state, st.id, role, "navigate", label,
-                                      self._locset(locs), ev.id, self._ids_since(mark, role))
+                                      self._locset(locs), ev.id, ids)
+            self.frontier.resolve_link(link_id, st.id)
         await self._expand(page, role, st, [{"type": "goto", "url": url}], item.depth)
         return "done"
 
@@ -299,13 +356,18 @@ class Crawler:
         if flag.held:  # never restore toward an action that will not be performed
             self._enqueue(role, None, self._step_label(step), flag, path, self._predicted(step))
             return "queued_approval"
+        restore_hits = self._arm_guard("restore")
         await self._replay(page, restore)
+        if restore_hits:
+            raise _Fail("restoring the action path issued a request that needs approval; "
+                        "aborted it")
         await self._check_lost(sess, page)
         src = await self._record_state(page, role, visit=False)
         before = canon_url(page.url)
         self._confirm_seen = False
         mark = self._exchange_mark()
         result = None
+        hits = self._arm_guard(self._step_label(step), step.get("context", ""))
         if step["type"] == "click":
             loc = await self._resolve(page, step["locators"])
             ev = self.events.emit("click", role=role, label=step.get("label", ""),
@@ -336,12 +398,22 @@ class Crawler:
             raise _Fail(f"unknown action step type {step.get('type')!r}")
         await self.recorder.drain()
         await self._close_popups(page)
+        if hits:  # the action fired a destructive request: aborted, hold the action
+            flag, method, url = hits[0]
+            self._enqueue(role, src.id, label, flag, path, {"method": method, "url": url})
+            return "queued_approval"
         if self._confirm_seen:
             confirm = Flag(True, "delete", ["action opened a confirm() dialog (dismissed)"])
             self._enqueue(role, src.id, label, confirm, path, self._predicted(step))
             return "queued_approval"
         ids = self._ids_since(mark, role)
+        mutating = self._has_write(ids)
+        if mutating and step["type"] == "click":
+            # Re-clicking it to restore children would repeat the write: mark it.
+            step["mutating"] = True
+            self.frontier.set_action_path(item.id, path)
         await self._check_lost(sess, page)
+        self._arm_guard("expand")
         dst = await self._record_state(page, role)
         self.store.add_transition(src.id, dst.id, role, step["type"], label,
                                   self._locset(locs), ev.id, ids)
@@ -355,10 +427,18 @@ class Crawler:
             if self.frontier.push(role, "url", url=safe, depth=item.depth,
                                   priority=PRIORITY["url"], source="ui"):
                 self.frontier.mark(self.frontier.id_of(role, "url", url=safe), "done")
-            await self._expand(page, role, dst, [{"type": "goto", "url": safe}], item.depth)
-        elif step["type"] == "click":
+            entry = [{"type": "goto", "url": safe}]
+            fully = dst.new and not self._saturated(role, dst.pattern)
+            await self._expand(page, role, dst, entry, item.depth)
+            if result is not None and result.success and not fully \
+                    and self._is_resource_url(after):
+                # The crawler just created this record: queue its destructive controls even
+                # though pages like it were seen, so marker-scoped approvals can act on it.
+                await self._push_controls(page, role, dst, entry, item.depth + 1, held_only=True)
+        elif step["type"] == "click" and not mutating:
             await self._expand(page, role, dst, path, item.depth)
-        # a submit that stayed on its URL is not expanded: restoring would resubmit
+        # A submit or write-issuing click that stayed on its URL is not expanded:
+        # restoring its children would repeat the write.
         return "done"
 
     # -- restore -------------------------------------------------------------
@@ -380,6 +460,8 @@ class Crawler:
             if step["type"] == "goto":
                 await self._goto(page, step["url"])
             elif step["type"] == "click":
+                if step.get("mutating"):
+                    raise _Fail("cannot replay a click that issues writes while restoring state")
                 loc = await self._resolve(page, step["locators"])
                 await loc.click(timeout=ACTION_TIMEOUT_MS)
                 await asyncio.sleep(0.05)
@@ -493,12 +575,28 @@ class Crawler:
             self._push_link(role, st, self._safe_url(target), c, depth + 1)
         if not st.new:
             return  # controls and forms of a known state were queued on its first visit
+        await self._push_controls(page, role, st, parent, depth + 1, others=others)
+
+    async def _push_controls(self, page: Page, role: str, st: _State, parent: list[dict],
+                             depth: int, *, others: list[Clickable] | None = None,
+                             held_only: bool = False) -> None:
+        """Queue forms and non-anchor clickables of the current page as child actions.
+
+        ``held_only`` queues just the ones the classifier holds (for approval)."""
+        if others is None:
+            others = [c for c in await enumerate_clickables(page)
+                      if not c.href or c.href.strip().startswith("#")
+                      or urlsplit(urljoin(page.url, c.href)).scheme not in ("http", "https")]
         forms = await discover_forms(page)
+        form_meta = await page.evaluate(_FORMS_JS)
         excluded = {x for f in forms
                     for x in [_xpath(f.submit_locators)] + [_xpath(fl.locators) for fl in f.fields]
                     if x}
         for f in forms:
-            self._push_form(role, st, parent, f, depth + 1)
+            if held_only and not classify(self._form_descriptor(f, role, st.title),
+                                          self.cfg.profile).held:
+                continue
+            self._push_form(role, st, parent, f, depth)
         groups: Counter = Counter()
         for c in others:
             xp = _xpath(c.locators)
@@ -513,7 +611,14 @@ class Crawler:
             step = {"type": "click", "locators": self._safe_locs(c.locators), "label": c.label}
             if href:
                 step["href"] = self._safe_url(href)
-            self._push_action(role, st, parent + [step], depth + 1, PRIORITY["click"])
+            owner = next((m for m in form_meta if xp and xp.startswith(m["xpath"] + "/")), None)
+            if owner:  # a secondary button of a form acts with that form's request
+                step.update(method=owner["method"], action=self._safe_url(owner["action"]),
+                            has_confirm=owner["confirm"], context=st.title)
+            if held_only and not classify(self._step_descriptor(step, role),
+                                          self.cfg.profile).held:
+                continue
+            self._push_action(role, st, parent + [step], depth, PRIORITY["click"])
 
     def _pattern_counts(self, role: str) -> Counter:
         if role not in self._url_patterns:
@@ -529,24 +634,33 @@ class Crawler:
         return p.netloc.lower() + normalize_path(p.path or "/", self.known, marker=self.gen.marker)
 
     def _push_link(self, role: str, st: _State, target: str, c: Clickable, depth: int) -> None:
-        if self.frontier.id_of(role, "url", url=target) is not None:
+        item_id = self.frontier.id_of(role, "url", url=target)
+        if item_id is None:
+            counts = self._pattern_counts(role)
+            pattern = self._url_pattern(target)
+            if counts[pattern] >= self.cap:  # pagination / long lists: sample the pattern
+                return
+            flag = classify(ActionDescriptor("click", "GET", target, c.label, "", False, role,
+                                             "ui"), self.cfg.profile)
+            if not self.frontier.push(role, "url", url=target, depth=depth,
+                                      priority=PRIORITY["url"], source="ui"):
+                return
+            counts[pattern] += 1
+            if flag.held:
+                self.frontier.mark(self.frontier.id_of(role, "url", url=target), "queued_approval")
+                self._enqueue(role, st.id, c.label or target, flag,
+                              [{"type": "goto", "url": target}], {"method": "GET", "url": target})
+                return
+        elif self.frontier.status_of(item_id) == "queued_approval":
             return
-        counts = self._pattern_counts(role)
-        pattern = self._url_pattern(target)
-        if counts[pattern] >= self.cap:  # pagination / long lists: sample the pattern
-            return
-        flag = classify(ActionDescriptor("click", "GET", target, c.label, "", False, role, "ui"),
-                        self.cfg.profile)
-        if not self.frontier.push(role, "url", url=target, depth=depth, priority=PRIORITY["url"],
-                                  source="ui"):
-            return
-        counts[pattern] += 1
-        if flag.held:
-            self.frontier.mark(self.frontier.id_of(role, "url", url=target), "queued_approval")
-            self._enqueue(role, st.id, c.label or target, flag, [{"type": "goto", "url": target}],
-                          {"method": "GET", "url": target})
-        else:
-            self._links[(role, target)] = (st.id, c.label, self._safe_locs(c.locators))
+        # Persist link provenance; if the target was already visited, record the edge now.
+        locs = self._safe_locs(c.locators)
+        link_id = self.frontier.add_link(role, target, st.id, c.label, locs)
+        to_state = self.frontier.visited_state(role, target) if link_id else None
+        if to_state:
+            self.store.add_transition(st.id, to_state, role, "navigate", c.label,
+                                      self._locset(locs), None, [])
+            self.frontier.resolve_link(link_id, to_state)
 
     def _push_form(self, role: str, st: _State, parent: list[dict], form: FormInfo,
                    depth: int) -> None:
@@ -578,8 +692,9 @@ class Crawler:
             return ActionDescriptor("submit", step.get("method"), step.get("action"),
                                     step.get("form_label", ""), step.get("context", ""),
                                     bool(step.get("has_confirm")), role, "ui")
-        return ActionDescriptor("click", None, step.get("href"), step.get("label", ""), "",
-                                False, role, "ui")
+        return ActionDescriptor("click", step.get("method"), step.get("href") or step.get("action"),
+                                step.get("label", ""), step.get("context", ""),
+                                bool(step.get("has_confirm")), role, "ui")
 
     @staticmethod
     def _form_descriptor(form: FormInfo, role: str, context: str) -> ActionDescriptor:
@@ -676,6 +791,19 @@ class Crawler:
             merged = old + [self.redactor.text(m) for m in msgs if m not in old]
             conn.execute("UPDATE fields SET validation_messages=? WHERE id=?",
                          (json.dumps(merged), row["id"]))
+
+    def _has_write(self, ids: list[int]) -> bool:
+        if not ids:
+            return False
+        marks = ",".join("?" * len(ids))
+        return self.store.conn.execute(
+            f"SELECT 1 FROM exchanges WHERE id IN ({marks}) AND upper(method) NOT IN "
+            f"('GET','HEAD','OPTIONS') LIMIT 1", ids).fetchone() is not None
+
+    def _is_resource_url(self, url: str) -> bool:
+        """A URL naming one record: carries the run marker or an id/uuid/hash segment."""
+        path = urlsplit(url).path or "/"
+        return self.gen.marker in url or normalize_path(path, marker=self.gen.marker) != path
 
     def _exchange_mark(self) -> int:
         return int(self.store.conn.execute("SELECT coalesce(max(id),0) FROM exchanges").fetchone()[0])
@@ -779,7 +907,7 @@ async def _crawl_with(cfg: RunConfig, rd: RunDir, names: list[str] | None, budge
         crawler = Crawler(cfg, rd, rt.store, rt.events, rt.gate, rt.queue, rt.recorder,
                           sessions, make_datagen(cfg, rd))
         stats = await crawler.run(crawl_roles, budget_minutes=budget, approved_only=approved_only)
-        stats.warnings = warnings
+        stats.warnings = warnings + stats.warnings
         return stats
     finally:
         await rt.recorder.drain()

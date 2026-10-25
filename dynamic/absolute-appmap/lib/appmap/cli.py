@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import json
 import logging
+import shlex
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -13,6 +14,11 @@ COMMANDS = ["init", "auth", "crawl", "probe", "approvals", "build", "status", "q
 IMPLEMENTED = {"init", "auth", "crawl"}
 
 log = logging.getLogger("appmap.cli")
+
+
+def _q(path) -> str:
+    """Shell-quote a path for a copy-pasteable ``next`` command."""
+    return shlex.quote(str(path))
 
 
 def emit_status(
@@ -136,8 +142,15 @@ def cmd_init(args) -> int:
         _detach_log(handler)
     print(rd.root)
     emit_status("init", ok=True, status="initialized",
-                counts={"roles": len(cfg.roles)}, next=f"appmap auth --run {rd.root}")
+                counts={"roles": len(cfg.roles)}, next=f"appmap auth --run {_q(rd.root)}")
     return 0
+
+
+def manual_login_roles(roles, *, explicit: bool):
+    """``--manual-login``: an explicitly named role is converted whatever its type;
+    otherwise only interactive roles (form/manual), never none/storage_state."""
+    return [replace(r, login=replace(r.login, type="manual"))
+            if explicit or r.login.type in ("form", "manual") else r for r in roles]
 
 
 async def _auth(cfg, rd, roles, headed: bool) -> dict[str, bool]:
@@ -179,7 +192,7 @@ def cmd_auth(args) -> int:
         emit_status("auth", ok=False, status="error", errors=[str(e)])
         return 1
     if args.manual_login:
-        roles = [replace(r, login=replace(r.login, type="manual")) for r in roles]
+        roles = manual_login_roles(roles, explicit=bool(args.role))
     headed = any(r.login.type == "manual" for r in roles)
     handler = _attach_log(rd, make_redactor(cfg))
     try:
@@ -196,7 +209,7 @@ def cmd_auth(args) -> int:
     emit_status("auth", ok=ok, status="authenticated" if ok else "auth_failed",
                 counts={"roles": len(results), "roles_ok": len(results) - len(failed)},
                 errors=[f"role {n}: login failed" for n in failed],
-                next=f"appmap crawl --run {rd.root}" if ok else None)
+                next=f"appmap crawl --run {_q(rd.root)}" if ok else None)
     return 0 if ok else 1
 
 
@@ -221,16 +234,18 @@ def cmd_crawl(args) -> int:
     finally:
         _detach_log(handler)
     errors = list(stats.warnings)
-    again = f"appmap crawl --run {rd.root}" + (f" --role {args.role}" if args.role else "")
+    run = _q(rd.root)
+    again = f"appmap crawl --run {run}" + (f" --role {_q(args.role)}" if args.role else "")
     nxt = {
         "in_progress": again,
-        "done": (f"appmap approvals --run {rd.root} write" if stats.queued_approvals
-                 else f"appmap probe --run {rd.root} --phase active"),
-        "limit_reached": f"appmap build --run {rd.root}",
+        "done": (f"appmap approvals --run {run} write" if stats.queued_approvals
+                 else f"appmap probe --run {run} --phase active"),
+        "limit_reached": f"appmap build --run {run}",
         "paused_circuit": None,
+        "not_implemented": None,
     }[stats.status]
-    ok = stats.status != "paused_circuit"
-    if not ok:
+    ok = stats.status in ("done", "in_progress", "limit_reached")
+    if stats.status == "paused_circuit":
         errors.append("circuit breaker tripped (too many 429/5xx responses); "
                       "check the target before resuming")
     emit_status("crawl", ok=ok, status=stats.status,

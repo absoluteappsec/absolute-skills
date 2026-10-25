@@ -73,6 +73,45 @@ class Frontier:
             raise ValueError(f"unknown frontier status: {status}")
         self.store.conn.execute("UPDATE frontier SET status=? WHERE id=?", (status, item_id))
 
+    # -- link provenance (frontier_links) -----------------------------------------
+    def add_link(self, role: str, url: str, from_state: str, label: str,
+                 locators: list[dict]) -> int | None:
+        """Remember that ``from_state`` links to ``url``; returns the row id if new."""
+        cur = self.store.conn.execute(
+            "INSERT OR IGNORE INTO frontier_links(role,url,from_state,label,locators) "
+            "VALUES(?,?,?,?,?)", (role, url, from_state, label or "", json.dumps(locators)))
+        return int(cur.lastrowid) if cur.rowcount == 1 else None
+
+    def visited_state(self, role: str, url: str) -> str | None:
+        row = self.store.conn.execute(
+            "SELECT to_state FROM frontier_links WHERE role=? AND url=? AND from_state=''",
+            (role, url)).fetchone()
+        return None if row is None else row[0]
+
+    def mark_visited(self, role: str, url: str, state: str) -> list[tuple[int, str, str, list]]:
+        """Record where ``url`` landed; return pending links (id, from_state, label, locators)."""
+        self.store.conn.execute(
+            "INSERT INTO frontier_links(role,url,from_state,label,to_state) VALUES(?,?,'','',?) "
+            "ON CONFLICT(role,url,from_state,label) DO UPDATE SET to_state=excluded.to_state",
+            (role, url, state))
+        rows = self.store.conn.execute(
+            "SELECT id, from_state, label, locators FROM frontier_links "
+            "WHERE role=? AND url=? AND from_state!='' AND to_state IS NULL", (role, url))
+        return [(r[0], r[1], r[2], json.loads(r[3] or "[]")) for r in rows]
+
+    def resolve_link(self, link_id: int, to_state: str) -> None:
+        self.store.conn.execute("UPDATE frontier_links SET to_state=? WHERE id=?",
+                                (to_state, link_id))
+
+    def status_of(self, item_id: int) -> str | None:
+        row = self.store.conn.execute("SELECT status FROM frontier WHERE id=?", (item_id,)).fetchone()
+        return None if row is None else row[0]
+
+    def set_action_path(self, item_id: int, action_path: list[dict]) -> None:
+        """Annotate an item's path (e.g. ``mutating`` steps); identity is not re-checked."""
+        self.store.conn.execute("UPDATE OR IGNORE frontier SET action_path=? WHERE id=?",
+                                (_path_json(action_path), item_id))
+
     def pending_count(self, role: str | None = None) -> int:
         if role is None:
             sql, args = "SELECT count(*) FROM frontier WHERE status='pending'", ()

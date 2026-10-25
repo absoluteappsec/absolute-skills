@@ -1,8 +1,11 @@
 import asyncio
 import json
+import re
+import shlex
 import urllib.request
 
 import pytest
+import werkzeug
 
 from appmap.cli import main
 from appmap.crawl import CrawlStats, run_crawl
@@ -69,6 +72,18 @@ async def test_ssr_crawl_admin_and_alice(browser, ssr_url, make_cfg, run_dir, tm
     assert rd.approvals_path.exists()
     # out-of-scope redirect target recorded as an external link, never requested
     assert q1(rd, "select count(*) from external_links where url like 'https://external.invalid%'") >= 1
+    # crawler-created projects (ids > 25) get their own held delete, for marker-scoped approval
+    created = set()
+    for a in q(rd, "select action_path from approvals where category='delete'"):
+        for step in json.loads(a["action_path"]):
+            m = re.search(r"/projects/(\d+)$", step.get("url", ""))
+            if m and int(m.group(1)) > 25:
+                created.add(int(m.group(1)))
+    assert created
+    # link provenance: a page reached from several pages has an edge from each of them
+    multi = q(rd, "select to_state, count(distinct from_state) n from transitions "
+                  "where action_type='navigate' group by to_state having n >= 2")
+    assert multi
 
 
 async def test_spa_crawl_states_and_list_sampling(browser, spa_url, make_cfg, run_dir, tmp_path):
@@ -112,6 +127,11 @@ async def test_budget_checkpoint_and_resume(browser, ssr_url, make_cfg, run_dir,
     # resumed, not restarted: the seed page was visited once across both runs
     assert q1(rd, "select count(*) from frontier where role='admin' and url=?", ssr_url + "/") == 1
     assert s2.states >= s1.states
+    # links discovered before the checkpoint still produced their edges after resume
+    assert q1(rd, "select count(*) from frontier_links l where l.from_state != '' "
+                  "and l.to_state is null and exists (select 1 from frontier_links v "
+                  "where v.role=l.role and v.url=l.url and v.from_state='')") == 0
+    assert q1(rd, "select count(*) from transitions where action_type='navigate'") >= 3
 
 
 async def test_session_expiry_mid_crawl(browser, ssr_url, make_cfg, run_dir, tmp_path):
@@ -166,6 +186,101 @@ async def test_confirm_dialog_dismissed_and_queued(browser, stub_server, make_cf
     assert {"confirm", "alert"} <= dialogs
 
 
+def _anon_cfg(make_cfg, url, **kw):
+    return make_cfg(url, roles=[{"name": "anonymous", "login": {"type": "none"}}], **kw)
+
+
+async def test_js_delete_request_guarded(browser, stub_server, make_cfg, run_dir, tmp_path):
+    """R17: a click whose JS issues DELETE (icon button, no telling label) is aborted and held;
+    a secondary button of a confirm-protected form is classified with that form."""
+    html = ("<html><head><title>Items</title></head><body><ul><li>Item 7 "
+            "<button onclick=\"fetch('/api/items/7',{method:'DELETE'})\">&#x2715;</button></li></ul>"
+            "<form method='post' action='/items/7/x' onsubmit=\"return confirm('Sure?')\">"
+            "<button type='submit'>Ok</button><button type='submit' name='alt'>Go</button>"
+            "</form></body></html>")
+    srv = stub_server({"/": lambda r: werkzeug.Response(html, mimetype="text/html"),
+                       "/api/items/7": lambda r: "ok", "/items/7/x": lambda r: "ok"})
+    cfg = _anon_cfg(make_cfg, srv.url, limits=FAST)
+    rd = run_dir(tmp_path, cfg)
+    stats = await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=2, browser=browser)
+    assert stats.status == "done"
+    assert ("DELETE", "/api/items/7") not in srv.requests
+    assert ("POST", "/items/7/x") not in srv.requests
+    held = q(rd, "select * from approvals where label='\u2715'")
+    assert held and held[0]["category"] == "delete"
+    pred = json.loads(held[0]["predicted_request"])
+    assert pred["method"] == "DELETE" and pred["url"].endswith("/api/items/7")
+    go = q(rd, "select * from approvals where label='Go'")
+    assert go and go[0]["category"] == "delete"
+    assert q1(rd, "select count(*) from frontier where status='queued_approval'") >= 2
+
+
+async def test_write_click_not_replayed_for_children(browser, stub_server, make_cfg, run_dir,
+                                                     tmp_path):
+    """A click that POSTs is never re-clicked as a restore prefix for its children."""
+    html = ("<html><head><title>Fav</title></head><body>"
+            "<button onclick=\"fetch('/api/star',{method:'POST'});"
+            "var d=document.createElement('section');d.innerHTML="
+            "'<button onclick=\\'this.textContent=1\\'>One</button>"
+            "<button onclick=\\'this.textContent=2\\'>Two</button>';"
+            "document.body.appendChild(d)\">Star</button></body></html>")
+    srv = stub_server({"/": lambda r: werkzeug.Response(html, mimetype="text/html"),
+                       "/api/star": lambda r: "ok"})
+    cfg = _anon_cfg(make_cfg, srv.url, limits=FAST)
+    rd = run_dir(tmp_path, cfg)
+    assert (await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=2,
+                            browser=browser)).status == "done"
+    assert sum(1 for m, p in srv.requests if m == "POST" and p == "/api/star") == 1
+    star = q(rd, "select action_path from frontier where action_path like '%Star%'")
+    assert json.loads(star[0]["action_path"])[-1]["mutating"] is True
+
+
+async def test_production_js_post_click_held(browser, stub_server, make_cfg, run_dir, tmp_path):
+    html = ("<html><head><title>Notes</title></head><body>"
+            "<button onclick=\"fetch('/api/notes',{method:'POST'})\">Add</button></body></html>")
+    srv = stub_server({"/": lambda r: werkzeug.Response(html, mimetype="text/html"),
+                       "/api/notes": lambda r: "ok"})
+    cfg = _anon_cfg(make_cfg, srv.url, profile="production",
+                    limits={"quiet_window_ms": 150, "jitter_seconds": 0.5})
+    rd = run_dir(tmp_path, cfg)
+    assert (await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=2,
+                            browser=browser)).status == "done"
+    assert ("POST", "/api/notes") not in srv.requests
+    assert q(rd, "select category from approvals where label='Add'")[0]["category"] == "data_create"
+
+
+async def test_approved_only_is_not_reported_as_done(browser, ssr_url, make_cfg, run_dir,
+                                                     tmp_path):
+    cfg = make_cfg(ssr_url, limits=FAST)
+    rd = run_dir(tmp_path, cfg)
+    stats = await run_crawl(cfg, rd, roles=["anonymous"], budget_minutes=1, approved_only=True,
+                            browser=browser)
+    assert stats.status == "not_implemented" and stats.warnings
+
+
+def test_manual_login_roles_only_converts_interactive(make_cfg, ssr_url):
+    from appmap.cli import manual_login_roles
+    cfg = make_cfg(ssr_url, roles=[
+        {"name": "a", "login": {"type": "form", "url": ssr_url + "/login",
+                                "username_env": "U", "password_env": "P"}},
+        {"name": "b", "login": {"type": "none"}},
+        {"name": "c", "login": {"type": "storage_state", "storage_state_path": "s.json"}}])
+    out = {r.name: r.login.type for r in manual_login_roles(cfg.roles, explicit=False)}
+    assert out == {"a": "manual", "b": "none", "c": "storage_state"}
+    one = manual_login_roles([cfg.roles[2]], explicit=True)
+    assert one[0].login.type == "manual"
+
+
+def test_cli_next_quotes_paths_with_spaces(ssr_url, make_cfg, tmp_path, capsys):
+    cfg = make_cfg(ssr_url)
+    out = tmp_path / "my runs"
+    assert main(["init", "--config", str(cfg.source_path), "--out", str(out)]) == 0
+    st = _status(capsys)
+    run = next(out.iterdir())
+    assert st["next"] == f"appmap auth --run {shlex.quote(str(run))}"
+    assert shlex.split(st["next"])[-1] == str(run)
+
+
 def _status(capsys) -> dict:
     last = capsys.readouterr().out.strip().splitlines()[-1]
     assert last.startswith("APPMAP_STATUS ")
@@ -182,7 +297,7 @@ def test_cli_init_auth_crawl(ssr_url, make_cfg, tmp_path, capsys):
     st = _status(capsys)
     assert st["ok"] and st["command"] == "init"
     run = next(out.iterdir())
-    assert st["next"] == f"appmap auth --run {run}"
+    assert st["next"] == f"appmap auth --run {shlex.quote(str(run))}"
     meta = json.loads((run / "run.json").read_text())
     assert meta["config_path"] == str(cfg.source_path.resolve())
 
@@ -193,7 +308,7 @@ def test_cli_init_auth_crawl(ssr_url, make_cfg, tmp_path, capsys):
     assert main(["crawl", "--run", str(run), "--budget-minutes", "0.02"]) == 0
     st = _status(capsys)
     assert st["ok"] and st["status"] == "in_progress"
-    assert st["next"] == f"appmap crawl --run {run}"
+    assert st["next"] == f"appmap crawl --run {shlex.quote(str(run))}"
     assert main(["crawl", "--run", str(run), "--role", "alice"]) == 0
     st = _status(capsys)
     assert st["ok"] and st["status"] == "done" and st["counts"]["states"] > 0
@@ -201,6 +316,17 @@ def test_cli_init_auth_crawl(ssr_url, make_cfg, tmp_path, capsys):
     log = (run / "crawl.log").read_text()
     assert "crawl" in log and "alice-pw-Fx2" not in log
     assert json.loads((run / "run.json").read_text())["status"] == "done"
+    # R18: one HAR per role accumulates every invocation (auth's login traffic survives)
+    har = json.loads((run / "traffic" / "alice.har").read_text())
+    reqs = [(e["request"]["method"], e["request"]["url"]) for e in har["log"]["entries"]]
+    assert any(m == "POST" and u.endswith("/login") for m, u in reqs)
+    assert any(m == "GET" and u.endswith("/account/password") for m, u in reqs)
+    assert not list((run / "traffic").glob("*.part.har"))
+    assert "alice-pw-Fx2" not in (run / "traffic" / "alice.har").read_text()
+    # --approved-only must not claim approvals ran
+    assert main(["crawl", "--run", str(run), "--approved-only"]) == 1
+    st = _status(capsys)
+    assert not st["ok"] and st["status"] == "not_implemented" and st["errors"]
 
 
 def test_cli_parser_flags():

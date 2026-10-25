@@ -105,3 +105,12 @@ CREATE TABLE IF NOT EXISTS frontier (
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','done','skipped','queued_approval','failed')),
   source TEXT,
   UNIQUE(role, kind, url, action_path));
+
+-- Crawl-internal (like frontier): which anchors point at a frontier URL, so the
+-- navigate transition can be recorded once the URL's state is known. A row with
+-- from_state '' marks the URL as visited and holds the state it landed on.
+CREATE TABLE IF NOT EXISTS frontier_links (
+  id INTEGER PRIMARY KEY, role TEXT NOT NULL, url TEXT NOT NULL,
+  from_state TEXT NOT NULL DEFAULT '', label TEXT NOT NULL DEFAULT '',
+  locators TEXT, to_state TEXT,
+  UNIQUE(role, url, from_state, label));

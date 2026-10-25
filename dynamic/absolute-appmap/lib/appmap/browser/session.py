@@ -15,7 +15,7 @@ from .. import paths
 from ..config import Role, RunConfig
 from ..events import EventLog
 from ..rundir import RunDir
-from .recorder import TrafficRecorder
+from .recorder import TrafficRecorder, har_part_path
 
 USERNAME_SELECTOR = "input[type=email], input[name*=user i], input[name*=email i]"
 PASSWORD_SELECTOR = "input[type=password]"
@@ -80,8 +80,9 @@ async def open_role_session(browser: Browser, cfg: RunConfig, rd: RunDir, role: 
         kwargs["storage_state"] = {"cookies": state.get("cookies", []),
                                    "origins": state.get("origins", [])}
     Path(rd.traffic_dir).mkdir(parents=True, exist_ok=True)
+    recorder.finalize_har(role.name)  # merge a part HAR a crashed invocation left behind
     context = await browser.new_context(
-        service_workers="block", record_har_path=str(Path(rd.traffic_dir) / f"{role.name}.har"),
+        service_workers="block", record_har_path=str(har_part_path(rd, role.name)),
         record_har_content="embed", **kwargs)
     session_storage = dict((state.get("session_storage") or {}).get(origin, {}))
     if session_storage:

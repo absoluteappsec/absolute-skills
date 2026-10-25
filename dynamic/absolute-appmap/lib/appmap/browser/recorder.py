@@ -29,6 +29,11 @@ _CSRF = re.compile(r"csrf|xsrf", re.I)
 _FRAME_LIMIT = 4096
 
 
+def har_part_path(rd: RunDir, role: str) -> Path:
+    """Where a role's browser context records the current session's (clear) HAR."""
+    return Path(rd.traffic_dir) / f"{role}.part.har"
+
+
 def _canonical_header(name: str) -> str:
     return "-".join(p.capitalize() for p in name.split("-"))
 
@@ -333,17 +338,46 @@ class TrafficRecorder:
 
     # -- HAR ---------------------------------------------------------------
     def finalize_har(self, role: str) -> Path | None:
-        """Rewrite ``traffic/<role>.har`` through the redactor (close the context first)."""
+        """Redact this session's HAR into ``traffic/<role>.har`` (close the context first).
+
+        Contexts record to ``traffic/<role>.part.har``; its redacted entries and pages are
+        appended to the existing ``<role>.har`` so every invocation's traffic is kept.
+        Without a part file, ``<role>.har`` itself is redacted in place.
+        """
         path = Path(self.rd.traffic_dir) / f"{role}.har"
+        part = har_part_path(self.rd, role)
+        if part.exists():
+            try:
+                har = self._redacted_har(part)
+            except ValueError as exc:  # truncated by a crash: unusable and unredactable
+                self.events.emit("error", role=role, message=f"discarding unreadable HAR: {exc}")
+                part.unlink()
+                return path if path.exists() else None
+            if path.exists():
+                base = json.loads(path.read_text(encoding="utf-8"))
+                log, new = base.setdefault("log", {}), har.get("log", {})
+                log.setdefault("pages", []).extend(new.get("pages") or [])
+                log.setdefault("entries", []).extend(new.get("entries") or [])
+                har = base
+            self._write_har(path, har)
+            part.unlink()
+            return path
         if not path.exists():
             return None
+        self._write_har(path, self._redacted_har(path))
+        return path
+
+    def _redacted_har(self, path: Path) -> dict:
         har = json.loads(path.read_text(encoding="utf-8"))
         for entry in har.get("log", {}).get("entries", []):
             self._redact_bodies(entry)
+        return self.redactor.json(har)
+
+    @staticmethod
+    def _write_har(path: Path, har: dict) -> None:
         tmp = path.with_suffix(".har.tmp")
-        tmp.write_text(json.dumps(self.redactor.json(har), indent=1), encoding="utf-8")
+        tmp.write_text(json.dumps(har, indent=1), encoding="utf-8")
         os.replace(tmp, path)
-        return path
 
     def _redact_body(self, text: str, mime: str, encoding: str | None) -> str:
         """Redact a HAR body the way recording.py redacts stored bodies."""
