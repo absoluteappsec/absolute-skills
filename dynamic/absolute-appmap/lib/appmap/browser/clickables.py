@@ -85,7 +85,7 @@ async def _listener_indexes(page: Page, indexes: list[int]) -> set[int]:
     return found
 
 
-async def _unique_locators(page: Page, raw: dict, dups: Counter) -> list[dict]:
+async def unique_locators(page: Page, raw: dict, dups: Counter) -> list[dict]:
     """Ranked locators, keeping a non-positional strategy only if it matches exactly one element."""
     out: list[dict] = []
     for loc in rank_locators(raw):
@@ -120,7 +120,7 @@ async def enumerate_clickables(page: Page) -> list[Clickable]:
     out: list[Clickable] = []
     seen: set[tuple[str, str | None]] = set()
     for c, reason in chosen:
-        locs = await _unique_locators(page, c["raw"], dups)
+        locs = await unique_locators(page, c["raw"], dups)
         if not locs:
             continue
         key = (c["raw"]["xpath"], c["href"])

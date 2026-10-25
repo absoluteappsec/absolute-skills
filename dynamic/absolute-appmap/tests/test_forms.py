@@ -150,3 +150,87 @@ async def test_fill_all_widget_kinds(browser):
     await ctx.close()
     assert state == {"e": "appmap-w@example.test", "c": True, "r": "a", "f": "sample.png",
                      "rt": "appmap-w", "s": "one"}
+
+
+_RESET_FORM = """<form id=f onsubmit="event.preventDefault();
+  fetch('/api', {method: 'POST', body: new FormData(this)}).then(() => { this.reset(); %s });">
+  <input name=title required><button type=submit>Save</button></form><div id=out></div>"""
+
+
+def _api_server(stub_server, body: str):
+    from werkzeug.wrappers import Response
+    return stub_server({"/": lambda r: Response(body, mimetype="text/html"),
+                        "/api": lambda r: Response("{}", status=201, mimetype="application/json")})
+
+
+async def test_form_reset_after_success_is_not_failure(browser, stub_server):
+    srv = _api_server(stub_server, _RESET_FORM % "")
+    ctx = await browser.new_context()
+    page = await ctx.new_page()
+    await page.goto(srv.url + "/")
+    form = (await discover_forms(page))[0]
+    res = await fill_and_submit(page, form, DataGen("appmap-r", {}), max_retries=2, settle_ms=200)
+    await ctx.close()
+    assert res.success and res.attempts == 1
+    assert srv.requests.count(("POST", "/api")) == 1
+
+
+async def test_success_toast_with_role_alert_is_success(browser, stub_server):
+    toast = "document.getElementById('out').innerHTML = '<div role=alert>Created!</div>';"
+    srv = _api_server(stub_server, _RESET_FORM % toast)
+    ctx = await browser.new_context()
+    page = await ctx.new_page()
+    await page.goto(srv.url + "/")
+    form = (await discover_forms(page))[0]
+    res = await fill_and_submit(page, form, DataGen("appmap-r", {}), max_retries=2, settle_ms=200)
+    await ctx.close()
+    assert res.success and res.attempts == 1 and res.validation_messages == {}
+
+
+async def test_alert_error_text_still_fails(browser, stub_server):
+    from werkzeug.wrappers import Response
+    body = ('<form onsubmit="event.preventDefault(); fetch(\'/api\', {method: \'POST\'}).then(() =>'
+            ' document.getElementById(\'out\').innerHTML = \'<div role=alert>Title is required</div>\');">'
+            '<input name=title><button type=submit>Save</button></form><div id=out></div>')
+    srv = stub_server({"/": lambda r: Response(body, mimetype="text/html"),
+                       "/api": lambda r: Response("{}", status=200, mimetype="application/json")})
+    ctx = await browser.new_context()
+    page = await ctx.new_page()
+    await page.goto(srv.url + "/")
+    form = (await discover_forms(page))[0]
+    res = await fill_and_submit(page, form, DataGen("appmap-r", {}), max_retries=0, settle_ms=200)
+    await ctx.close()
+    assert not res.success and res.validation_messages
+
+
+async def test_navigation_on_submit_does_not_hang(browser, stub_server):
+    import time
+    from werkzeug.wrappers import Response
+    srv = stub_server({
+        "/": lambda r: Response("<form action=/next method=get><input name=q><button>Search</button></form>",
+                                mimetype="text/html"),
+        "/next": lambda r: Response("<h1>done</h1>", mimetype="text/html")})
+    ctx = await browser.new_context()
+    page = await ctx.new_page()
+    await page.goto(srv.url + "/")
+    form = (await discover_forms(page))[0]
+    t0 = time.monotonic()
+    res = await fill_and_submit(page, form, DataGen("appmap-n", {}), max_retries=1, settle_ms=200)
+    await ctx.close()
+    assert time.monotonic() - t0 < 10
+    assert res.success and res.to_url.endswith("/next?q=appmap-n")
+
+
+async def test_range_and_color_use_fill(browser):
+    from appmap.browser.forms import _fill_field
+    ctx = await browser.new_context()
+    page = await ctx.new_page()
+    await page.set_content('<form><input type=range name=r min=0 max=10><input type=color name=c>'
+                           '<button>Save</button></form>')
+    form = (await discover_forms(page))[0]
+    gen = DataGen("appmap-c", {})
+    for f in form.fields:
+        assert await _fill_field(page, f, gen.value_for(f, 1)), f.name
+    vals = await page.evaluate("[document.querySelector('[name=r]').value, document.querySelector('[name=c]').value]")
+    await ctx.close()
+    assert vals == ["5", "#336699"]

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Callable, Literal
 from playwright.async_api import Page, Request, Response
 
 from ..datagen import hint_from_validation
-from .clickables import _unique_locators
+from .clickables import unique_locators
 from .locators import LOCATOR_JS, rank_locators, resolve
 from .settle import wait_settled
 
@@ -189,14 +189,14 @@ async def discover_forms(page: Page) -> list[FormInfo]:
     for f in raw_forms:
         fields = []
         for d in f["fields"]:
-            locs = await _unique_locators(page, d["raw"], dups)
+            locs = await unique_locators(page, d["raw"], dups)
             fields.append(FieldInfo(
                 name=d["name"], type=d["type"], widget=d["widget"], required=d["required"],
                 pattern=d["pattern"], min=d["min"], max=d["max"], maxlength=d["maxlength"],
                 options=d["options"], locators=locs, label=d["label"]))
         submit_locs = []
         for r in f["submit"]:
-            locs = await _unique_locators(page, r, dups)
+            locs = await unique_locators(page, r, dups)
             if locs:
                 submit_locs = locs
                 break
@@ -213,7 +213,9 @@ async def _fill_field(page: Page, fld: FieldInfo, value) -> bool:
         return False
     w = fld.widget
     try:
-        if w in ("input", "textarea"):
+        if w == "input" and fld.type in ("range", "color"):
+            await loc.fill(str(value), timeout=_ACTION_TIMEOUT)
+        elif w in ("input", "textarea"):
             await loc.fill("", timeout=_ACTION_TIMEOUT)
             await loc.press_sequentially(str(value), timeout=_ACTION_TIMEOUT)
         elif w == "date":
@@ -266,24 +268,28 @@ async def _fill_combobox(page: Page, loc, value: str) -> None:
 
 _ERR_JS = """(els) => {
   const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-  const SEL = '.error, .errors, .error-message, .field-error, .invalid-feedback, .help-block.error,'
-    + ' .has-error .help-block, .text-danger, .alert-danger, .errorlist li, [role=alert], .form-error';
+  const STRICT = '.error, .errors, .error-message, .field-error, .invalid-feedback, .help-block.error,'
+    + ' .has-error .help-block, .text-danger, .alert-danger, .errorlist li, .form-error';
+  const SEL = STRICT + ', [role=alert]';
+  const ERRLOOK = /error|invalid|required|must|failed/i;
   const visible = (e) => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
-  const fields = els.map(e => ({invalid: !!e && (e.matches(':invalid') || e.getAttribute('aria-invalid') === 'true'),
-    msg: e ? norm(e.validationMessage) : '', msgs: []}));
-  const pageTexts = [], all = [];
+  const fields = els.map(e => ({invalid: !!e && e.getAttribute('aria-invalid') === 'true',
+    css: !!e && e.matches(':invalid'), msg: e ? norm(e.validationMessage) : '', msgs: []}));
+  const pageTexts = [], all = [], weak = [];
   const nodes = [...document.querySelectorAll(SEL)].filter(n => visible(n) && norm(n.innerText));
   const leaf = nodes.filter(n => !nodes.some(m => m !== n && n.contains(m)));
   for (const n of leaf) {
     const t = norm(n.innerText);
     all.push(t);
+    const isWeak = !n.matches(STRICT) && !ERRLOOK.test(t);
+    if (isWeak) weak.push(t);
     let owner = -1;
     for (let a = n, d = 0; a && d < 4; a = a.parentElement, d++) {
       const inside = els.map((e, i) => (e && a.contains(e)) ? i : -1).filter(i => i >= 0);
       if (inside.length === 1) { owner = inside[0]; break; }
       if (inside.length > 1) break;
     }
-    if (owner >= 0) { fields[owner].msgs.push(t); fields[owner].invalid = true; } else pageTexts.push(t);
+    if (owner >= 0) { fields[owner].msgs.push(t); if (!isWeak) fields[owner].invalid = true; } else pageTexts.push(t);
   }
   const dm = els.map((e, i) => e && e.getAttribute('aria-describedby') ? i : -1).filter(i => i >= 0);
   for (const i of dm) {
@@ -293,20 +299,27 @@ _ERR_JS = """(els) => {
       if (n && norm(n.innerText) && !fields[i].msgs.includes(norm(n.innerText))) fields[i].msgs.push(norm(n.innerText));
     }
   }
-  return {fields, pageTexts, all};
+  return {fields, pageTexts, all, weak};
 }"""
 
 
 async def _inspect(page: Page, form: FormInfo) -> dict:
-    handles = []
-    for f in form.fields:
-        loc = await resolve(page, f.locators)
-        handles.append(await loc.element_handle() if loc is not None else None)
+    handles: list = []
     try:
+        for f in form.fields:
+            loc = await resolve(page, f.locators)
+            handles.append(await loc.element_handle(timeout=1000) if loc is not None else None)
         return await page.evaluate(_ERR_JS, handles)
-    except Exception:
-        return {"fields": [{"invalid": False, "msg": "", "msgs": []} for _ in handles],
-                "pageTexts": [], "all": []}
+    except Exception:  # page navigated away / detached mid-inspection
+        return {"fields": [{"invalid": False, "css": False, "msg": "", "msgs": []} for _ in form.fields],
+                "pageTexts": [], "all": [], "weak": []}
+    finally:
+        for h in handles:
+            if h is not None:
+                try:
+                    await h.dispose()
+                except Exception:
+                    pass
 
 
 def _norm_words(s: str) -> str:
@@ -449,15 +462,23 @@ async def fill_and_submit(page: Page, form: FormInfo, gen: "DataGen", *, max_ret
         seen: dict[str, list[str]] = {}
         insp = await _inspect(page, form)
         invalid = False
+        bad_any = any(r.status >= 400 for r in submissions) or any(
+            r.status >= 400 for r in triggered if r.request.resource_type == "document")
         for f, st in zip(form.fields, insp["fields"]):
-            invalid |= st["invalid"]
-            _merge(seen, f.name, st["msgs"] or ([st["msg"]] if st["invalid"] else []))
-        new_errors = [t for t in insp["all"] if t not in baseline]
+            # :invalid counts only if the browser blocked the submit; a form reset after a
+            # successful create leaves required inputs :invalid.
+            flagged = st["invalid"] or (st["css"] and not submissions)
+            invalid |= flagged
+            msgs = [m for m in st["msgs"] if m not in set(insp["weak"])] if not (bad_any) else st["msgs"]
+            _merge(seen, f.name, msgs or ([st["msg"]] if flagged and st["msg"] else []))
+        bad = [r for r in submissions if r.status >= 400] + [
+            r for r in triggered if r.request.resource_type == "document" and r.status >= 400]
+        weak = set(insp["weak"])
+        new_errors = [t for t in insp["all"] if t not in baseline
+                      and (t not in weak or bad or invalid)]
         for t in insp["pageTexts"]:
             if t in new_errors:
                 _merge(seen, _assign_page_message(t, form.fields), [t])
-        bad = [r for r in submissions if r.status >= 400] + [
-            r for r in triggered if r.request.resource_type == "document" and r.status >= 400]
         for r in bad:
             try:
                 for k, v in _json_errors(await r.json()).items():

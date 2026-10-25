@@ -69,3 +69,16 @@ def test_hint_truncates_and_keeps_pattern():
     v = gen.value_for(fld, 2, "max:12")
     assert v == MARKER[:12] and re.fullmatch("[a-z0-9-]{3,40}", v)
     assert len(gen.value_for(f("n"), 2, "min:30")) >= 30
+
+
+def test_anchored_pattern_generation():
+    v = DataGen(MARKER, {}).value_for(f("code", pattern=r"^\d{4}$"), 1)
+    assert re.fullmatch(r"\d{4}", v)
+    v = DataGen(MARKER, {}).value_for(f("n", pattern="^[a-z0-9-]{3,40}$"), 1)
+    assert v == MARKER
+
+
+def test_more_than_is_max_not_min():
+    assert hint_from_validation("Must be no more than 20 characters") == "max:20"
+    assert hint_from_validation("Use more than 20 characters") == "max:20"
+    assert hint_from_validation("Please enter no fewer than 5 characters") == "min:5"

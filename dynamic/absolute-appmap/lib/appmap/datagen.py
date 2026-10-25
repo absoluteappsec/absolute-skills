@@ -78,10 +78,19 @@ def _parse_pattern(p: str) -> list[tuple[set[str], int, int]]:
     return atoms
 
 
+def _unanchor(p: str) -> str:
+    """HTML ``pattern`` is implicitly anchored; drop explicit ^ / $."""
+    if p.startswith("^"):
+        p = p[1:]
+    if p.endswith("$") and not p.endswith("\\$"):
+        p = p[:-1]
+    return p
+
+
 def _from_pattern(pattern: str, seed: str) -> str | None:
     """A string fully matching ``pattern`` that reuses as much of ``seed`` as the atoms allow."""
     try:
-        atoms = _parse_pattern(pattern)
+        atoms = _parse_pattern(_unanchor(pattern))
     except ValueError:
         return None
     out, pos = [], 0
@@ -114,8 +123,8 @@ def _fit_pattern(value: str, field: "FieldInfo") -> str:
 
 _HINT_RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"(\d+)\s*(?:-|to|and)\s*(\d+)\s*char", re.I), "len:{0}-{1}"),
-    (re.compile(r"(?:at most|no more than|maximum(?: length)?(?: of| is)?|max(?:imum)?|up to|under)\s*(\d+)", re.I), "max:{0}"),
-    (re.compile(r"(?:at least|minimum(?: length)?(?: of| is)?|min(?:imum)?|no fewer than|more than)\s*(\d+)", re.I), "min:{0}"),
+    (re.compile(r"(?:at most|no more than|more than|maximum(?: length)?(?: of| is)?|max(?:imum)?|up to|under)\s*(\d+)", re.I), "max:{0}"),
+    (re.compile(r"(?:at least|minimum(?: length)?(?: of| is)?|min(?:imum)?|no fewer than)\s*(\d+)", re.I), "min:{0}"),
     (re.compile(r"too long|exceeds?|shorten|shorter", re.I), "max:8"),
     (re.compile(r"too short|longer", re.I), "min:12"),
     (re.compile(r"(?:invalid|valid|enter an?)\s+e-?mail|email address", re.I), "email"),
