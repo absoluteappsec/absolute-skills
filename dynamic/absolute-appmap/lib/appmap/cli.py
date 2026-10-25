@@ -66,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("probe", help="non-browser discovery (robots/sitemaps/schemas)")
     p.add_argument("--run", required=True, help="run directory")
     p.add_argument("--phase", required=True, choices=["passive", "active"],
-                   help="passive: robots, sitemaps, well-known, OpenAPI, GraphQL introspection")
+                   help="passive: robots, sitemaps, well-known, OpenAPI, GraphQL introspection, JS bundles")
     p.add_argument("--role", help="probe as this role (default: the first configured role)")
     p.add_argument("--budget-minutes", type=float, default=8.0,
                    help="stop cleanly after this long (default 8); rerun to resume")
@@ -273,6 +273,7 @@ async def _probe_passive(cfg, rd, role_name: str, budget_minutes: float) -> dict
     from appmap.crawl import build_runtime
     from appmap.direct import DirectClient
     from appmap.frontier import Frontier
+    from appmap.probe.bundles import probe_bundles
     from appmap.probe.passive import probe_passive
     from appmap.probe.schemas import probe_schemas
     from appmap.recording import record_exchange
@@ -302,6 +303,10 @@ async def _probe_passive(cfg, rd, role_name: str, budget_minutes: float) -> dict
                                                        deadline=deadline))
                 if cfg.discovery.schemas:
                     steps.append(lambda: probe_schemas(client, api, cfg, rt.store, role_name,
+                                                       deadline=deadline))
+                if cfg.discovery.bundle_mining:
+                    steps.append(lambda: probe_bundles(client, api, cfg, rt.store,
+                                                       Frontier(rt.store), role_name,
                                                        deadline=deadline))
                 for step in steps:
                     for k, v in (await step()).items():
