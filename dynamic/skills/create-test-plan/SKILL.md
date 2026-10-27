@@ -13,7 +13,8 @@ This skill **plans**; it does not test. It sends no requests to the target. Runn
 
 1. **Evidence-based.** Every hypothesis names the endpoint/page/form and the observation that suggests it (e.g. "`/taskManager/profile/{id}` edit form opened for any id as user"). No generic checklist padding — if there's no evidence, it's at most a low-priority "standard coverage" item.
 2. **Authorized scope only.** Use the scope recorded in the site map. Note any check that would touch out-of-scope hosts (e.g. SSRF callbacks, external fetches) and require explicit approval for it.
-3. **Flag destructive checks.** Mark any check that changes or deletes data, changes credentials, sends messages, or could disrupt the service, and say it needs approval and should target test records only.
+3. **Flag destructive checks.** Mark any check that changes or deletes data, changes credentials, sends messages, or could disrupt the service, and say it needs approval and should target test records only. Carry over any standing rules from the crawl (held actions, accounts never to touch) as constraints. List the test fixtures checks need (e.g. a second ordinary user, a project the user isn't a member of, a marker string) under Preconditions so they're created once, deliberately.
+5. **Scanner safety.** Any ZAP/Burp spider or active-scan config must exclude state-changing GETs (delete/complete/logout-style URLs) and block out-of-scope hosts the pages call on their own (telemetry, CDNs); default to low attack strength.
 4. **No secrets.** Never copy passwords, tokens, cookies or API keys into the plan. Use placeholders (`{{ADMIN_SESSION}}`, `{{USER_TOKEN}}`).
 
 ## Step 1 — Gather inputs
@@ -42,7 +43,7 @@ Score 1–3 on each:
 | **Data sensitivity** | public/low-value | internal business data | PII, credentials, tokens, financial, admin/privilege |
 | **Evidence** | standard coverage, no specific signal | indirect signal (pattern, ID in URL, tech known to allow it) | directly observed behavior (e.g. other user's object returned, input reached a shell) |
 
-**Priority = sum (3–9):** P1 = 8–9, P2 = 6–7, P3 = 3–5. Sort by priority, then evidence.
+**Priority = sum (3–9):** P1 = 8–9, P2 = 6–7, P3 = 3–5 — but an item with Evidence = 1 is capped at P3. Sort by priority, then evidence, then exposure; when there are many P1s, pick the "run first" five by directly observed evidence on anonymous or cross-role paths.
 
 ## Step 4 — Map to OWASP Top 10 and ASVS
 
@@ -51,7 +52,7 @@ Tag each hypothesis with the OWASP Top 10 category and the ASVS chapter/requirem
 - **OWASP Top 10:2025:** A01 Broken Access Control · A02 Security Misconfiguration · A03 Software Supply Chain Failures · A04 Cryptographic Failures · A05 Injection · A06 Insecure Design · A07 Authentication Failures · A08 Software or Data Integrity Failures · A09 Security Logging and Alerting Failures · A10 Mishandling of Exceptional Conditions.
 - **ASVS 5.0 chapters:** V1 Encoding and Sanitization · V2 Validation and Business Logic · V3 Web Frontend Security · V4 API and Web Service · V5 File Handling · V6 Authentication · V7 Session Management · V8 Authorization · V9 Self-contained Tokens · V10 OAuth and OIDC · V11 Cryptography · V12 Secure Communication · V13 Configuration · V14 Data Protection · V15 Secure Coding and Architecture · V16 Security Logging and Error Handling · V17 WebRTC.
 
-Cite specific ASVS requirement IDs only when you're sure of them; otherwise cite the chapter.
+Cite specific ASVS requirement IDs only when you're sure of them; otherwise cite the chapter. Note that in the 2025 Top 10, SSRF and CSRF fall under A01 Broken Access Control.
 
 ## Step 5 — Hand off each pathway as a concrete check
 
